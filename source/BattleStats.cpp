@@ -16,13 +16,11 @@ constexpr size_t kUnitStride = 0x30;
 constexpr size_t kUnitCount = 250;
 constexpr size_t kStrategyStride = 0x61;
 constexpr size_t kStrategyTypeOffset = 0x0B;
-constexpr BYTE kDirectHealingStrategyType = 19;
-
 enum SettlementKind : int {
     SettlementPhysicalDamage = 0,
     SettlementStrategyDamage = 1,
-    SettlementStrategyHealingSimple = 2,
-    SettlementStrategyHealingAnimated = 3
+    SettlementRecoverySimple = 2,
+    SettlementRecoveryAnimated = 3
 };
 
 constexpr size_t kSettlementCapabilityCount = 3;
@@ -335,7 +333,7 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
     if (!image.ExecutableRange(text, textSize)) return false;
 
     std::vector<uintptr_t> damageSites;
-    std::vector<uintptr_t> healingSites;
+    std::vector<uintptr_t> recoverySites;
     uintptr_t hpSetter = 0;
     uintptr_t unitBase = 0;
     size_t unitMatches = 0;
@@ -359,7 +357,7 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
             p[17] == 0xE8) {
             const uintptr_t target = CallTarget(image, p + 17);
             if (ValidateHpSetter(image, target)) {
-                healingSites.push_back(image.Address(p + 17));
+                recoverySites.push_back(image.Address(p + 17));
                 if (!hpSetter) hpSetter = target;
                 else if (hpSetter != target) return false;
             }
@@ -389,10 +387,10 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
     // table probe below for diagnostics and existing layout tests, but let
     // the two validated HP-setter result loops stand on their own.
     ResolveStrategyTable(image, text, textSize, result.strategyBase, result.strategyCount);
-    if (healingSites.size() == 2) {
-        std::sort(healingSites.begin(), healingSites.end());
-        result.callSites[2] = healingSites[0];
-        result.callSites[3] = healingSites[1];
+    if (recoverySites.size() == 2) {
+        std::sort(recoverySites.begin(), recoverySites.end());
+        result.callSites[2] = recoverySites[0];
+        result.callSites[3] = recoverySites[1];
     }
     ResolvePhysicalEvents(image, text, textSize, result);
     return std::any_of(result.callSites.begin(), result.callSites.end(),
@@ -559,60 +557,13 @@ bool ResolveStrategyDamageSettlement(uintptr_t callerFrame, int targetSlot, int&
         contextTarget == targetSlot;
 }
 
-bool IsDirectHealingStrategy(BYTE strategyId) {
-    if (!gLayout.strategyBase || strategyId >= gLayout.strategyCount) return false;
-    BYTE type = 0xFF;
-    return ReadBytes(gLayout.strategyBase + static_cast<uintptr_t>(strategyId) *
-        kStrategyStride + kStrategyTypeOffset, &type, sizeof(type)) &&
-        type == kDirectHealingStrategyType;
-}
-
-bool ResolveStrategyHealingSettlement(int kind, uintptr_t callerFrame, uintptr_t target,
-    int targetSlot, int& actorSlot) {
-    uintptr_t context = 0;
-    uintptr_t initialTarget = 0;
-    uintptr_t targetFromFrame = 0;
-    // The native result loops consume this local as a bounded byte slot.  One
-    // loop increments a zero-initialised DWORD and the other increments its
-    // low byte; reading only the low byte keeps stale stack high bytes from
-    // becoming part of the target index.  The test model intentionally keeps
-    // those surrounding bytes noisy to cover this ABI detail.
-    BYTE resultIndex = 0xFF;
-    BYTE strategyId = 0xFF;
-    BYTE initialTargetSlot = 0xFF;
-    BYTE contextActorSlot = 0xFF;
-    BYTE resultTargetSlot = 0xFF;
-    const uintptr_t frameTargetOffset = kind == SettlementStrategyHealingSimple ?
-        0x10 : 0x14;
-    if (!ReadBytes(callerFrame - 0x0C, &context, sizeof(context)) || !context ||
-        !ReadBytes(callerFrame - 0x04, &resultIndex, sizeof(resultIndex)) ||
-        resultIndex >= kUnitCount ||
-        !ReadBytes(callerFrame - frameTargetOffset, &targetFromFrame, sizeof(targetFromFrame)) ||
-        !ReadBytes(context, &strategyId, sizeof(strategyId)) ||
-        !ReadBytes(context + 1, &initialTargetSlot, sizeof(initialTargetSlot)) ||
-        !ReadBytes(context + 2, &contextActorSlot, sizeof(contextActorSlot)) ||
-        !ReadBytes(context + 8, &initialTarget, sizeof(initialTarget)) ||
-        !ReadBytes(context + 0x0D + static_cast<uintptr_t>(resultIndex),
-            &resultTargetSlot, sizeof(resultTargetSlot)) ||
-        targetFromFrame != target || resultTargetSlot != targetSlot ||
-        contextActorSlot >= kUnitCount || !IsDirectHealingStrategy(strategyId)) return false;
-    int verifiedInitialTargetSlot = -1;
-    if (!UnitSlotFromPointer(initialTarget, verifiedInitialTargetSlot) ||
-        verifiedInitialTargetSlot != initialTargetSlot) return false;
-    actorSlot = contextActorSlot;
-    return true;
-}
-
-bool ResolveSettlementActor(int kind, uintptr_t target, uintptr_t callerFrame,
+bool ResolveSettlementActor(int kind, uintptr_t callerFrame,
     int targetSlot, int& actorSlot) {
     switch (kind) {
     case SettlementPhysicalDamage:
         return ResolvePhysicalSettlement(callerFrame, targetSlot, actorSlot);
     case SettlementStrategyDamage:
         return ResolveStrategyDamageSettlement(callerFrame, targetSlot, actorSlot);
-    case SettlementStrategyHealingSimple:
-    case SettlementStrategyHealingAnimated:
-        return ResolveStrategyHealingSettlement(kind, callerFrame, target, targetSlot, actorSlot);
     default:
         return false;
     }
@@ -702,7 +653,7 @@ void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int old
             } else if (oldHp > finalHp) {
                 int actorSlot = -1;
                 int actorCamp = -1;
-                if (ResolveSettlementActor(kind, target, callerFrame, targetSlot, actorSlot) &&
+                if (ResolveSettlementActor(kind, callerFrame, targetSlot, actorSlot) &&
                     UnitCamp(actorSlot, actorCamp)) {
                     const long long damage = static_cast<long long>(oldHp) - finalHp;
                     if (actorCamp == 0) {
@@ -875,16 +826,16 @@ extern "C" __declspec(naked) void BattleStatsStrategyDamageBridge() {
     }
 }
 
-extern "C" __declspec(naked) void BattleStatsStrategyHealingBridge() {
+extern "C" __declspec(naked) void BattleStatsRecoveryBridge() {
     __asm {
-        push SettlementStrategyHealingSimple
+        push SettlementRecoverySimple
         jmp BattleStatsHpBridgeCommon
     }
 }
 
-extern "C" __declspec(naked) void BattleStatsStrategyHealingAnimatedBridge() {
+extern "C" __declspec(naked) void BattleStatsRecoveryAnimatedBridge() {
     __asm {
-        push SettlementStrategyHealingAnimated
+        push SettlementRecoveryAnimated
         jmp BattleStatsHpBridgeCommon
     }
 }
@@ -939,8 +890,8 @@ void InitializeBattleStats(const wchar_t* gameRoot) {
     const uintptr_t bridges[] = {
         reinterpret_cast<uintptr_t>(&BattleStatsPhysicalBridge),
         reinterpret_cast<uintptr_t>(&BattleStatsStrategyDamageBridge),
-        reinterpret_cast<uintptr_t>(&BattleStatsStrategyHealingBridge),
-        reinterpret_cast<uintptr_t>(&BattleStatsStrategyHealingAnimatedBridge)
+        reinterpret_cast<uintptr_t>(&BattleStatsRecoveryBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsRecoveryAnimatedBridge)
     };
     PeImage image;
     if (!image.Open(reinterpret_cast<const BYTE*>(module), reinterpret_cast<uintptr_t>(module)))

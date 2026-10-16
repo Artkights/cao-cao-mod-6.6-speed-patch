@@ -7,7 +7,7 @@
 #include <vector>
 
 extern "C" uintptr_t gBattleStatsOriginalSetHp;
-extern "C" void BattleStatsStrategyHealingBridge();
+extern "C" void BattleStatsRecoveryBridge();
 
 bool GetObservedGuideScenario(std::wstring& name) {
     name.clear();
@@ -21,7 +21,7 @@ constexpr size_t kStrategyStride = 0x61;
 constexpr size_t kStrategyTypeOffset = 0x0B;
 constexpr unsigned kStrategyCount = 0x90;
 constexpr BYTE kSupplyStrategy = 55;
-constexpr BYTE kPersistentHealingStrategy = 104;
+constexpr BYTE kPersistentRecoveryStrategy = 104;
 constexpr uint32_t kComboOffset = 0x608;
 int failures = 0;
 
@@ -33,7 +33,7 @@ extern "C" __declspec(naked) void TestHpSetter() {
     }
 }
 
-extern "C" __declspec(naked) void InvokeHealingBridgeForTest(uintptr_t, uintptr_t) {
+extern "C" __declspec(naked) void InvokeRecoveryBridgeForTest(uintptr_t, uintptr_t) {
     __asm {
         push ebp
         mov ebp, esp
@@ -45,7 +45,7 @@ extern "C" __declspec(naked) void InvokeHealingBridgeForTest(uintptr_t, uintptr_
         mov byte ptr [ebp - 4], 0
         mov ecx, dword ptr [ebp + 8]
         push 82
-        call BattleStatsStrategyHealingBridge
+        call BattleStatsRecoveryBridge
         mov esp, ebp
         pop ebp
         ret 8
@@ -108,7 +108,7 @@ const BattleUnitTotals* FindUnit(const BattleStatsSnapshot& snapshot, int slot) 
     return nullptr;
 }
 
-void ConfigureHealing(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& frame,
+void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& frame,
     int kind, BYTE strategyId, BYTE actorSlot, BYTE initialTargetSlot,
     uintptr_t initialTarget, BYTE resultTargetSlot, uintptr_t resultTarget,
     int resultIndex = 0) {
@@ -147,7 +147,7 @@ int wmain(int argc, wchar_t** argv) {
         layout.settlementCalls[1] == 0x4229FC &&
         layout.settlementCalls[2] == 0x4247DC &&
         layout.settlementCalls[3] == 0x4249DA,
-        "resolve damage and both real strategy-result healing calls");
+        "resolve damage and both real recovery-result calls");
     Check(layout.physicalResultCall == 0x452802 && layout.criticalCommit == 0x405F1A,
         "resolve actual-result entry and committed critical decision");
     Check(layout.criticalOffset == 0x604 && layout.comboOffset == 0x608,
@@ -160,14 +160,14 @@ int wmain(int argc, wchar_t** argv) {
         partial.settlementCalls.size() == 4 && !partial.settlementCalls[2] &&
         !partial.settlementCalls[3] &&
         partial.settlementCalls[0] == 0x405ADC && partial.settlementCalls[1] == 0x4229FC,
-        "disable the complete healing capability when either result path is missing");
+        "disable complete recovery capability when either result path is missing");
     changed = image;
     changed[0x405F1A - base] = 0x90;
     Check(ResolveBattleStatsImageLayoutForTest(changed.data(), base, partial) &&
         !partial.criticalCommit && !partial.physicalResultCall &&
         partial.settlementCalls[2] == 0x4247DC &&
         partial.settlementCalls[3] == 0x4249DA,
-        "isolate an invalid critical graph from healing settlement support");
+        "isolate an invalid critical graph from recovery settlement support");
 
     std::vector<BYTE> units(kUnitStride * kUnitCount, 0);
     constexpr BYTE actorSlot = 2;
@@ -188,7 +188,7 @@ int wmain(int argc, wchar_t** argv) {
 
     std::vector<BYTE> strategies(kStrategyStride * kStrategyCount, 0);
     strategies[kSupplyStrategy * kStrategyStride + kStrategyTypeOffset] = 19;
-    strategies[kPersistentHealingStrategy * kStrategyStride + kStrategyTypeOffset] = 43;
+    strategies[kPersistentRecoveryStrategy * kStrategyStride + kStrategyTypeOffset] = 43;
     InitializeBattleStatsModelForTest(unitBase,
         reinterpret_cast<uintptr_t>(strategies.data()), kStrategyCount);
     SetBattleStatsModelActiveForTest(true);
@@ -199,20 +199,20 @@ int wmain(int argc, wchar_t** argv) {
     // catches both the BYTE result index contract and PUSHAD stack offsets;
     // the direct model calls below intentionally remain as fine-grained
     // resolver/aggregation coverage.
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, actorSlot, actorSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, actorSlot, actorSlot,
         actor, actorSlot, actor);
     units[actorSlot * kUnitStride + 0x10] = 37;
     gBattleStatsOriginalSetHp = reinterpret_cast<uintptr_t>(&TestHpSetter);
-    InvokeHealingBridgeForTest(actor, reinterpret_cast<uintptr_t>(context.data()));
+    InvokeRecoveryBridgeForTest(actor, reinterpret_cast<uintptr_t>(context.data()));
     gBattleStatsOriginalSetHp = 0;
     BattleStatsSnapshot bridgeSnapshot;
     Check(ReadBattleStatsSnapshot(bridgeSnapshot) &&
         FindUnit(bridgeSnapshot, actorSlot) &&
         FindUnit(bridgeSnapshot, actorSlot)->recoveryDone == 45 &&
         units[actorSlot * kUnitStride + 0x10] == 82,
-        "run the healing bridge with the native setter ABI and final HP delta");
+        "run the recovery bridge with the native setter ABI and final HP delta");
 
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
         friendlyTarget, friendlyTargetSlot, friendlyTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 37, 82);
@@ -220,32 +220,32 @@ int wmain(int argc, wchar_t** argv) {
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 90, 100);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 100, 100);
-    ConfigureHealing(context, frame, 3, kSupplyStrategy, actorSlot, actorSlot,
+    ConfigureRecovery(context, frame, 3, kSupplyStrategy, actorSlot, actorSlot,
         actor, actorSlot, actor);
     RecordBattleStatsSettlementForTest(3, actor,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 20, 50);
-    ConfigureHealing(context, frame, 3, kSupplyStrategy, actorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 3, kSupplyStrategy, actorSlot, friendlyTargetSlot,
         friendlyTarget, secondTargetSlot, secondTarget, 1);
     RecordBattleStatsSettlementForTest(3, secondTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 10, 25);
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, enemyActorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, enemyActorSlot, friendlyTargetSlot,
         friendlyTarget, friendlyTargetSlot, friendlyTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 40, 70);
-    ConfigureHealing(context, frame, 2, kPersistentHealingStrategy, actorSlot,
+    ConfigureRecovery(context, frame, 2, kPersistentRecoveryStrategy, actorSlot,
         friendlyTargetSlot, friendlyTarget, friendlyTargetSlot, friendlyTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 40, 70);
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
         friendlyTarget, friendlyTargetSlot, friendlyTarget);
     PutPointer(frame.data() + 0x40 - 0x10, secondTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 40, 70);
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
         friendlyTarget, secondTargetSlot, friendlyTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 40, 70);
-    ConfigureHealing(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
+    ConfigureRecovery(context, frame, 2, kSupplyStrategy, actorSlot, friendlyTargetSlot,
         secondTarget, friendlyTargetSlot, friendlyTarget);
     RecordBattleStatsSettlementForTest(2, friendlyTarget,
         reinterpret_cast<uintptr_t>(frame.data() + 0x40), 40, 70);
@@ -305,13 +305,13 @@ int wmain(int argc, wchar_t** argv) {
     Check(secondTotals && secondTotals->recoveryDone == 15,
         "accumulate positive HP deltas for each multi-target recipient");
     Check(actorTotals && actorTotals->damageDealt == 30,
-        "keep strategy-damage actor resolution separate from healing layout");
+        "keep strategy-damage actor resolution separate from recovery layout");
     Check(actorTotals && actorTotals->comboExtraHitCount == 2,
         "count each actual extra-strike ordinal once");
     Check(actorTotals && actorTotals->criticalCount == 4,
         "count committed critical decisions once per action, strike, and target");
     Check(!FindUnit(snapshot, enemyActorSlot),
-        "exclude enemy healing and physical events from friendly totals");
+        "exclude enemy recovery and physical events from friendly totals");
 
     ShutdownBattleStats();
     printf("BattleStatsTests: %d failures\n", failures);
