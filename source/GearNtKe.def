@@ -1,0 +1,7 @@
+LIBRARY GearNtKe
+EXPORTS
+    AddProcess @1
+    GetSpeed @2
+    OldSetTimer=_OldSetTimer@16 @3
+    SetSpeed @4
+    UnIntercept @5

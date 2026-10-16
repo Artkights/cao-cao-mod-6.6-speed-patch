@@ -1,0 +1,15 @@
+# Build outputs and intermediate files
+*.exe
+*.dll
+*.obj
+*.lib
+*.exp
+*.res
+*.map
+*.pdb
+*.ilk
+*.log
+_PackageTest/
+config-test/
+!release/
+!release/加速补丁6.6安装器.exe

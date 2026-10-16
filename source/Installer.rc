@@ -1,0 +1,9 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "ResourceIds.h"
+
+IDI_DORO_WHITE ICON "Doro-white.ico"
+IDR_INSTALL_PROXY RCDATA "Koeicda.dll"
+IDR_INSTALL_GEAR RCDATA "GearNtKe.dll"
+IDR_INSTALL_CONFIG RCDATA "pl_06.ini"
+IDR_INSTALL_FEATURES RCDATA "features.ini"
