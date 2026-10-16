@@ -46,8 +46,8 @@ void InsertRow(int row, const std::wstring& label, const BattleUnitTotals* total
         gStats.strategyDamageAvailable;
     InsertText(row, 1, damageAvailable ? std::to_wstring(totals->damageDealt) : L"--");
     InsertText(row, 2, damageAvailable ? std::to_wstring(totals->damageReceived) : L"--");
-    InsertText(row, 3, gStats.strategyHealingAvailable ?
-        std::to_wstring(totals->healingDone) : L"--");
+    InsertText(row, 3, gStats.recoveryAvailable ?
+        std::to_wstring(totals->recoveryDone) : L"--");
     InsertText(row, 4, gStats.criticalAvailable ?
         std::to_wstring(totals->criticalCount) : L"--");
     InsertText(row, 5, gStats.comboAvailable ?
@@ -105,7 +105,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(gList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
         const wchar_t* headings[] = {
-            L"单位", L"造成伤害", L"承受伤害", L"治疗量", L"暴击次数", L"连击次数"
+            L"单位", L"造成伤害", L"承受伤害", L"回复量", L"暴击次数", L"连击次数"
         };
         for (int index = 0; index < 6; ++index) {
             LVCOLUMNW column = {};

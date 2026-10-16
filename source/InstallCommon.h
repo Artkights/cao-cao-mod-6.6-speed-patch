@@ -10,7 +10,7 @@
 namespace XiaoAnInstall {
 
 constexpr unsigned kManifestSchema = 1;
-constexpr wchar_t kPackageVersion[] = L"6.6.10";
+constexpr wchar_t kPackageVersion[] = L"6.6.11";
 
 enum class InstallMode {
     Clean,

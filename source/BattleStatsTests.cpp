@@ -208,7 +208,7 @@ int wmain(int argc, wchar_t** argv) {
     BattleStatsSnapshot bridgeSnapshot;
     Check(ReadBattleStatsSnapshot(bridgeSnapshot) &&
         FindUnit(bridgeSnapshot, actorSlot) &&
-        FindUnit(bridgeSnapshot, actorSlot)->healingDone == 45 &&
+        FindUnit(bridgeSnapshot, actorSlot)->recoveryDone == 45 &&
         units[actorSlot * kUnitStride + 0x10] == 82,
         "run the healing bridge with the native setter ABI and final HP delta");
 
@@ -292,12 +292,18 @@ int wmain(int argc, wchar_t** argv) {
 
     BattleStatsSnapshot snapshot;
     Check(ReadBattleStatsSnapshot(snapshot) && snapshot.physicalSettlementAvailable &&
-        snapshot.strategyDamageAvailable && snapshot.strategyHealingAvailable &&
+        snapshot.strategyDamageAvailable && snapshot.recoveryAvailable &&
         snapshot.criticalAvailable && snapshot.comboAvailable,
         "publish five independent battle-stat capabilities");
     const BattleUnitTotals* actorTotals = FindUnit(snapshot, actorSlot);
-    Check(actorTotals && actorTotals->healingDone == 145,
-        "attribute direct healing by actor slot across bridge, self and multi-target results");
+    const BattleUnitTotals* friendlyTotals = FindUnit(snapshot, friendlyTargetSlot);
+    const BattleUnitTotals* secondTotals = FindUnit(snapshot, secondTargetSlot);
+    Check(actorTotals && actorTotals->recoveryDone == 75,
+        "attribute self recovery to the unit whose HP increased");
+    Check(friendlyTotals && friendlyTotals->recoveryDone == 205,
+        "accumulate every positive friendly HP delta on its target unit");
+    Check(secondTotals && secondTotals->recoveryDone == 15,
+        "accumulate positive HP deltas for each multi-target recipient");
     Check(actorTotals && actorTotals->damageDealt == 30,
         "keep strategy-damage actor resolution separate from healing layout");
     Check(actorTotals && actorTotals->comboExtraHitCount == 2,

@@ -115,7 +115,7 @@ int main() {
     HWND battleDetail = battle ? FindWindowExW(battle, nullptr, WC_EDITW, nullptr) : nullptr;
     check(battle && !battleTabs && battleList && !battleDetail && IsWindowUnicode(battleList) &&
         ColumnText(battleList, 0) == L"单位" && ColumnText(battleList, 1) == L"造成伤害" &&
-        ColumnText(battleList, 2) == L"承受伤害" && ColumnText(battleList, 3) == L"治疗量" &&
+        ColumnText(battleList, 2) == L"承受伤害" && ColumnText(battleList, 3) == L"回复量" &&
         ColumnText(battleList, 4) == L"暴击次数" && ColumnText(battleList, 5) == L"连击次数",
         "battle statistics exposes the six requested Unicode columns");
     CloseBattleInfo();

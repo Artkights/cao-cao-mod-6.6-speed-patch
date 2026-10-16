@@ -27,7 +27,7 @@ enum SettlementKind : int {
 
 constexpr size_t kSettlementCapabilityCount = 3;
 constexpr size_t kSettlementCallCount = 4;
-constexpr size_t kStrategyHealingCapability = 2;
+constexpr size_t kRecoveryCapability = 2;
 
 struct PeImage {
     const BYTE* bytes = nullptr;
@@ -384,8 +384,12 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
         result.callSites[0] = damageSites[0];
         result.callSites[1] = damageSites[1];
     }
-    if (healingSites.size() == 2 && ResolveStrategyTable(image, text, textSize,
-        result.strategyBase, result.strategyCount)) {
+    // Recovery is based on the final HP delta, so it must not depend on
+    // resolving a particular strategy ID or strategy-table type.  Keep the
+    // table probe below for diagnostics and existing layout tests, but let
+    // the two validated HP-setter result loops stand on their own.
+    ResolveStrategyTable(image, text, textSize, result.strategyBase, result.strategyCount);
+    if (healingSites.size() == 2) {
         std::sort(healingSites.begin(), healingSites.end());
         result.callSites[2] = healingSites[0];
         result.callSites[3] = healingSites[1];
@@ -660,8 +664,8 @@ void FinishUnlocked(ULONGLONG now) {
             Append(output, L"  造成伤害：" + std::to_wstring(unit.damageDealt));
             Append(output, L"  承受伤害：" + std::to_wstring(unit.damageReceived));
         }
-        if (gSettlementAvailable[kStrategyHealingCapability])
-            Append(output, L"  治疗量：" + std::to_wstring(unit.healingDone));
+        if (gSettlementAvailable[kRecoveryCapability])
+            Append(output, L"  回复量：" + std::to_wstring(unit.recoveryDone));
         if (gCriticalAvailable)
             Append(output, L"  暴击次数：" + std::to_wstring(unit.criticalCount));
         if (gComboAvailable)
@@ -685,34 +689,34 @@ void FinishUnlocked(ULONGLONG now) {
 void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int oldHp, int finalHp) {
     if (InterlockedCompareExchange(&gRecording, TRUE, FALSE) != FALSE) return;
     int targetSlot = -1;
-    int actorSlot = -1;
     int targetCamp = -1;
-    int actorCamp = -1;
-    const bool valid = UnitSlotFromPointer(target, targetSlot) &&
-        ResolveSettlementActor(kind, target, callerFrame, targetSlot, actorSlot) &&
-        UnitCamp(targetSlot, targetCamp) && UnitCamp(actorSlot, actorCamp);
-    if (valid) {
+    const bool validTarget = UnitSlotFromPointer(target, targetSlot) &&
+        UnitCamp(targetSlot, targetCamp);
+    if (validTarget) {
         AcquireSRWLockExclusive(&gStatsLock);
         if (gActive) {
-            const bool healing = kind == SettlementStrategyHealingSimple ||
-                kind == SettlementStrategyHealingAnimated;
-            if (healing && finalHp > oldHp && actorCamp == 0) {
-                BattleUnitTotals& actorTotals = gTotals[actorSlot];
-                actorTotals.slot = actorSlot;
-                actorTotals.healingDone += static_cast<long long>(finalHp) - oldHp;
-            } else if (!healing && oldHp > finalHp) {
-                const long long damage = static_cast<long long>(oldHp) - finalHp;
-                if (actorCamp == 0) {
-                    BattleUnitTotals& actorTotals = gTotals[actorSlot];
-                    actorTotals.slot = actorSlot;
-                    actorTotals.damageDealt += damage;
-                    if (targetCamp != 0 && oldHp > 0 && finalHp <= 0)
-                        ++actorTotals.defeatedEnemies;
-                }
-                if (targetCamp == 0) {
-                    BattleUnitTotals& targetTotals = gTotals[targetSlot];
-                    targetTotals.slot = targetSlot;
-                    targetTotals.damageReceived += damage;
+            if (finalHp > oldHp && targetCamp == 0) {
+                BattleUnitTotals& targetTotals = gTotals[targetSlot];
+                targetTotals.slot = targetSlot;
+                targetTotals.recoveryDone += static_cast<long long>(finalHp) - oldHp;
+            } else if (oldHp > finalHp) {
+                int actorSlot = -1;
+                int actorCamp = -1;
+                if (ResolveSettlementActor(kind, target, callerFrame, targetSlot, actorSlot) &&
+                    UnitCamp(actorSlot, actorCamp)) {
+                    const long long damage = static_cast<long long>(oldHp) - finalHp;
+                    if (actorCamp == 0) {
+                        BattleUnitTotals& actorTotals = gTotals[actorSlot];
+                        actorTotals.slot = actorSlot;
+                        actorTotals.damageDealt += damage;
+                        if (targetCamp != 0 && oldHp > 0 && finalHp <= 0)
+                            ++actorTotals.defeatedEnemies;
+                    }
+                    if (targetCamp == 0) {
+                        BattleUnitTotals& targetTotals = gTotals[targetSlot];
+                        targetTotals.slot = targetSlot;
+                        targetTotals.damageReceived += damage;
+                    }
                 }
             }
         }
@@ -968,17 +972,9 @@ void InitializeBattleStats(const wchar_t* gameRoot) {
             !WriteCode(pending.callSites[index], pending.patched[index].data(), 5)) continue;
         pending.installed[index] = true;
     }
-    bool healingComplete = pending.installed[2] && pending.installed[3];
-    if (pending.installed[2] != pending.installed[3]) {
-        for (size_t index = 2; index <= 3; ++index) {
-            if (!pending.installed[index]) continue;
-            const bool restored = !memcmp(pending.callSites[index],
-                pending.patched[index].data(), 5) &&
-                WriteCode(pending.callSites[index], pending.original[index].data(), 5);
-            if (restored) pending.installed[index] = false;
-        }
-        healingComplete = false;
-    }
+    const bool recoveryComplete = pending.callSites[0] && pending.callSites[1] &&
+        pending.callSites[2] && pending.callSites[3] && pending.installed[0] &&
+        pending.installed[1] && pending.installed[2] && pending.installed[3];
     InstallCodePatch(pending.physicalResult);
     if (pending.physicalResult.installed) InstallCodePatch(pending.criticalCommit);
 
@@ -986,7 +982,7 @@ void InitializeBattleStats(const wchar_t* gameRoot) {
     gLayout = pending;
     gSettlementAvailable[SettlementPhysicalDamage] = pending.installed[0];
     gSettlementAvailable[SettlementStrategyDamage] = pending.installed[1];
-    gSettlementAvailable[kStrategyHealingCapability] = healingComplete;
+    gSettlementAvailable[kRecoveryCapability] = recoveryComplete;
     gComboAvailable = pending.physicalResult.installed;
     gCriticalAvailable = pending.physicalResult.installed && pending.criticalCommit.installed;
     gHookAvailable = gCriticalAvailable || gComboAvailable ||
@@ -1073,7 +1069,7 @@ bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
     snapshot.hookAvailable = gHookAvailable;
     snapshot.physicalSettlementAvailable = gSettlementAvailable[SettlementPhysicalDamage];
     snapshot.strategyDamageAvailable = gSettlementAvailable[SettlementStrategyDamage];
-    snapshot.strategyHealingAvailable = gSettlementAvailable[kStrategyHealingCapability];
+    snapshot.recoveryAvailable = gSettlementAvailable[kRecoveryCapability];
     snapshot.criticalAvailable = gCriticalAvailable;
     snapshot.comboAvailable = gComboAvailable;
     snapshot.active = gActive;

@@ -10,7 +10,7 @@ struct BattleUnitTotals {
     std::wstring label;
     long long damageDealt = 0;
     long long damageReceived = 0;
-    long long healingDone = 0;
+    long long recoveryDone = 0;
     long long criticalCount = 0;
     long long comboExtraHitCount = 0;
     int defeatedEnemies = 0;
@@ -20,7 +20,7 @@ struct BattleStatsSnapshot {
     bool hookAvailable = false;
     bool physicalSettlementAvailable = false;
     bool strategyDamageAvailable = false;
-    bool strategyHealingAvailable = false;
+    bool recoveryAvailable = false;
     bool criticalAvailable = false;
     bool comboAvailable = false;
     bool active = false;
