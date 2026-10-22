@@ -6,11 +6,12 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include "EngineProfile.h"
 
 namespace XiaoAnInstall {
 
 constexpr unsigned kManifestSchema = 1;
-constexpr wchar_t kPackageVersion[] = L"6.6.11";
+constexpr wchar_t kPackageVersion[] = L"1.1.0";
 
 enum class InstallMode {
     Clean,
@@ -38,6 +39,7 @@ struct FileRecord {
 
 struct Manifest {
     unsigned schemaVersion = kManifestSchema;
+    EngineProfileId profile = EngineProfileId::Unknown;
     std::wstring packageVersion;
     std::wstring installId;
     InstallMode mode = InstallMode::Clean;
@@ -51,6 +53,8 @@ struct Manifest {
 };
 
 struct PackagePayload {
+    EngineProfileId profile = EngineProfileId::Unknown;
+    std::wstring expectedExeSha256;
     std::vector<unsigned char> proxy;
     std::vector<unsigned char> gear;
     std::vector<unsigned char> defaultConfig;
@@ -60,6 +64,7 @@ struct PackagePayload {
 std::wstring JoinPath(const std::wstring& left, const std::wstring& right);
 std::wstring CanonicalRoot(const std::wstring& path);
 std::wstring ManifestPath(const std::wstring& root);
+std::wstring ManifestPath(const std::wstring& root, EngineProfileId profile);
 bool FileExists(const std::wstring& path);
 bool DirectoryExists(const std::wstring& path);
 bool IsGameRunning(const std::wstring& root, std::wstring& error);

@@ -1,5 +1,6 @@
 #pragma once
 #include "Patch.h"
+#include "EngineProfile.h"
 
 // Addresses use the legacy 0x400000 origin; they are independent of the loaded image base.
 enum EngineSiteIndex : size_t {
@@ -18,6 +19,15 @@ enum EngineSiteIndex : size_t {
 };
 
 struct EngineLayout {
+    EngineProfileId profile = EngineProfileId::Unknown;
+    // Each profile owns its instruction templates and native toggle membership.
+    BYTE siteOriginal[EngineSiteCount][8] = {};
+    BYTE siteEnabled[EngineSiteCount][8] = {};
+    unsigned nativeSiteMask = 0;
+    uintptr_t waitWrapper = 0;
+    uintptr_t timerContext = 0;
+    bool stageUsesThis = false;
+    bool dialog3Applicable = true;
     uintptr_t sites[EngineSiteCount] = {};
     uintptr_t nativeStage = 0;
     uintptr_t nativeSuper = 0;

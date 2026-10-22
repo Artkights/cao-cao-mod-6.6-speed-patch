@@ -68,12 +68,17 @@ int wmain(int argc, wchar_t** argv) {
     const DWORD wait = WaitForSingleObject(process, 30000);
     CloseHandle(process);
     if (wait != WAIT_OBJECT_0) return 7;
-    const std::wstring manifest = std::wstring(argv[4]) + L"\\patch\\xiaoan66\\install.ini";
+    const std::wstring manifest65 = std::wstring(argv[4]) + L"\\patch\\xiaoan65\\install.ini";
+    const std::wstring manifest66 = std::wstring(argv[4]) + L"\\patch\\xiaoan66\\install.ini";
+    const auto manifestExists = [&]() {
+        return GetFileAttributesW(manifest65.c_str()) != INVALID_FILE_ATTRIBUTES ||
+            GetFileAttributesW(manifest66.c_str()) != INVALID_FILE_ATTRIBUTES;
+    };
     const ULONGLONG restoreDeadline = GetTickCount64() + 15000;
-    while (GetTickCount64() < restoreDeadline && GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES)
+    while (GetTickCount64() < restoreDeadline && manifestExists())
         Sleep(100);
     EnumWindows(CloseWorkerResult, 0);
-    if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) return 8;
+    if (manifestExists()) return 8;
     printf("PASS confirmed menu uninstall closed the game and removed the manifest\n");
     return 0;
 }

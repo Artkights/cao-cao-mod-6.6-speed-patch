@@ -1,4 +1,5 @@
 #include "BattleRuntime.h"
+#include "EngineProfile.h"
 
 #include <stdio.h>
 #include <vector>
@@ -50,12 +51,13 @@ int wmain(int argc, wchar_t** argv) {
         "resolve unit/person runtime anchors");
     Check(units == 0x4A7B20 && people == 0x4CEA00,
         "resolve the 6.6 ShanZei unit array and person pointer slot");
+    const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz65;
     std::wstring itemName;
-    Check(LoadBattleItemNameForTest(argv[2], 0, itemName) && itemName == L"铁剑",
+    Check(LoadBattleItemNameForTest(argv[2], 0, itemName) && itemName == (engine65 ? L"短剑" : L"铁剑"),
         "read the current MOD's low item table as Unicode");
-    Check(LoadBattleItemNameForTest(argv[2], 104, itemName) && itemName == L"昭武明光铠",
+    Check(LoadBattleItemNameForTest(argv[2], 104, itemName) && itemName == (engine65 ? L"虎豹嘶风铠" : L"昭武明光铠"),
         "read the current MOD's high item table as Unicode");
-    Check(LoadBattleItemNameForTest(argv[2], 30, itemName) && itemName == L"古今双绝" &&
+    if (!engine65) Check(LoadBattleItemNameForTest(argv[2], 30, itemName) && itemName == L"古今双绝" &&
         LoadBattleItemNameForTest(argv[2], 71, itemName) && itemName == L"鱼鳞铠",
         "resolve live ShanZei equipment IDs to their actual weapon and armor names");
     printf("BattleRuntimeTests: %d failures\n", failures);

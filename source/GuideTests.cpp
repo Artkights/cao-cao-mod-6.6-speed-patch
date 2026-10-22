@@ -147,6 +147,32 @@ bool ValidateShanZeiS85(const std::wstring& value, const GuideTestStats& stats) 
         stats.aiEntries > 0 && stats.rewardEntries > 0;
 }
 
+bool ValidateStandard65(const std::wstring& value, const GuideTestStats& stats, bool finalStage) {
+    if (!ValidatePlayerText(value) || stats.commands == 0 || stats.dialogEntries == 0 || stats.aiEntries == 0)
+        return false;
+    static const wchar_t* first[] = {
+        L"第 00 关简易攻略",
+        L"击退张宝时，张宝触发对话；获得恢复用麦，并且获得太平清领道。",
+        L"击退张梁时，张梁触发对话并且获得恢复用麦。",
+        L"我军阶段开始且第 1 回合时",
+        L"（5，10）至（12，12）范围的敌军由被动出击改为主动出击",
+        L"完成本关后，获得 200 金钱。",
+        L"我方部队到达（13，12）后，获得恢复用豆。"
+    };
+    static const wchar_t* last[] = {
+        L"第 58 关简易攻略",
+        L"（2，12）至（39，39）区域内的敌军数量等于0且我军阶段开始",
+        L"曹操触发对话；诸葛亮触发对话，并且诸葛亮全能力上升。",
+        L"（9，2）至（23，18）范围的敌军由坚守原地改为主动出击。"
+    };
+    if (finalStage) {
+        for (const wchar_t* item : last) if (value.find(item) == std::wstring::npos) return false;
+        return stats.commands == 477 && stats.rewardEntries == 1;
+    }
+    for (const wchar_t* item : first) if (value.find(item) == std::wstring::npos) return false;
+    return stats.commands == 819 && stats.dialogEntries == 2 && stats.aiEntries == 1 && stats.rewardEntries == 7;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc != 3 && argc != 4) return 2;
     if (!ValidateStateFormatting()) return 7;
@@ -212,6 +238,12 @@ int wmain(int argc, wchar_t** argv) {
             fromR.find(L"刘备当前 HP 低于 80时，刘备触发对话并且刘备全能力上升并解除异常") ==
                 std::wstring::npos)
             return 9;
+    } else if (argc == 4 && (wcscmp(argv[3], L"--standard65-s00") == 0 ||
+        wcscmp(argv[3], L"--standard65-s58") == 0)) {
+        GuideTestStats stats;
+        if (!BuildGuideStatsForTest(argv[1], argv[2], stats) ||
+            !ValidateStandard65(text, stats, wcscmp(argv[3], L"--standard65-s58") == 0) ||
+            !ValidateScenarioSelection(argv[2])) return 14;
     } else if (argc == 4) {
         return 2;
     }

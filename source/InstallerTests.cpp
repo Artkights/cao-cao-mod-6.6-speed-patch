@@ -19,8 +19,8 @@ bool SameHash(const std::vector<unsigned char>& bytes, const wchar_t* path) {
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 5) {
-        fprintf(stderr, "Usage: InstallerTests <installer> <proxy> <gear> <original-audio>\n");
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "Usage: InstallerTests <installer> <proxy66> <gear> <original-audio> [proxy65]\n");
         return 2;
     }
     std::wstring error, hash;
@@ -34,12 +34,17 @@ int wmain(int argc, wchar_t** argv) {
     Check(XiaoAnInstall::ValidateOriginalAudio(argv[4], error), "sample original audio has 20 implementations");
 
     HMODULE installer = LoadLibraryExW(argv[1], nullptr, LOAD_LIBRARY_AS_DATAFILE);
-    std::vector<unsigned char> proxy, gear, config, features;
+    std::vector<unsigned char> proxy, proxy65, gear, config, features;
     Check(installer && XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_PROXY, proxy, error) &&
           XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_GEAR, gear, error) &&
           XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_CONFIG, config, error) &&
           XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_FEATURES, features, error),
           "installer contains runtime payloads and feature defaults");
+    Check(installer && XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_PROXY65, proxy65, error) &&
+          XiaoAnInstall::ValidateProxyAudioBytes(proxy65, error),
+          "installer contains a valid 6.5 proxy with the exact 20 forwarders");
+    if (argc == 6) Check(SameHash(proxy65, argv[5]), "embedded 6.5 proxy is byte-identical to its final build");
+    Check(proxy != proxy65, "6.5 and 6.6 runtime resources are distinct");
     Check(SameHash(proxy, argv[2]), "embedded proxy is byte-identical to the final build");
     Check(SameHash(gear, argv[3]), "embedded gear module is byte-identical to the final build");
     size_t lines = 0;
@@ -61,6 +66,18 @@ int wmain(int argc, wchar_t** argv) {
           "embedded uninstall worker is an x86 PE32 executable");
     DeleteFileW(workerPath);
     if (proxyModule) FreeLibrary(proxyModule);
+    if (argc == 6) {
+        HMODULE proxy65Module = LoadLibraryExW(argv[5], nullptr, LOAD_LIBRARY_AS_DATAFILE);
+        std::vector<unsigned char> worker65;
+        Check(proxy65Module && XiaoAnInstall::ReadResourceBytes(proxy65Module, IDR_UNINSTALL_WORKER, worker65, error),
+              "6.5 proxy contains the standalone uninstall worker");
+        GetTempFileNameW(temporary, L"xa5", 0, workerPath);
+        Check(XiaoAnInstall::WriteBytes(workerPath, worker65, error) &&
+              XiaoAnInstall::ValidatePe32Executable(workerPath, error),
+              "6.5 embedded uninstall worker is an x86 PE32 executable");
+        DeleteFileW(workerPath);
+        if (proxy65Module) FreeLibrary(proxy65Module);
+    }
     printf("InstallerTests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

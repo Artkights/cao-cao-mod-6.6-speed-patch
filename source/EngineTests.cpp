@@ -1,7 +1,9 @@
 #include "Patch.h"
 #include <stdio.h>
 
-int EngineTestSuperHelper();
+int EngineTestTimerABI(bool usesThis, uintptr_t stage, uintptr_t deadline, uintptr_t context, bool fallback);
+int EngineTestSuperWaitABI(bool usesThis, uintptr_t stage, uintptr_t context, uintptr_t caller,
+    bool enabled, bool known, int& polls);
 int EngineTestSuperCaller(uintptr_t caller);
 void EngineTestSuperWhitelist(uintptr_t caller);
 void EngineTestSuperCallbacks(ULONGLONG (WINAPI* clock)(), void (WINAPI* sleep)(DWORD),
@@ -12,6 +14,41 @@ uintptr_t gGameBase = 0;
 
 namespace {
 int failures = 0;
+uintptr_t timerObserved = 0;
+int timerStageCalls = 0;
+int timerDeadlineCalls = 0;
+__declspec(naked) int ThisStage() {
+    __asm {
+        inc timerStageCalls
+        mov timerObserved, ecx
+        mov eax, [ecx]
+        ret
+    }
+}
+__declspec(naked) int ThisDeadline() {
+    __asm {
+        inc timerDeadlineCalls
+        mov timerObserved, ecx
+        mov eax, [ecx]
+        ret
+    }
+}
+int __cdecl CdeclStage() { ++timerStageCalls; return 321; }
+int __cdecl CdeclDeadline() { ++timerDeadlineCalls; return 1; }
+__declspec(naked) int ThisWaitStage() {
+    __asm {
+        inc timerStageCalls
+        mov timerObserved, ecx
+        xor eax, eax
+        cmp timerStageCalls, 2
+        jb waiting
+        mov eax, [ecx]
+    waiting:
+        ret
+    }
+}
+int __cdecl CdeclWaitStage() { return ++timerStageCalls >= 2 ? 321 : 0; }
+
 ULONGLONG testClock = 10000;
 int sleepCalls = 0;
 int pumpCalls = 0;
@@ -64,6 +101,37 @@ int LegacyStageReference(WORD speed, BYTE phase, const BYTE table[3], BYTE& coun
 }
 
 int main() {
+    int timerValue = 0x1234;
+    const uintptr_t timerContext = reinterpret_cast<uintptr_t>(&timerValue);
+    Check(EngineTestTimerABI(true, reinterpret_cast<uintptr_t>(&ThisStage),
+        reinterpret_cast<uintptr_t>(&ThisDeadline), timerContext, true) == timerValue &&
+        timerObserved == timerContext && timerStageCalls == 1 && timerDeadlineCalls == 0,
+        "6.5 phase bridge preserves ECX for the native-stage fallback");
+    Check(EngineTestTimerABI(true, reinterpret_cast<uintptr_t>(&ThisStage),
+        reinterpret_cast<uintptr_t>(&ThisDeadline), timerContext, false) == 1 &&
+        timerObserved == timerContext && timerStageCalls == 1 && timerDeadlineCalls == 1,
+        "6.5 phase bridge supplies the timer object to deadline polling");
+    Check(EngineTestTimerABI(false, reinterpret_cast<uintptr_t>(&CdeclStage),
+        reinterpret_cast<uintptr_t>(&CdeclDeadline), 0, true) == 321 && timerStageCalls == 2,
+        "6.6 native-stage fallback keeps its original cdecl ABI");
+    Check(EngineTestTimerABI(false, reinterpret_cast<uintptr_t>(&CdeclStage),
+        reinterpret_cast<uintptr_t>(&CdeclDeadline), 0, false) == 1 && timerDeadlineCalls == 2,
+        "6.6 phase deadline polling keeps its original cdecl ABI");
+    int polls = 0;
+    timerStageCalls = 0;
+    Check(EngineTestSuperWaitABI(true, reinterpret_cast<uintptr_t>(&ThisWaitStage), timerContext,
+        0x87654321, true, false, polls) == timerValue && polls == 2 && timerStageCalls == 2 &&
+        timerObserved == timerContext,
+        "6.5 unknown super caller retries the native ECX timer and eventually completes");
+    timerStageCalls = 0;
+    Check(EngineTestSuperWaitABI(false, reinterpret_cast<uintptr_t>(&CdeclWaitStage), 0,
+        0x87654321, true, false, polls) == 321 && polls == 2 && timerStageCalls == 2,
+        "6.6 unknown super caller retries the native cdecl timer and eventually completes");
+    timerStageCalls = 0;
+    Check(EngineTestSuperWaitABI(true, reinterpret_cast<uintptr_t>(&ThisWaitStage), timerContext,
+        0x12345678, false, true, polls) == timerValue && polls == 2 && timerStageCalls == 2 &&
+        timerObserved == timerContext,
+        "disabled super S preserves native waiting for an otherwise classified caller");
     bool pacing = true;
     const int values[] = {0, 1, 2, 25, 49, 50};
     for (int value : values) {
@@ -118,8 +186,6 @@ int main() {
     bool zeroAlways = true;
     for (int i = 0; i < 200; ++i) zeroAlways = zeroAlways && StageDelay(0, counterForZero) == 0;
     Check(zeroAlways, "phase value zero never sleeps for one millisecond");
-    Check(EngineTestSuperHelper() == 0,
-        "unknown super-wait context stays on the native message-pump path");
     EngineTestSuperWhitelist(0x12345678);
     EngineTestSuperCallbacks(TestClock, TestSleep, TestPump);
     Check(EngineTestSuperCaller(0x12345678) == 1 && sleepCalls == 1 && pumpCalls == 1 && recursiveResult,
@@ -129,8 +195,6 @@ int main() {
     testClock += 4000;
     Check(EngineTestSuperCaller(0x12345678) == 1 && sleepCalls == 2 && pumpCalls == 2,
         "known long-running presentation receives another bounded yield after four milliseconds");
-    Check(EngineTestSuperCaller(0x87654321) == 0,
-        "unknown caller remains on the native wait path even while super S is enabled");
 
     printf("Engine verification: %d failures\n", failures);
     return failures ? 1 : 0;

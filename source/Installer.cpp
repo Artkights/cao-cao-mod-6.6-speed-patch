@@ -41,12 +41,19 @@ std::wstring ExecutableDirectory() {
 }
 
 void Show(bool quiet, const std::wstring& text, UINT flags) {
-    if (!quiet) MessageBoxW(nullptr, text.c_str(), L"加速补丁6.6安装器", flags | MB_SETFOREGROUND);
+    if (!quiet) MessageBoxW(nullptr, text.c_str(), L"加速补丁安装器", flags | MB_SETFOREGROUND);
 }
 
-bool LoadPayload(XiaoAnInstall::PackagePayload& payload, std::wstring& error) {
+bool LoadPayload(const EngineDetection& engine, XiaoAnInstall::PackagePayload& payload, std::wstring& error) {
+    if (engine.profile != EngineProfileId::Ccz65 && engine.profile != EngineProfileId::Ccz66) {
+        error = L"没有与当前游戏版本匹配的补丁载荷。";
+        return false;
+    }
+    payload.profile = engine.profile;
+    payload.expectedExeSha256 = engine.exeSha256;
     HMODULE module = GetModuleHandleW(nullptr);
-    return XiaoAnInstall::ReadResourceBytes(module, IDR_INSTALL_PROXY, payload.proxy, error) &&
+    const WORD proxyId = engine.profile == EngineProfileId::Ccz65 ? IDR_INSTALL_PROXY65 : IDR_INSTALL_PROXY;
+    return XiaoAnInstall::ReadResourceBytes(module, proxyId, payload.proxy, error) &&
            XiaoAnInstall::ReadResourceBytes(module, IDR_INSTALL_GEAR, payload.gear, error) &&
            XiaoAnInstall::ReadResourceBytes(module, IDR_INSTALL_CONFIG, payload.defaultConfig, error) &&
            XiaoAnInstall::ReadResourceBytes(module, IDR_INSTALL_FEATURES, payload.defaultFeatures, error);
@@ -66,7 +73,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (useCurrentFolder) {
         arguments.root = ExecutableDirectory();
         if (arguments.root.empty() ||
-            !XiaoAnInstall::FileExists(XiaoAnInstall::JoinPath(arguments.root, L"Ekd5.exe"))) {
+            (!XiaoAnInstall::FileExists(XiaoAnInstall::JoinPath(arguments.root, L"Ekd5.exe")) &&
+             !XiaoAnInstall::FileExists(XiaoAnInstall::ManifestPath(arguments.root, EngineProfileId::Ccz65)) &&
+             !XiaoAnInstall::FileExists(XiaoAnInstall::ManifestPath(arguments.root, EngineProfileId::Ccz66)))) {
             Show(arguments.quiet, L"当前所在文件夹不是游戏根目录", MB_ICONERROR);
             CoUninitialize();
             return 3;
@@ -85,8 +94,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (!arguments.install && !arguments.uninstall) {
         if (kind == XiaoAnInstall::TargetKind::Installed) {
             const int choice = MessageBoxW(nullptr,
-                L"已安装补丁，选择\"是\"更新补丁，选择\"否\"卸载补丁，选择“取消”退出",
-                L"加速补丁6.6安装器", MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
+                (detail + L"\r\n选择\"是\"更新补丁，选择\"否\"卸载补丁，选择“取消”退出").c_str(),
+                L"加速补丁安装器", MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
             if (choice == IDCANCEL) {
                 CoUninitialize();
                 return 1;
@@ -94,8 +103,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             uninstall = choice == IDNO;
         } else {
             const int choice = MessageBoxW(nullptr,
-                L"是否安装安装补丁",
-                L"加速补丁6.6安装器", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
+                (L"已识别受支持的游戏版本，是否安装加速补丁？\r\n" + detail).c_str(),
+                L"加速补丁安装器", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
             if (choice != IDYES) {
                 CoUninitialize();
                 return 1;
@@ -104,6 +113,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     std::wstring report, error;
+    EngineProfileId installedProfile = EngineProfileId::Unknown;
     bool success = false;
     if (uninstall) {
         if (kind != XiaoAnInstall::TargetKind::Installed) {
@@ -112,12 +122,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             success = XiaoAnInstall::RestorePatch(arguments.root, report, error, true);
         }
     } else {
+        EngineDetection engine;
         XiaoAnInstall::PackagePayload payload;
-        if (LoadPayload(payload, error)) success = XiaoAnInstall::InstallPatch(arguments.root, payload, kind, report, error);
+        if (DetectEngineProfile(arguments.root, engine, error) && LoadPayload(engine, payload, error)) {
+            installedProfile = engine.profile;
+            success = XiaoAnInstall::InstallPatch(arguments.root, payload, kind, report, error);
+        }
     }
     if (!success) Show(arguments.quiet, error, MB_ICONERROR);
     else if (!uninstall)
-        Show(arguments.quiet, L"补丁已完成安装，小暗祝您游玩开心哦！", MB_ICONINFORMATION);
+        Show(arguments.quiet, std::wstring(L"补丁已完成安装（") + EngineProfileName(installedProfile) +
+            L"），小暗祝您游玩开心哦！", MB_ICONINFORMATION);
     CoUninitialize();
     return success ? 0 : 4;
 }

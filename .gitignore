@@ -1,4 +1,5 @@
 # Build outputs and intermediate files
+source/build/
 *.exe
 *.dll
 *.obj

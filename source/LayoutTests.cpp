@@ -63,35 +63,51 @@ int wmain(int argc, wchar_t** argv) {
             static_cast<unsigned>(layout.sites[4]), static_cast<unsigned>(layout.sites[5]),
             static_cast<unsigned>(layout.nativeStage), static_cast<unsigned>(layout.phase),
             static_cast<unsigned>(layout.speed));
-        Check(layout.sites[SiteDialog3] == 0x42DB2C && layout.sites[SiteExtraDelay] == 0x415B40 &&
-            layout.sites[SiteWaitBranch] == 0x42C4EF && layout.sites[SiteDialogDisplay] == 0x42C812 &&
-            layout.sites[SiteExtendedDisplay] == 0x455CE5,
-            "resolve all native 6.6 acceleration sites including dialog3");
-        Check(layout.nativeSuper == 0x4250E6 && layout.nativeSuperCall == 0x4132E3 &&
-            layout.nativeSuperState == 0x500ADB && layout.nativeSuperBusy == 0x500E0C,
-            "resolve the native Z toggle owner and its state bytes");
+        const bool is65 = layout.profile == EngineProfileId::Ccz65;
+        Check((is65 && layout.nativeSuper == 0x4250B3 && layout.nativeSuperState == 0x4CE7BF &&
+            layout.waitWrapper == 0x42C4E0 && layout.timerContext == 0x4B1B18 && layout.stageUsesThis &&
+            layout.sites[SiteMapText] == 0x4327EF && !layout.dialog3Applicable) ||
+            (!is65 && layout.nativeSuper == 0x4250E6 && layout.nativeSuperState == 0x500ADB &&
+            layout.waitWrapper == 0x42C4E5 && !layout.stageUsesThis && layout.dialog3Applicable),
+            "identify independent profile, native owner and timer ABI");
+        Check(layout.sites[SiteExtraDelay] == 0x415B40 && layout.sites[SiteWaitBranch] == 0x42C4EF &&
+            layout.sites[SiteDialogDisplay] == 0x42C812 && layout.sites[SiteExtendedDisplay] == 0x455CE5 &&
+            (is65 ? layout.sites[SiteDialog3] == 0 : layout.sites[SiteDialog3] == 0x42DB2C),
+            "resolve every acceleration site implemented by this engine profile");
+        if (is65) {
+            DWORD dialog3, next;
+            memcpy(&dialog3, image.data() + 0x10C18, 4);
+            memcpy(&next, image.data() + 0x10C1C, 4);
+            Check(dialog3 == 0x4D0000 && next == dialog3,
+                "6.5 dialog3 dispatch slot is an unimplemented command, not a missed patch site");
+        }
         const unsigned requiredCapabilities = CapabilitySuperDialog|CapabilitySuperMapText|
             CapabilitySuperDelay|CapabilitySuperR|CapabilitySuperS|CapabilityPhase|CapabilityInput|
-            CapabilityDialog3|CapabilityExtraDelay|CapabilityDialogDisplay|
-            CapabilityExtendedDisplay|CapabilityNativeSuper;
-        Check((layout.capabilities & requiredCapabilities) == requiredCapabilities,
-            "all acceleration capabilities pass their semantic checks");
-        bool safeCallers = layout.waitCallerCount == 17;
+            CapabilityExtraDelay|CapabilityDialogDisplay|CapabilityExtendedDisplay|CapabilityNativeSuper|
+            (is65 ? 0u : CapabilityDialog3);
+        wprintf(L"capabilities=%08X expected=%08X callers=%u nativeCall=%08X\n", layout.capabilities, requiredCapabilities, static_cast<unsigned>(layout.waitCallerCount), static_cast<unsigned>(layout.nativeSuperCall));
+        const bool complete = (layout.capabilities & requiredCapabilities) == requiredCapabilities;
+        Check(complete, "all acceleration capabilities implemented by this profile pass semantic checks");
+        // Never index a missing site after a failed resolver assertion.
+        if (!complete) continue;
+        bool safeCallers = layout.waitCallerCount == (is65 ? 16u : 17u);
         for (size_t i = 0; i < layout.waitCallerCount; ++i)
             safeCallers = safeCallers && layout.waitCallers[i] != layout.sites[SiteRWait] + 5;
-        Check(safeCallers, "S wait whitelist excludes the separately controlled R wait");
+        Check(safeCallers, "profile-specific S wait whitelist excludes the separately controlled R wait");
         const auto original = image;
         gGameBase = reinterpret_cast<uintptr_t>(image.data());
-        Check(EngineTestInitializeImage(base), "initialize real mapped base without its original hash");
+        const bool initialized = EngineTestInitializeImage(base);
+        Check(initialized, "initialize real mapped base without its original hash");
+        if (!initialized) continue;
         Settings settings;
         settings.superEnabled = true;
         for (bool& flag : settings.superFlags) flag = false;
         settings.superFlags[0] = true;
-        Check(ApplyEngineState(settings) && image[layout.sites[SiteDialog3] - 0x400000] == 0xC2 &&
+        Check(ApplyEngineState(settings) && (!layout.dialog3Applicable || image[layout.sites[SiteDialog3] - 0x400000] == 0xC2) &&
             image[layout.sites[SiteDialogDisplay] - 0x400000] == 0xEB &&
             image[layout.nativeSuper - 0x400000] == 0xE9 &&
             image[layout.nativeSuperState - 0x400000] == 1,
-            "dialog switch covers dialog3 and the native Z route owns the toggle");
+            "dialog switch covers this profile's dialogue paths and owns native Z");
         RestoreEngine();
         Check(image == original, "dialog3 and native Z routing restore byte-for-byte");
         EngineTestFailWrite(1);
@@ -112,7 +128,7 @@ int wmain(int argc, wchar_t** argv) {
         settings.superFlags[2] = true;
         Check(ApplyEngineState(settings) && image[layout.sites[SiteDelay] - 0x400000] == 0xC2 &&
             image[layout.sites[SiteExtraDelay] - 0x400000] == 0xEB,
-            "delay switch covers both legacy and 6.6 delay paths");
+            "delay switch covers both native delay paths");
         RestoreEngine();
         settings = Settings();
         settings.superEnabled = true;
@@ -121,7 +137,9 @@ int wmain(int argc, wchar_t** argv) {
         Check(ApplyEngineState(settings) &&
             image[layout.sites[SiteWaitCall] - 0x400000] == 0xE8 &&
             image[layout.sites[SiteWaitBranch] - 0x400000] == 0x75 &&
-            image[layout.sites[SiteExtendedDisplay] - 0x400000] == 0xEB,
+            image[layout.sites[SiteExtendedDisplay] - 0x400000] == 0xEB &&
+            image[layout.sites[SiteExtendedDisplay] - 0x400000 + 1] ==
+                layout.siteEnabled[SiteExtendedDisplay][1],
             "S switch keeps the native completion branch and accelerates extended display");
         RestoreEngine();
         settings = Settings();
@@ -153,7 +171,7 @@ int wmain(int argc, wchar_t** argv) {
         Check(stageApplied && image[layout.phaseTable - 0x400000] == 60 &&
             image[layout.phaseTable - 0x400000 + 1] == 61 &&
             image[layout.phaseTable - 0x400000 + 2] == 62,
-            "phase acceleration writes the native 6.6 phase table");
+            "phase acceleration writes the selected native phase table");
         Check(stageApplied && image[layout.sites[4] - 0x400000] == 0xE8 &&
             image[layout.sites[4] - 0x400000 + 5] == original[layout.sites[4] - 0x400000 + 5] &&
             image[layout.sites[4] - 0x400000 + 6] == original[layout.sites[4] - 0x400000 + 6] &&
@@ -180,13 +198,20 @@ int wmain(int argc, wchar_t** argv) {
         Check(image == ctrlBase, "closing patch restores original Ctrl rather than reference-base Shift");
         image = original;
         const DWORD relocatedBase = base + 0x1000000;
-        const size_t absoluteOperands[] = {layout.nativeStage + 6 - 0x400000,
-            layout.nativeStage + 0x2C - 0x400000,
-            layout.nativeSuper + 4 - 0x400000, layout.nativeSuper + 9 - 0x400000,
-            layout.nativeSuper + 35 - 0x400000, layout.nativeSuper + 46 - 0x400000,
-            layout.nativeSuper + 55 - 0x400000, layout.nativeSuper + 64 - 0x400000,
-            layout.nativeSuper + 72 - 0x400000, layout.nativeSuper + 82 - 0x400000,
-            layout.nativeSuper + 93 - 0x400000};
+        std::vector<size_t> absoluteOperands = {layout.nativeStage + (is65 ? 7 : 6) - 0x400000,
+            layout.nativeStage + (is65 ? 40 : 39) - 0x400000,
+            layout.nativeStage + (is65 ? 45 : 44) - 0x400000,
+            layout.nativeStage + (is65 ? 51 : 50) - 0x400000,
+            layout.nativeSuper + 4 - 0x400000, layout.nativeSuper + 9 - 0x400000};
+        const size_t nativeStart = layout.nativeSuper - 0x400000;
+        for (size_t offset = nativeStart + 12; offset + 10 < nativeStart + (is65 ? 152 : 172); ++offset)
+            if (image[offset] == 0xC7 && image[offset + 1] == 0x05)
+                absoluteOperands.push_back(offset + 2);
+        if (is65) {
+            absoluteOperands.push_back(layout.waitWrapper + 4 - 0x400000);
+            absoluteOperands.push_back(0x10C18);
+            absoluteOperands.push_back(0x10C1C);
+        }
         for (size_t operand : absoluteOperands) {
             DWORD pointer;
             memcpy(&pointer, image.data() + operand, sizeof(pointer));
@@ -201,21 +226,21 @@ int wmain(int argc, wchar_t** argv) {
             relocated.sites[SiteDialog3] == layout.sites[SiteDialog3],
             "relocated image preserves absolute data and relative helper mappings");
         image = original;
-        if (index != 1) continue;
-        const size_t nativeIndices[] = {SiteDialog3,SiteExtraDelay,SiteWaitBranch,SiteDialogDisplay,
-            SiteDialog,SiteMapText,SiteExtendedDisplay};
-        const BYTE nativeEnabled[][4] = {{0xC2,0x04,0,0x6A},{0xEB,0x06},{0xEB,0x07},{0xEB,0x1D},
-            {0xC2,0x0C,0,0xE8},{0xC2,0x10,0,0x6A},{0xEB,0xF5}};
-        const size_t nativeLengths[] = {4,2,2,2,4,4,2};
-        for (size_t i = 0; i < ARRAYSIZE(nativeIndices); ++i)
-            memcpy(image.data() + layout.sites[nativeIndices[i]] - 0x400000,
-                nativeEnabled[i], nativeLengths[i]);
+
+        std::vector<size_t> nativeIndices;
+        const size_t lengths[EngineSiteCount] = {4,4,3,5,5,1,4,2,2,2,2};
+        for (size_t site = 0; site < EngineSiteCount; ++site) {
+            if (!(layout.nativeSiteMask & (1u << site))) continue;
+            nativeIndices.push_back(site);
+            memcpy(image.data() + layout.sites[site] - 0x400000,
+                layout.siteEnabled[site], lengths[site]);
+        }
         image[layout.nativeSuperState - 0x400000] = 1;
         gGameBase = reinterpret_cast<uintptr_t>(image.data());
         Check(EngineTestInitializeImage(base) && image == original,
             "complete native-on layout normalizes to the canonical off baseline");
         image = original;
-        memcpy(image.data() + layout.sites[SiteDialog3] - 0x400000, nativeEnabled[0], 4);
+        memcpy(image.data() + layout.sites[SiteDialog] - 0x400000, layout.siteEnabled[SiteDialog], 4);
         gGameBase = reinterpret_cast<uintptr_t>(image.data());
         Check(EngineTestInitializeImage(base) && wcsstr(EngineError(), L"未知") != nullptr,
             "mixed native-toggle bytes are rejected instead of captured as originals");
@@ -227,14 +252,14 @@ int wmain(int argc, wchar_t** argv) {
         image[key] = VK_CONTROL;
         Check(ResolveEngineLayout(image.data(), altered, base), "accept a base using native Ctrl acceleration");
         const size_t delay = layout.sites[2] - 0x400000;
-        BYTE backup[36];
-        memcpy(backup, image.data() + delay + 0x100, sizeof(backup));
-        memcpy(image.data() + delay + 0x100, image.data() + delay, sizeof(backup));
+        std::vector<BYTE> backup(is65 ? 47u : 36u);
+        memcpy(backup.data(), image.data() + delay + 0x100, backup.size());
+        memcpy(image.data() + delay + 0x100, image.data() + delay, backup.size());
         Check(ResolveEngineLayout(image.data(), altered, base) &&
             !(altered.capabilities & CapabilitySuperDelay),
             "ambiguous delay signatures disable only the affected feature");
-        memset(image.data() + delay, 0x90, sizeof(backup));
-        const size_t callOffsets[] = {6, 11, 25};
+        memset(image.data() + delay, 0x90, backup.size());
+        const size_t callOffsets[] = {is65 ? 12u : 6u, is65 ? 20u : 11u, is65 ? 34u : 25u};
         for (size_t offset : callOffsets) {
             int32_t displacement;
             memcpy(&displacement, image.data() + delay + 0x100 + offset + 1, sizeof(displacement));
@@ -243,15 +268,15 @@ int wmain(int argc, wchar_t** argv) {
         }
         Check(ResolveEngineLayout(image.data(), altered, base) && altered.sites[2] == layout.sites[2] + 0x100,
             "relocated delay function resolves its native call targets");
-        memcpy(image.data() + delay, image.data() + delay + 0x100, sizeof(backup));
+        memcpy(image.data() + delay, image.data() + delay + 0x100, backup.size());
         for (size_t offset : callOffsets) {
             int32_t displacement;
             memcpy(&displacement, image.data() + delay + offset + 1, sizeof(displacement));
             displacement += 0x100;
             memcpy(image.data() + delay + offset + 1, &displacement, sizeof(displacement));
         }
-        memcpy(image.data() + delay + 0x100, backup, sizeof(backup));
-        image[delay + 23] = 0x90;
+        memcpy(image.data() + delay + 0x100, backup.data(), backup.size());
+        image[delay + (is65 ? 32 : 23)] = 0x90;
         Check(ResolveEngineLayout(image.data(), altered, base) &&
             !(altered.capabilities & CapabilitySuperDelay),
             "unrecognized wait semantics disable only the affected feature");

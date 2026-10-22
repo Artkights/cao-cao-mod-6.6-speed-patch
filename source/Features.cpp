@@ -1,4 +1,5 @@
 #include "Features.h"
+#include "EngineProfile.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -28,7 +29,7 @@ void AppendValue(std::wstring& text, const wchar_t* key, int value) {
 
 bool LoadFeatureSettings(const wchar_t* gameRoot) {
     if (!gameRoot || !*gameRoot) return false;
-    gFeaturePath = std::wstring(gameRoot) + L"\\patch\\xiaoan66\\features.ini";
+    gFeaturePath = PatchPrivatePath(gameRoot, CompiledEngineProfile()) + L"\\features.ini";
     FeatureSettings settings;
     static const wchar_t* campKeys[] = {L"Player", L"Friend", L"Enemy"};
     static const wchar_t* kindKeys[] = {
@@ -49,9 +50,9 @@ bool LoadFeatureSettings(const wchar_t* gameRoot) {
 
 bool SaveFeatureSettings(const wchar_t* gameRoot) {
     if (!gameRoot || !*gameRoot) return false;
-    if (gFeaturePath.empty()) gFeaturePath = std::wstring(gameRoot) + L"\\patch\\xiaoan66\\features.ini";
+    if (gFeaturePath.empty()) gFeaturePath = PatchPrivatePath(gameRoot, CompiledEngineProfile()) + L"\\features.ini";
     const std::wstring patch = std::wstring(gameRoot) + L"\\patch";
-    const std::wstring folder = patch + L"\\xiaoan66";
+    const std::wstring folder = PatchPrivatePath(gameRoot, CompiledEngineProfile());
     if (!EnsureDirectory(patch) || !EnsureDirectory(folder)) return false;
 
     std::wstring text = L"[Features]\r\nSchemaVersion=1\r\n\r\n[Animation]\r\n";

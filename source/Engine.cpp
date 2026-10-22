@@ -36,6 +36,10 @@ const size_t kSiteCount = sizeof(gSites) / sizeof(gSites[0]);
 const size_t kNativeRouteSite = EngineSiteCount;
 EngineLayout DefaultLayout() {
     EngineLayout layout;
+    layout.profile = EngineProfileId::Ccz66;
+    layout.waitWrapper = 0x42C4E5;
+    layout.nativeSiteMask = (1u << SiteDialog3)|(1u << SiteExtraDelay)|(1u << SiteWaitBranch)|
+        (1u << SiteDialogDisplay)|(1u << SiteDialog)|(1u << SiteMapText)|(1u << SiteExtendedDisplay);
     const uintptr_t sites[EngineSiteCount] = {0x42D5B0,0x4332A6,0x422DBA,0x429964,0x42C4E8,
         0x413324,0x42DB2C,0x415B40,0x42C4EF,0x42C812,0x455CE5};
     memcpy(layout.sites, sites, sizeof(sites));
@@ -51,6 +55,14 @@ EngineLayout DefaultLayout() {
     layout.speed = 0x500AD8;
     layout.phaseTable = 0x4750DC;
     layout.phaseCounter = 0x4750DF;
+    for (size_t i = 0; i < EngineSiteCount; ++i)
+        memcpy(layout.siteOriginal[i], gSites[i].original, sizeof(layout.siteOriginal[i]));
+    const BYTE enabled[EngineSiteCount][8] = {
+        {0xC2,0x0C,0,0xE8},{0xC2,0x10,0,0x6A},{0xC2,0x04,0},
+        {0x90,0x90,0x90,0x90,0x90},{},{0x10},{0xC2,0x04,0,0x6A},
+        {0xEB,0x06},{0xEB,0x07},{0xEB,0x1D},{0xEB,0xF5}
+    };
+    memcpy(layout.siteEnabled, enabled, sizeof(enabled));
     layout.capabilities = CapabilitySuperDialog|CapabilitySuperMapText|CapabilitySuperDelay|
         CapabilitySuperR|CapabilitySuperS|CapabilityPhase|CapabilityInput|CapabilityDialog3|
         CapabilityExtraDelay|CapabilityDialogDisplay|CapabilityExtendedDisplay|CapabilityNativeSuper;
@@ -310,13 +322,19 @@ int KnownWaitCallerKind(uintptr_t caller) {
     return -1;
 }
 
-int NativeStageCall() {
-    return reinterpret_cast<int (__cdecl*)()>(At(gLayout.nativeStage))();
+int CallTimerFunction(uintptr_t address, uintptr_t context) {
+    if (gLayout.stageUsesThis)
+        return reinterpret_cast<int (__thiscall*)(void*)>(At(address))(reinterpret_cast<void*>(context));
+    return reinterpret_cast<int (__cdecl*)()>(At(address))();
 }
 
-int __cdecl LegacyPhaseHelper() {
+int NativeStageCall(uintptr_t context) {
+    return CallTimerFunction(gLayout.nativeStage, context);
+}
+
+int __cdecl LegacyPhaseHelper(uintptr_t context) {
     if (!gPhaseInstalled || !gPhaseDataAvailable || !gLayout.speed || !gLayout.phase ||
-        !gLayout.phaseTable || !gLayout.phaseCounter || !gLayout.sleep) return NativeStageCall();
+        !gLayout.phaseTable || !gLayout.phaseCounter || !gLayout.sleep) return NativeStageCall(context);
 
     WORD speed = 0;
     BYTE phase = 0;
@@ -325,7 +343,7 @@ int __cdecl LegacyPhaseHelper() {
     if (!ReadBytes(gLayout.speed, &speed, sizeof(speed)) ||
         !ReadBytes(gLayout.phase, &phase, sizeof(phase)) || phase >= 3 ||
         !ReadBytes(gLayout.phaseTable + phase, &value, sizeof(value)) ||
-        !ReadBytes(gLayout.phaseCounter, &counter, sizeof(counter))) return NativeStageCall();
+        !ReadBytes(gLayout.phaseCounter, &counter, sizeof(counter))) return NativeStageCall(context);
 
     int delay = 0;
     if (value > 50) {
@@ -341,32 +359,35 @@ int __cdecl LegacyPhaseHelper() {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             wroteCounter = false;
         }
-        if (!wroteCounter) return NativeStageCall();
+        if (!wroteCounter) return NativeStageCall(context);
     }
     reinterpret_cast<void (__stdcall*)(DWORD)>(At(gLayout.sleep))(static_cast<DWORD>(delay));
     if ((speed & 0xFF) == 0 && gLayout.deadline)
-        reinterpret_cast<int (__cdecl*)()>(At(gLayout.deadline))();
+        CallTimerFunction(gLayout.deadline, context);
     return 1;
 }
 
 __declspec(naked) int __cdecl LegacyPhaseBridge() {
     __asm {
+        push ecx
         call LegacyPhaseHelper
+        add esp, 4
         ret
     }
 }
 
-int __cdecl SuperYieldWithContext(uintptr_t caller) {
-    // The native wrapper treats zero as "keep waiting and pump messages".
-    // Unknown callers must take that path because they may be interactive or
-    // waiting for a resource rather than an expendable animation frame.
+int __cdecl SuperYieldWithContext(uintptr_t caller, uintptr_t context) {
+    // The wrapper repeats this call while it returns zero. Merely returning
+    // zero for an unknown wait would remove the native completion test and
+    // keep the wrapper pumping forever. Preserve that test and its timer ABI.
     const int kind = KnownWaitCallerKind(caller);
-    if (!gSuperS || kind < 0) return 0;
+    if (!gSuperS || kind < 0) return NativeStageCall(context);
 #ifndef XA66_TEST
-    if (kind >= static_cast<int>(AnimationKind::Count) || !gFeatureSettings.animationKinds[kind]) return 0;
+    if (kind >= static_cast<int>(AnimationKind::Count) || !gFeatureSettings.animationKinds[kind])
+        return NativeStageCall(context);
     BYTE camp = 0xFF;
-    if (!gLayout.phase || !ReadBytes(gLayout.phase, &camp, sizeof(camp))) return 0;
-    if (camp >= 3 || !gFeatureSettings.animationCamps[camp]) return 0;
+    if (!gLayout.phase || !ReadBytes(gLayout.phase, &camp, sizeof(camp))) return NativeStageCall(context);
+    if (camp >= 3 || !gFeatureSettings.animationCamps[camp]) return NativeStageCall(context);
 #endif
     if (gSuperBusy) return 1;
     const ULONGLONG before = SuperClock();
@@ -386,15 +407,12 @@ int __cdecl SuperYieldWithContext(uintptr_t caller) {
 __declspec(naked) int __cdecl SuperYieldBridge() {
     __asm {
         mov eax, [esp + 8]
+        push ecx
         push eax
         call SuperYieldWithContext
-        add esp, 4
+        add esp, 8
         ret
     }
-}
-
-int __cdecl SuperYieldHelper() {
-    return SuperYieldWithContext(0);
 }
 
 uintptr_t CallTarget(uintptr_t instruction) {
@@ -406,33 +424,31 @@ uintptr_t CallTarget(uintptr_t instruction) {
 }
 
 bool NormalizeNativeToggleLayout() {
-    static const size_t indices[] = {SiteDialog3,SiteExtraDelay,SiteWaitBranch,SiteDialogDisplay,
-        SiteDialog,SiteMapText,SiteExtendedDisplay};
-    static const BYTE enabled[][4] = {
-        {0xC2,0x04,0x00,0x6A},{0xEB,0x06},{0xEB,0x07},{0xEB,0x1D},
-        {0xC2,0x0C,0x00,0xE8},{0xC2,0x10,0x00,0x6A},{0xEB,0xF5}
-    };
+    size_t indices[EngineSiteCount] = {};
+    size_t count = 0;
+    for (size_t i = 0; i < EngineSiteCount; ++i)
+        if (gLayout.nativeSiteMask & (1u << i)) indices[count++] = i;
     bool allOriginal = true;
     bool allEnabled = true;
-    for (size_t i = 0; i < ARRAYSIZE(indices); ++i) {
+    for (size_t i = 0; i < count; ++i) {
         const Site& site = gSites[indices[i]];
         allOriginal = allOriginal && MatchBytes(site.address, site.original, site.length);
-        allEnabled = allEnabled && MatchBytes(site.address, enabled[i], site.length);
+        allEnabled = allEnabled && MatchBytes(site.address, gLayout.siteEnabled[indices[i]], site.length);
     }
     if (!allOriginal && !allEnabled) {
-        SetError(L"6.6 原生超级加速站点处于未知或不完整状态；已停用相关子项，阶段、齿轮和其它已验证功能仍可使用。");
-        for (size_t index : indices) gSites[index].available = false;
+        SetError(L"原生超级加速站点处于未知或不完整状态；已停用相关子项，阶段、齿轮和其它已验证功能仍可使用。");
+        for (size_t i = 0; i < count; ++i) gSites[indices[i]].available = false;
         gSites[kNativeRouteSite].available = false;
         return true;
     }
     if (allEnabled) {
         bool changed[ARRAYSIZE(indices)] = {};
-        for (size_t i = 0; i < ARRAYSIZE(indices); ++i) {
+        for (size_t i = 0; i < count; ++i) {
             Site& site = gSites[indices[i]];
             if (!WriteSite(site, site.original)) {
                 for (size_t j = 0; j < i; ++j)
-                    if (changed[j]) WriteSite(gSites[indices[j]], enabled[j], true);
-                SetSiteMismatch(L"无法把 6.6 原生超级加速恢复为关闭状态", site, enabled[i]);
+                    if (changed[j]) WriteSite(gSites[indices[j]], gLayout.siteEnabled[indices[j]], true);
+                SetSiteMismatch(L"无法把 原生超级加速恢复为关闭状态", site, gLayout.siteEnabled[indices[i]]);
                 return false;
             }
             changed[i] = true;
@@ -442,7 +458,7 @@ bool NormalizeNativeToggleLayout() {
         const BYTE zero = 0;
         if (!WriteMemory(gLayout.nativeSuperState, &zero, 1) ||
             !WriteMemory(gLayout.nativeSuperBusy, &zero, 1)) {
-            SetError(L"无法初始化 6.6 原生超级加速状态字节，已停止接管 Z 键。");
+            SetError(L"无法初始化 原生超级加速状态字节，已停止接管 Z 键。");
             gSites[kNativeRouteSite].available = false;
             return true;
         }
@@ -453,6 +469,8 @@ bool NormalizeNativeToggleLayout() {
 
 bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     gInitialized = false;
+    gPhaseDataAvailable = false;
+    gNativeDataAvailable = false;
     gError[0] = 0;
     if (!gGameBase) {
         SetError(L"\u65e0\u6cd5\u5b9a\u4f4d\u6e38\u620f\u4e3b\u7a0b\u5e8f\u3002");
@@ -461,12 +479,19 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     if (resolveLayout) {
         EngineLayout layout;
         if (!ResolveEngineLayout(reinterpret_cast<const BYTE*>(gGameBase), layout, virtualBase)) {
-            SetError(L"\u672a\u80fd\u5b9a\u4f4d\u6b64\u57fa\u5e95\u7684 6.6 \u52a0\u901f\u51fd\u6570\u3002");
+            SetError(L"\u672a\u80fd\u5b9a\u4f4d\u6b64\u57fa\u5e95\u7684\u52a0\u901f\u51fd\u6570\u3002");
             return false;
         }
+#ifndef XA66_TEST
+        if (layout.profile != CompiledEngineProfile()) {
+            SetError(L"游戏引擎与补丁版本不匹配，请重新运行加速补丁安装器。");
+            return false;
+        }
+#endif
         gLayout = layout;
         for (size_t i = 0; i < EngineSiteCount; ++i) {
             gSites[i].address = layout.sites[i];
+            memcpy(gSites[i].original, layout.siteOriginal[i], sizeof(gSites[i].original));
             gSites[i].available = layout.sites[i] != 0 && (layout.capabilities & gSites[i].capability) != 0;
         }
         gSites[kNativeRouteSite].address = layout.nativeSuper;
@@ -487,19 +512,19 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     const BYTE branchTail[] = {0x07};
     if (!resolveLayout && (!MatchBytes(gSites[SiteInputModifier].address - 2, shiftContext, sizeof(shiftContext)) ||
         !MatchBytes(gSites[SiteWaitBranch].address + 1, branchTail, sizeof(branchTail)))) {
-        SetError(L"6.6 \u8f93\u5165\u6216\u7b49\u5f85\u6307\u4ee4\u5df2\u88ab\u5176\u4ed6\u8865\u4e01\u6539\u53d8\uff0c\u5df2\u505c\u6b62\u52a0\u901f\u4fee\u6539\u3002");
+        SetError(L"\u8f93\u5165\u6216\u7b49\u5f85\u6307\u4ee4\u5df2\u88ab\u5176\u4ed6\u8865\u4e01\u6539\u53d8\uff0c\u5df2\u505c\u6b62\u52a0\u901f\u4fee\u6539\u3002");
         return false;
     }
     if (gSites[SiteWaitCall].available) {
         if (CallTarget(gSites[SiteWaitCall].address) != gLayout.nativeStage) {
-            SetSiteMismatch(L"6.6 公共等待调用目标无效，已停用阶段和超级 S", gSites[SiteWaitCall],
+            SetSiteMismatch(L"公共等待调用目标无效，已停用阶段和超级 S", gSites[SiteWaitCall],
                 gSites[SiteWaitCall].original);
             gSites[SiteWaitCall].available = false;
         } else ReadBytes(gSites[SiteWaitCall].address, gSites[SiteWaitCall].original,
             gSites[SiteWaitCall].length);
     }
     if (gSites[SiteRWait].available) {
-        if (CallTarget(gSites[SiteRWait].address) != gSites[SiteWaitCall].address - 3) {
+        if (CallTarget(gSites[SiteRWait].address) != gLayout.waitWrapper) {
             gSites[SiteRWait].available = false;
         } else ReadBytes(gSites[SiteRWait].address, gSites[SiteRWait].original,
             gSites[SiteRWait].length);
@@ -525,7 +550,7 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
             gSites[i].original[0] = modifier;
         }
         if (!MatchBytes(gSites[i].address, gSites[i].original, gSites[i].length)) {
-            SetSiteMismatch(L"6.6 \u6307\u4ee4\u6821\u9a8c\u5931\u8d25\uff0c\u5df2\u505c\u7528\u8be5\u529f\u80fd", gSites[i], gSites[i].original);
+            SetSiteMismatch(L"\u6307\u4ee4\u6821\u9a8c\u5931\u8d25\uff0c\u5df2\u505c\u7528\u8be5\u529f\u80fd", gSites[i], gSites[i].original);
             gSites[i].available = false;
             continue;
         }
@@ -619,7 +644,8 @@ bool ApplyEngineState(const Settings& settings) {
         nativeRouteInstalled = true;
     bool superSInstalled = false;
     bool phaseUnavailable = settings.phaseEnabled && !gPhaseDataAvailable;
-    const bool dialogReady = gSites[SiteDialog].available && gSites[SiteDialog3].available &&
+    const bool dialogReady = gSites[SiteDialog].available &&
+        (!gLayout.dialog3Applicable || gSites[SiteDialog3].available) &&
         gSites[SiteDialogDisplay].available;
     const bool mapReady = gSites[SiteMapText].available && gSites[SiteDialogDisplay].available;
     const bool delayReady = gSites[SiteDelay].available && gSites[SiteExtraDelay].available;
@@ -631,7 +657,7 @@ bool ApplyEngineState(const Settings& settings) {
             const BYTE dialog[] = {0xC2,0x0C,0x00,0xE8};
             const BYTE dialog3[] = {0xC2,0x04,0x00,0x6A};
             memcpy(desired[SiteDialog], dialog, sizeof(dialog));
-            memcpy(desired[SiteDialog3], dialog3, sizeof(dialog3));
+            if (gLayout.dialog3Applicable) memcpy(desired[SiteDialog3], dialog3, sizeof(dialog3));
         }
         if (settings.superFlags[1] && mapReady) {
             const BYTE map[] = {0xC2,0x10,0x00,0x6A};
@@ -655,7 +681,7 @@ bool ApplyEngineState(const Settings& settings) {
                 reinterpret_cast<uintptr_t>(At(gSites[SiteWaitCall].address)))) {
                 superSInstalled = true;
                 desired[SiteExtendedDisplay][0] = 0xEB;
-                desired[SiteExtendedDisplay][1] = 0xF5;
+                desired[SiteExtendedDisplay][1] = gLayout.siteEnabled[SiteExtendedDisplay][1];
             }
         }
     }
@@ -695,7 +721,7 @@ bool ApplyEngineState(const Settings& settings) {
         (!ReadBytes(gLayout.nativeSuperState, &oldNativeState, 1) ||
          !ReadBytes(gLayout.nativeSuperBusy, &oldNativeBusy, 1) ||
          !WriteMemory(gLayout.nativeSuperBusy, &busy, 1))) {
-        SetError(L"无法锁定 6.6 原生超级加速状态，本次设置未生效。");
+        SetError(L"无法锁定 原生超级加速状态，本次设置未生效。");
         return false;
     }
     if (phaseChanged && !WriteMemory(gLayout.phaseTable, newPhase, sizeof(newPhase))) {
@@ -719,13 +745,13 @@ bool ApplyEngineState(const Settings& settings) {
             if (phaseChanged) WriteMemory(gLayout.phaseTable, oldPhase, sizeof(oldPhase));
             WriteMemory(gLayout.nativeSuperState, &oldNativeState, 1);
             WriteMemory(gLayout.nativeSuperBusy, &oldNativeBusy, 1);
-            SetError(L"6.6 原生超级加速状态同步失败，本次设置已回滚。");
+            SetError(L"原生超级加速状态同步失败，本次设置已回滚。");
             return false;
         }
     }
     if (gPhaseDataAvailable) memcpy(gPhaseCurrent, newPhase, 3);
     if (!nativeRouteInstalled)
-        SetErrorIfEmpty(L"6.6 原生 Z 键入口接管失败；已停用原生快捷键兜底，其它可用功能保持不变。");
+        SetErrorIfEmpty(L"原生 Z 键入口接管失败；已停用原生快捷键兜底，其它可用功能保持不变。");
     if (settings.superEnabled && settings.superFlags[0] && !dialogReady)
         SetErrorIfEmpty(L"超级加速对白功能定位失败，已停用该子项。");
     if (settings.superEnabled && settings.superFlags[1] && !mapReady)
@@ -785,8 +811,7 @@ void SetNativeToggleHandler(void (__cdecl* handler)()) {
 bool EngineTestInitialize() { return InitializeSites(false); }
 bool EngineTestInitializeImage(uintptr_t virtualBase) { return InitializeSites(true, virtualBase); }
 void EngineTestFailWrite(int index) { gFailWrite = index; gWriteCount = 0; }
-int EngineTestSuperHelper() { return SuperYieldHelper(); }
-int EngineTestSuperCaller(uintptr_t caller) { return SuperYieldWithContext(caller); }
+int EngineTestSuperCaller(uintptr_t caller) { return SuperYieldWithContext(caller, 0); }
 void EngineTestSuperWhitelist(uintptr_t caller) {
     for (bool& value : gFeatureSettings.animationCamps) value = true;
     for (bool& value : gFeatureSettings.animationKinds) value = true;
@@ -802,6 +827,75 @@ void EngineTestSuperCallbacks(ULONGLONG (WINAPI* clock)(), void (WINAPI* sleep)(
     gTestSuperPump = pump;
     gSuperBusy = gSuperScheduled = false;
     gSuperLast = 0;
+}
+// Exercise the actual assembly bridge with functions that require an ECX
+// context. This catches an ABI regression that offline byte tests cannot.
+void WINAPI EngineTestNoSleep(DWORD) {}
+int EngineTestTimerABI(bool usesThis, uintptr_t stage, uintptr_t deadline, uintptr_t context,
+    bool nativeFallback) {
+    const EngineLayout savedLayout = gLayout;
+    const uintptr_t savedBase = gGameBase;
+    const bool savedInstalled = gPhaseInstalled;
+    const bool savedAvailable = gPhaseDataAvailable;
+    WORD speed = 0;
+    BYTE phase = 0;
+    BYTE table[4] = {60,60,60,0};
+    gGameBase = kPreferredBase;
+    gLayout = EngineLayout();
+    gLayout.stageUsesThis = usesThis;
+    gLayout.nativeStage = stage;
+    gLayout.deadline = deadline;
+    gLayout.sleep = reinterpret_cast<uintptr_t>(&EngineTestNoSleep);
+    gLayout.speed = reinterpret_cast<uintptr_t>(&speed);
+    gLayout.phase = reinterpret_cast<uintptr_t>(&phase);
+    gLayout.phaseTable = reinterpret_cast<uintptr_t>(table);
+    gLayout.phaseCounter = reinterpret_cast<uintptr_t>(table + 3);
+    gPhaseDataAvailable = true;
+    gPhaseInstalled = !nativeFallback;
+    int result = 0;
+    __asm {
+        mov ecx, context
+        call LegacyPhaseBridge
+        mov result, eax
+    }
+    gLayout = savedLayout;
+    gGameBase = savedBase;
+    gPhaseInstalled = savedInstalled;
+    gPhaseDataAvailable = savedAvailable;
+    return result;
+}
+int EngineTestSuperWaitABI(bool usesThis, uintptr_t stage, uintptr_t context, uintptr_t caller,
+    bool enabled, bool known, int& polls) {
+    const EngineLayout savedLayout = gLayout;
+    const uintptr_t savedBase = gGameBase;
+    const bool savedSuperS = gSuperS;
+    gGameBase = kPreferredBase;
+    gLayout = EngineLayout();
+    gLayout.stageUsesThis = usesThis;
+    gLayout.nativeStage = stage;
+    gLayout.waitCallerCount = known ? 1 : 0;
+    gLayout.waitCallers[0] = caller;
+    gLayout.waitKinds[0] = static_cast<unsigned char>(AnimationKind::Physical);
+    gSuperS = enabled;
+    polls = 0;
+    int result = 0;
+    // Reproduce the wrapper's saved EBP and caller-return positions, then
+    // execute its actual zero/retry and nonzero/complete contract.
+    while (!result && polls < 8) {
+        ++polls;
+        __asm {
+            mov ecx, context
+            push caller
+            push ebp
+            call SuperYieldBridge
+            add esp, 8
+            mov result, eax
+        }
+    }
+    gLayout = savedLayout;
+    gGameBase = savedBase;
+    gSuperS = savedSuperS;
+    return result;
 }
 ULONGLONG EngineTestRealClock() {
     auto saved = gTestSuperClock;

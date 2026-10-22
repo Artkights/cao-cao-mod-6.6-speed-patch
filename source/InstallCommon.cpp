@@ -17,11 +17,38 @@
 namespace XiaoAnInstall {
 namespace {
 
-constexpr const wchar_t* kPrivateRelative = L"patch\\xiaoan66";
-constexpr const wchar_t* kBackupRelative = L"patch\\xiaoan66\\backup";
-constexpr const wchar_t* kManifestRelative = L"patch\\xiaoan66\\install.ini";
-constexpr const wchar_t* kConfigRelative = L"patch\\xiaoan66\\pl_06.ini";
-constexpr const wchar_t* kFeaturesRelative = L"patch\\xiaoan66\\features.ini";
+struct PrivatePaths {
+    std::wstring directory;
+    std::wstring backup;
+    std::wstring manifest;
+    std::wstring config;
+    std::wstring features;
+    std::wstring stagePrefix;
+};
+
+bool IsKnownProfile(EngineProfileId profile) {
+    return profile == EngineProfileId::Ccz65 || profile == EngineProfileId::Ccz66;
+}
+
+PrivatePaths PathsFor(EngineProfileId profile) {
+    const std::wstring directory = PatchPrivateRelative(profile);
+    return {directory, JoinPath(directory, L"backup"), JoinPath(directory, L"install.ini"),
+            JoinPath(directory, L"pl_06.ini"), JoinPath(directory, L"features.ini"),
+            L".xiaoan" + std::to_wstring(static_cast<unsigned>(profile))};
+}
+
+bool FindInstalledProfile(const std::wstring& root, EngineProfileId& profile, std::wstring& error) {
+    const bool exists65 = FileExists(ManifestPath(root, EngineProfileId::Ccz65));
+    const bool exists66 = FileExists(ManifestPath(root, EngineProfileId::Ccz66));
+    profile = EngineProfileId::Unknown;
+    if (exists65 && exists66) {
+        error = L"同时发现 6.5 和 6.6 安装清单，无法确认唯一恢复基线，操作已停止。";
+        return false;
+    }
+    if (exists65) profile = EngineProfileId::Ccz65;
+    else if (exists66) profile = EngineProfileId::Ccz66;
+    return true;
+}
 constexpr const wchar_t* kAudioNames[] = {
     L"CDAudioClose", L"CDAudioEjectMedia", L"CDAudioGetDriveLetter", L"CDAudioGetNumDrives",
     L"CDAudioGetNumTracks", L"CDAudioGetPlayingPos", L"CDAudioGetStartPos", L"CDAudioGetTrackLength",
@@ -456,6 +483,7 @@ bool SaveManifestFile(const std::wstring& path, const Manifest& manifest, std::w
     std::wstringstream output;
     output << L"[Install]\r\n";
     output << L"SchemaVersion=" << manifest.schemaVersion << L"\r\n";
+    output << L"EngineProfile=" << static_cast<unsigned>(manifest.profile) << L"\r\n";
     output << L"PackageVersion=" << manifest.packageVersion << L"\r\n";
     output << L"InstallId=" << manifest.installId << L"\r\n";
     output << L"InstallMode=" << (manifest.mode == InstallMode::Clean ? L"Clean" : L"LegacyAdopted") << L"\r\n";
@@ -601,6 +629,7 @@ struct Change {
     std::wstring rollback;
     bool hadTarget = false;
     bool applied = false;
+    DWORD originalAttributes = INVALID_FILE_ATTRIBUTES;
 };
 
 void RollbackChanges(std::vector<Change>& changes) {
@@ -608,7 +637,9 @@ void RollbackChanges(std::vector<Change>& changes) {
         if (!it->applied) continue;
         SetFileAttributesW(it->target.c_str(), FILE_ATTRIBUTE_NORMAL);
         DeleteFileW(it->target.c_str());
-        if (it->hadTarget) MoveFileExW(it->rollback.c_str(), it->target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        if (it->hadTarget && MoveFileExW(it->rollback.c_str(), it->target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) &&
+            it->originalAttributes != INVALID_FILE_ATTRIBUTES)
+            SetFileAttributesW(it->target.c_str(), it->originalAttributes);
     }
 }
 
@@ -617,9 +648,13 @@ bool BeginChanges(std::vector<Change>& changes, std::wstring& error) {
         Change& change = changes[i];
         change.hadTarget = FileExists(change.target);
         if (change.hadTarget) {
+            change.originalAttributes = GetFileAttributesW(change.target.c_str());
             SetFileAttributesW(change.target.c_str(), FILE_ATTRIBUTE_NORMAL);
             if (!MoveFileExW(change.target.c_str(), change.rollback.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-                error = Failure(L"无法暂存现有文件", change.target, GetLastError());
+                const DWORD code = GetLastError();
+                if (change.originalAttributes != INVALID_FILE_ATTRIBUTES)
+                    SetFileAttributesW(change.target.c_str(), change.originalAttributes);
+                error = Failure(L"无法暂存现有文件", change.target, code);
                 RollbackChanges(changes);
                 return false;
             }
@@ -700,7 +735,15 @@ std::wstring CanonicalRoot(const std::wstring& path) {
     return result;
 }
 
-std::wstring ManifestPath(const std::wstring& root) { return JoinPath(root, kManifestRelative); }
+std::wstring ManifestPath(const std::wstring& root, EngineProfileId profile) {
+    return JoinPath(root, PathsFor(profile).manifest);
+}
+
+std::wstring ManifestPath(const std::wstring& root) {
+    if (FileExists(ManifestPath(root, EngineProfileId::Ccz65)))
+        return ManifestPath(root, EngineProfileId::Ccz65);
+    return ManifestPath(root, EngineProfileId::Ccz66);
+}
 
 bool FileExists(const std::wstring& path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -789,22 +832,28 @@ TargetKind DetectTarget(const std::wstring& rootValue, std::wstring& detail) {
         return TargetKind::Invalid;
     }
     std::wstring error;
-    if (!ValidatePe32Executable(JoinPath(root, L"Ekd5.exe"), error)) {
-        detail = L"目标目录缺少有效的 x86 Ekd5.exe。\r\n" + error;
+    EngineProfileId installedProfile = EngineProfileId::Unknown;
+    if (!FindInstalledProfile(root, installedProfile, error)) {
+        detail = error;
         return TargetKind::Invalid;
     }
-    if (FileExists(ManifestPath(root))) {
+    if (IsKnownProfile(installedProfile)) {
         Manifest manifest;
         if (!LoadManifest(root, manifest, error)) {
             detail = L"发现安装清单，但清单已损坏。\r\n" + error;
             return TargetKind::Invalid;
         }
-        detail = L"已安装，可执行修复/更新或应急卸载。";
+        detail = std::wstring(L"已安装 ") + EngineProfileName(manifest.profile) + L" 补丁，可执行修复/更新或应急卸载。";
         return TargetKind::Installed;
+    }
+    EngineDetection engine;
+    if (!DetectEngineProfile(root, engine, error)) {
+        detail = L"无法确认受支持的 6.5 或 6.6 游戏版本。\r\n" + error;
+        return TargetKind::Invalid;
     }
     const std::wstring proxy = JoinPath(root, L"Koeicda.dll");
     if (ValidateOriginalAudio(proxy, error)) {
-        detail = L"检测到未安装补丁的原始音频 DLL。";
+        detail = std::wstring(L"检测到 ") + EngineProfileName(engine.profile) + L"，音频 DLL 尚未安装补丁。";
         return TargetKind::Clean;
     }
     const std::wstring original = JoinPath(root, L"Koeicda_org.dll");
@@ -812,7 +861,7 @@ TargetKind DetectTarget(const std::wstring& rootValue, std::wstring& detail) {
     std::wstring proxyError, originalError, gearError;
     if (ValidateProxyAudio(proxy, proxyError) && ValidateOriginalAudio(original, originalError) &&
         ValidateGear(gear, gearError)) {
-        detail = L"检测到旧版松散文件安装，可执行有限迁移。";
+        detail = std::wstring(L"检测到 ") + EngineProfileName(engine.profile) + L" 的旧版松散文件安装，可执行有限迁移。";
         return TargetKind::Legacy;
     }
     detail = L"无法确认音频 DLL 与齿轮 DLL 的身份，已拒绝覆盖。\r\n代理检查：" + proxyError +
@@ -822,8 +871,32 @@ TargetKind DetectTarget(const std::wstring& rootValue, std::wstring& detail) {
 
 bool LoadManifest(const std::wstring& rootValue, Manifest& manifest, std::wstring& error) {
     const std::wstring root = CanonicalRoot(rootValue);
+    manifest = {};
+    EngineProfileId pathProfile = EngineProfileId::Unknown;
+    if (!FindInstalledProfile(root, pathProfile, error)) return false;
+    if (!IsKnownProfile(pathProfile)) {
+        error = L"此目录没有可用的安装清单。";
+        return false;
+    }
     std::map<std::wstring, std::wstring> values;
-    if (!ReadManifestMap(ManifestPath(root), values, error)) return false;
+    if (!ReadManifestMap(ManifestPath(root, pathProfile), values, error)) return false;
+    const auto profileValue = values.find(L"Install/EngineProfile");
+    if (profileValue == values.end()) {
+        if (pathProfile != EngineProfileId::Ccz66) {
+            error = L"6.5 安装清单缺少 EngineProfile 字段。";
+            return false;
+        }
+        manifest.profile = EngineProfileId::Ccz66;
+    } else {
+        uint64_t parsedProfile = 0;
+        if (!ParseUnsigned(profileValue->second, parsedProfile) ||
+            parsedProfile != static_cast<unsigned>(pathProfile)) {
+            error = L"安装清单中的引擎版本与清单所在目录不一致。";
+            return false;
+        }
+        manifest.profile = pathProfile;
+    }
+    const PrivatePaths paths = PathsFor(manifest.profile);
     std::wstring schema, mode, patchExisted, privateExisted;
     if (!GetRequired(values, L"Install/SchemaVersion", schema, error) ||
         !GetRequired(values, L"Install/PackageVersion", manifest.packageVersion, error) ||
@@ -857,10 +930,10 @@ bool LoadManifest(const std::wstring& rootValue, Manifest& manifest, std::wstrin
     }
     const wchar_t* sections[] = {L"File.Koeicda", L"File.KoeicdaOrg", L"File.Gear"};
     const wchar_t* expectedPaths[] = {L"Koeicda.dll", L"Koeicda_org.dll", L"GearNtKe.dll"};
-    const wchar_t* expectedBackups[] = {
-        L"patch\\xiaoan66\\backup\\Koeicda.dll.orig",
-        L"patch\\xiaoan66\\backup\\Koeicda_org.dll.orig",
-        L"patch\\xiaoan66\\backup\\GearNtKe.dll.orig"
+    const std::wstring expectedBackups[] = {
+        JoinPath(paths.backup, L"Koeicda.dll.orig"),
+        JoinPath(paths.backup, L"Koeicda_org.dll.orig"),
+        JoinPath(paths.backup, L"GearNtKe.dll.orig")
     };
     if (!IsSafeInstallId(manifest.installId) || !IsHexHash(manifest.proxySha256) ||
         !IsHexHash(manifest.gearSha256) || !IsHexHash(manifest.originalCopySha256)) {
@@ -870,7 +943,7 @@ bool LoadManifest(const std::wstring& rootValue, Manifest& manifest, std::wstrin
     for (size_t i = 0; i < 3; ++i) {
         if (!LoadRecord(values, sections[i], manifest.files[i], error)) return false;
         if (_wcsicmp(manifest.files[i].path.c_str(), expectedPaths[i]) ||
-            _wcsicmp(manifest.files[i].backup.c_str(), expectedBackups[i]) ||
+            _wcsicmp(manifest.files[i].backup.c_str(), expectedBackups[i].c_str()) ||
             !IsSafeRelative(manifest.files[i].path) || !IsSafeRelative(manifest.files[i].backup) ||
             (manifest.files[i].existed && !IsHexHash(manifest.files[i].sha256)) ||
             (!manifest.files[i].existed && (!manifest.files[i].sha256.empty() || manifest.files[i].size))) {
@@ -962,6 +1035,15 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
         return false;
     }
     if (IsGameRunning(root, error)) return false;
+    EngineDetection engine;
+    if (!DetectEngineProfile(root, engine, error)) return false;
+    if (!IsKnownProfile(payload.profile) || payload.profile != engine.profile ||
+        !IsHexHash(payload.expectedExeSha256) ||
+        _wcsicmp(payload.expectedExeSha256.c_str(), engine.exeSha256.c_str())) {
+        error = L"安装载荷与当前游戏版本或主程序指纹不匹配，操作已停止。";
+        return false;
+    }
+    const PrivatePaths paths = PathsFor(engine.profile);
     if (!ValidateProxyAudioBytes(payload.proxy, error)) {
         error = L"安装器内嵌代理无效。\r\n" + error;
         return false;
@@ -992,31 +1074,42 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
     const bool repair = detected == TargetKind::Installed;
     if (repair) {
         if (!ValidateUninstall(root, manifest, error, false)) return false;
+        if (manifest.profile != engine.profile) {
+            error = L"当前游戏版本与首次安装清单不一致，不能跨版本更新补丁。";
+            return false;
+        }
     } else {
+        manifest.profile = engine.profile;
         manifest.packageVersion = kPackageVersion;
         manifest.installId = HexId();
         manifest.mode = detected == TargetKind::Legacy ? InstallMode::LegacyAdopted : InstallMode::Clean;
         manifest.root = root;
         manifest.patchDirExisted = DirectoryExists(JoinPath(root, L"patch"));
-        manifest.privateDirExisted = DirectoryExists(JoinPath(root, kPrivateRelative));
-        if (manifest.privateDirExisted && !DirectoryEmpty(JoinPath(root, kPrivateRelative))) {
-            error = L"patch\\xiaoan66 已存在但没有有效安装清单。为避免覆盖未知备份，安装已停止。";
+        manifest.privateDirExisted = DirectoryExists(JoinPath(root, paths.directory));
+        if (manifest.privateDirExisted && !DirectoryEmpty(JoinPath(root, paths.directory))) {
+            error = paths.directory + L" 已存在但没有有效安装清单。为避免覆盖未知备份，安装已停止。";
             return false;
         }
         if (detected == TargetKind::Clean) {
-            if (!CaptureFile(JoinPath(root, L"Koeicda.dll"), L"Koeicda.dll", L"patch\\xiaoan66\\backup\\Koeicda.dll.orig", manifest.files[0], error) ||
-                !CaptureFile(JoinPath(root, L"Koeicda_org.dll"), L"Koeicda_org.dll", L"patch\\xiaoan66\\backup\\Koeicda_org.dll.orig", manifest.files[1], error) ||
-                !CaptureFile(JoinPath(root, L"GearNtKe.dll"), L"GearNtKe.dll", L"patch\\xiaoan66\\backup\\GearNtKe.dll.orig", manifest.files[2], error)) return false;
+            if (!CaptureFile(JoinPath(root, L"Koeicda.dll"), L"Koeicda.dll", JoinPath(paths.backup, L"Koeicda.dll.orig"), manifest.files[0], error) ||
+                !CaptureFile(JoinPath(root, L"Koeicda_org.dll"), L"Koeicda_org.dll", JoinPath(paths.backup, L"Koeicda_org.dll.orig"), manifest.files[1], error) ||
+                !CaptureFile(JoinPath(root, L"GearNtKe.dll"), L"GearNtKe.dll", JoinPath(paths.backup, L"GearNtKe.dll.orig"), manifest.files[2], error)) return false;
         } else {
-            if (!CaptureFile(JoinPath(root, L"Koeicda_org.dll"), L"Koeicda.dll", L"patch\\xiaoan66\\backup\\Koeicda.dll.orig", manifest.files[0], error)) return false;
+            if (!CaptureFile(JoinPath(root, L"Koeicda_org.dll"), L"Koeicda.dll", JoinPath(paths.backup, L"Koeicda.dll.orig"), manifest.files[0], error)) return false;
             manifest.files[1].path = L"Koeicda_org.dll";
-            manifest.files[1].backup = L"patch\\xiaoan66\\backup\\Koeicda_org.dll.orig";
+            manifest.files[1].backup = JoinPath(paths.backup, L"Koeicda_org.dll.orig");
             manifest.files[2].path = L"GearNtKe.dll";
-            manifest.files[2].backup = L"patch\\xiaoan66\\backup\\GearNtKe.dll.orig";
+            manifest.files[2].backup = JoinPath(paths.backup, L"GearNtKe.dll.orig");
         }
     }
 
-    const std::wstring stage = JoinPath(root, L".xiaoan66-stage-" + (repair ? HexId() : manifest.installId));
+    std::wstring finalExeHash;
+    if (!Sha256File(JoinPath(root, L"Ekd5.exe"), finalExeHash, error) ||
+        _wcsicmp(finalExeHash.c_str(), payload.expectedExeSha256.c_str())) {
+        error = L"写入前发现游戏主程序已发生变化，操作已停止。\r\n" + error;
+        return false;
+    }
+    const std::wstring stage = JoinPath(root, paths.stagePrefix + L"-stage-" + (repair ? HexId() : manifest.installId));
     if (!EnsureDirectory(stage, error)) return false;
     auto cleanupStage = [&]() { RemoveKnownTree(stage); };
     const std::wstring stagedProxy = JoinPath(stage, L"Koeicda.dll");
@@ -1057,8 +1150,8 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
             return false;
         }
         const std::wstring patch = JoinPath(root, L"patch");
-        const std::wstring privateDir = JoinPath(root, kPrivateRelative);
-        const std::wstring backupDir = JoinPath(root, kBackupRelative);
+        const std::wstring privateDir = JoinPath(root, paths.directory);
+        const std::wstring backupDir = JoinPath(root, paths.backup);
         if (!EnsureDirectory(backupDir, error)) {
             cleanupStage();
             return false;
@@ -1086,13 +1179,13 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
         {JoinPath(root, L"GearNtKe.dll"), stagedGear, JoinPath(stage, L"rollback-GearNtKe.dll")}
     };
     if (!repair) {
-        changes.push_back({JoinPath(root, kConfigRelative), stagedConfig, JoinPath(stage, L"rollback-pl_06.ini")});
-        changes.push_back({JoinPath(root, kFeaturesRelative), stagedFeatures, JoinPath(stage, L"rollback-features.ini")});
+        changes.push_back({JoinPath(root, paths.config), stagedConfig, JoinPath(stage, L"rollback-pl_06.ini")});
+        changes.push_back({JoinPath(root, paths.features), stagedFeatures, JoinPath(stage, L"rollback-features.ini")});
     }
     if (!BeginChanges(changes, error)) {
         if (!repair) {
-            if (!manifest.privateDirExisted) RemoveKnownTree(JoinPath(root, kPrivateRelative));
-            else RemoveKnownTree(JoinPath(root, kBackupRelative));
+            if (!manifest.privateDirExisted) RemoveKnownTree(JoinPath(root, paths.directory));
+            else RemoveKnownTree(JoinPath(root, paths.backup));
         }
         cleanupStage();
         return false;
@@ -1109,19 +1202,19 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
     manifest.proxySha256 = proxyHash;
     manifest.gearSha256 = gearHash;
     manifest.originalCopySha256 = originalHash;
-    if (verified && !SaveManifestFile(ManifestPath(root), manifest, error)) verified = false;
+    if (verified && !SaveManifestFile(ManifestPath(root, manifest.profile), manifest, error)) verified = false;
     if (!verified) {
         RollbackChanges(changes);
         if (!repair) {
-            if (!manifest.privateDirExisted) RemoveKnownTree(JoinPath(root, kPrivateRelative));
-            else RemoveKnownTree(JoinPath(root, kBackupRelative));
+            if (!manifest.privateDirExisted) RemoveKnownTree(JoinPath(root, paths.directory));
+            else RemoveKnownTree(JoinPath(root, paths.backup));
         }
         cleanupStage();
         return false;
     }
     CommitChanges(changes);
     cleanupStage();
-    SetFileAttributesW(JoinPath(root, kPrivateRelative).c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_DIRECTORY);
+    SetFileAttributesW(JoinPath(root, paths.directory).c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_DIRECTORY);
     report = repair ? L"补丁已修复/更新，首次安装保存的原始备份和当前私有配置均已保留。" :
              (manifest.mode == InstallMode::LegacyAdopted ?
               L"旧版松散安装已完成有限迁移。卸载可恢复原音频 DLL 并移除加速模块；共享 patch\\pl_06.ini 保持不变，但无法找回第一次旧安装前已丢失的配置内容。" :
@@ -1134,7 +1227,8 @@ bool RestorePatch(const std::wstring& rootValue, std::wstring& report, std::wstr
     const std::wstring root = CanonicalRoot(rootValue);
     Manifest manifest;
     if (!ValidateUninstall(root, manifest, error, requireInstalledProxy)) return false;
-    const std::wstring stage = JoinPath(root, L".xiaoan66-restore-" + HexId());
+    const PrivatePaths paths = PathsFor(manifest.profile);
+    const std::wstring stage = JoinPath(root, paths.stagePrefix + L"-restore-" + HexId());
     if (!EnsureDirectory(stage, error)) return false;
     std::vector<Change> changes;
     for (size_t i = 0; i < 3; ++i) {
@@ -1173,7 +1267,7 @@ bool RestorePatch(const std::wstring& rootValue, std::wstring& report, std::wstr
     CommitChanges(changes);
     RemoveKnownTree(stage);
 
-    const std::wstring privateDir = JoinPath(root, kPrivateRelative);
+    const std::wstring privateDir = JoinPath(root, paths.directory);
     SetFileAttributesW(privateDir.c_str(), FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_DIRECTORY);
     RemoveKnownTree(privateDir);
     if (manifest.privateDirExisted) EnsureDirectory(privateDir, error);

@@ -11,21 +11,23 @@
 namespace {
 constexpr UINT_PTR kRefreshTimer = 0x6810;
 constexpr UINT kUnitList = 0x6812;
+constexpr UINT kStatsTabs = 0x6813;
 
 HWND gWindow = nullptr;
 HWND gList = nullptr;
+HWND gTabs = nullptr;
 HFONT gFont = nullptr;
 BattleStatsSnapshot gStats;
 
 void ConfigureColumns(int listWidth) {
     if (!gList) return;
-    const int usable = std::max(700, listWidth - 4);
+    const int usable = std::max(1100, listWidth - 4);
     const int unitWidth = std::max(170, usable * 27 / 100);
-    const int metricWidth = (usable - unitWidth) / 5;
+    const int metricWidth = (usable - unitWidth) / 7;
     SendMessageW(gList, LVM_SETCOLUMNWIDTH, 0, unitWidth);
-    for (int column = 1; column < 6; ++column)
+    for (int column = 1; column < 8; ++column)
         SendMessageW(gList, LVM_SETCOLUMNWIDTH, column,
-            column == 5 ? usable - unitWidth - metricWidth * 4 : metricWidth);
+            column == 7 ? usable - unitWidth - metricWidth * 6 : metricWidth);
 }
 
 void InsertText(int row, int column, const std::wstring& value) {
@@ -42,35 +44,41 @@ void InsertRow(int row, const std::wstring& label, const BattleUnitTotals* total
     item.pszText = const_cast<wchar_t*>(label.c_str());
     SendMessageW(gList, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
     if (!totals) return;
-    const bool damageAvailable = gStats.physicalSettlementAvailable &&
-        gStats.strategyDamageAvailable;
-    InsertText(row, 1, damageAvailable ? std::to_wstring(totals->damageDealt) : L"--");
-    InsertText(row, 2, damageAvailable ? std::to_wstring(totals->damageReceived) : L"--");
-    InsertText(row, 3, gStats.recoveryAvailable ?
+    InsertText(row, 1, (gStats.knownMetrics & BattleStatsDamageDealt) ?
+        std::to_wstring(totals->damageDealt) : L"--");
+    InsertText(row, 2, (gStats.knownMetrics & BattleStatsDamageReceived) ?
+        std::to_wstring(totals->damageReceived) : L"--");
+    InsertText(row, 3, (gStats.knownMetrics & BattleStatsRecovery) ?
         std::to_wstring(totals->recoveryDone) : L"--");
-    InsertText(row, 4, gStats.criticalAvailable ?
+    InsertText(row, 4, (gStats.knownMetrics & BattleStatsCritical) ?
         std::to_wstring(totals->criticalCount) : L"--");
-    InsertText(row, 5, gStats.comboAvailable ?
+    InsertText(row, 5, (gStats.knownMetrics & BattleStatsCombo) ?
         std::to_wstring(totals->comboExtraHitCount) : L"--");
+    InsertText(row, 6, (gStats.knownMetrics & BattleStatsAttackBlock) ?
+        std::to_wstring(totals->attackBlockCount) : L"--");
+    InsertText(row, 7, (gStats.knownMetrics & BattleStatsSpellBlock) ?
+        std::to_wstring(totals->spellBlockCount) : L"--");
 }
 
 void Render() {
     if (!gList) return;
+    const bool campaign = gTabs && TabCtrl_GetCurSel(gTabs) == 1;
+    const auto& units = campaign ? gStats.campaignUnits : gStats.units;
+    const int top = ListView_GetTopIndex(gList);
+    SendMessageW(gList, WM_SETREDRAW, FALSE, 0);
     SendMessageW(gList, LVM_DELETEALLITEMS, 0, 0);
-    if (!gStats.hookAvailable) {
-        InsertRow(0, L"当前版本不支持精确统计。", nullptr);
-        return;
-    }
-    if (gStats.units.empty()) {
-        InsertRow(0, gStats.active ? L"暂无统计数据。" : L"进入战场后开始统计。", nullptr);
-        return;
-    }
-    for (size_t row = 0; row < gStats.units.size(); ++row) {
-        const BattleUnitTotals& totals = gStats.units[row];
+    if (units.empty())
+        InsertRow(0, gStats.loading ? L"正在恢复统计数据。" :
+            (campaign ? L"当前存档暂无全局统计数据。" : L"当前战场暂无统计数据。"), nullptr);
+    for (size_t row = 0; row < units.size(); ++row) {
+        const BattleUnitTotals& totals = units[row];
         const std::wstring label = totals.label.empty() ?
-            L"我方单位 " + std::to_wstring(totals.slot + 1) : totals.label;
+            L"我方角色 " + std::to_wstring(totals.personId) : totals.label;
         InsertRow(static_cast<int>(row), label, &totals);
     }
+    if (top > 0 && top < static_cast<int>(units.size())) ListView_EnsureVisible(gList, top, FALSE);
+    SendMessageW(gList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(gList, nullptr, FALSE);
 }
 
 void Refresh() {
@@ -84,7 +92,8 @@ void Layout(HWND window) {
     constexpr int margin = 10;
     const int width = std::max(100, static_cast<int>(client.right - client.left) - margin * 2);
     const int height = std::max(80, static_cast<int>(client.bottom - client.top) - margin * 2);
-    MoveWindow(gList, margin, margin, width, height, TRUE);
+    MoveWindow(gTabs, margin, margin, width, 28, TRUE);
+    MoveWindow(gList, margin, margin + 34, width, std::max(30, height - 34), TRUE);
     ConfigureColumns(width);
 }
 
@@ -98,6 +107,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         NONCLIENTMETRICSW metrics = {sizeof(metrics)};
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
             gFont = CreateFontIndirectW(&metrics.lfMessageFont);
+        gTabs = CreateWindowExW(0, WC_TABCONTROLW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kStatsTabs), gInstance, nullptr);
+        for (int index = 0; index < 2; ++index) {
+            TCITEMW item = {};
+            item.mask = TCIF_TEXT;
+            item.pszText = const_cast<wchar_t*>(index ? L"全局统计" : L"当前战场");
+            SendMessageW(gTabs, TCM_INSERTITEMW, index, reinterpret_cast<LPARAM>(&item));
+        }
         gList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             0, 0, 0, 0, window, reinterpret_cast<HMENU>(kUnitList), gInstance, nullptr);
@@ -105,18 +123,22 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         SendMessageW(gList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
         const wchar_t* headings[] = {
-            L"单位", L"造成伤害", L"承受伤害", L"回复量", L"暴击次数", L"连击次数"
+            L"单位", L"造成伤害", L"承受伤害", L"回复量", L"暴击次数", L"连击次数",
+            L"攻击格挡", L"法术格挡"
         };
-        for (int index = 0; index < 6; ++index) {
+        for (int index = 0; index < 8; ++index) {
             LVCOLUMNW column = {};
             column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
             column.pszText = const_cast<wchar_t*>(headings[index]);
-            column.cx = index ? 110 : 220;
+            column.cx = index ? 124 : 220;
             column.fmt = index ? LVCFMT_RIGHT : LVCFMT_LEFT;
             SendMessageW(gList, LVM_INSERTCOLUMNW, index, reinterpret_cast<LPARAM>(&column));
         }
         if (gList && gFont)
             SendMessageW(gList, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+        if (gFont) {
+            SendMessageW(gTabs, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+        }
         SetTimer(window, kRefreshTimer,
             static_cast<UINT>(gFeatureSettings.battleRefreshMilliseconds), nullptr);
         Refresh();
@@ -124,8 +146,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     case WM_GETMINMAXINFO: {
         auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
-        limits->ptMinTrackSize.x = 760;
-        limits->ptMinTrackSize.y = 260;
+        limits->ptMinTrackSize.x = 1120;
+        limits->ptMinTrackSize.y = 340;
         return 0;
     }
     case WM_SIZE:
@@ -134,6 +156,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_TIMER:
         if (wParam == kRefreshTimer) Refresh();
         return 0;
+    case WM_NOTIFY:
+        if (reinterpret_cast<NMHDR*>(lParam)->idFrom == kStatsTabs &&
+            reinterpret_cast<NMHDR*>(lParam)->code == TCN_SELCHANGE) Render();
+        break;
     case WM_CLOSE:
         DestroyWindow(window);
         return 0;
@@ -142,6 +168,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         if (gFont) DeleteObject(gFont);
         gFont = nullptr;
         gList = nullptr;
+        gTabs = nullptr;
         gWindow = nullptr;
         return 0;
     }
@@ -176,7 +203,7 @@ bool OpenBattleInfo(HWND owner) {
     if (!RegisterWindowClass()) return false;
     RECT ownerRect = {};
     if (!GetWindowRect(owner, &ownerRect)) SetRect(&ownerRect, 100, 100, 900, 700);
-    constexpr int width = 920;
+    constexpr int width = 1160;
     constexpr int height = 460;
     int x = ownerRect.right + 8;
     int y = ownerRect.top;

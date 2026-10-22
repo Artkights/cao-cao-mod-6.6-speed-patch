@@ -1,4 +1,5 @@
 #include "BattleStats.h"
+#include "EngineProfile.h"
 
 #include <array>
 #include <cstring>
@@ -102,10 +103,32 @@ void PutInt(BYTE* address, int value) {
     memcpy(address, &value, sizeof(value));
 }
 
+void PutPerson(BYTE* address, uint16_t value) {
+    memcpy(address, &value, sizeof(value));
+}
+
+const BattleUnitTotals* FindPerson(const std::vector<BattleUnitTotals>& units, int personId) {
+    for (const BattleUnitTotals& unit : units)
+        if (unit.personId == personId) return &unit;
+    return nullptr;
+}
+
 const BattleUnitTotals* FindUnit(const BattleStatsSnapshot& snapshot, int slot) {
     for (const BattleUnitTotals& unit : snapshot.units)
         if (unit.slot == slot) return &unit;
     return nullptr;
+}
+
+bool SameTotals(const BattleUnitTotals& left, const BattleUnitTotals& right) {
+    return left.slot == right.slot && left.personId == right.personId && left.label == right.label &&
+        left.damageDealt == right.damageDealt &&
+        left.damageReceived == right.damageReceived &&
+        left.recoveryDone == right.recoveryDone &&
+        left.criticalCount == right.criticalCount &&
+        left.comboExtraHitCount == right.comboExtraHitCount &&
+        left.attackBlockCount == right.attackBlockCount &&
+        left.spellBlockCount == right.spellBlockCount &&
+        left.defeatedEnemies == right.defeatedEnemies;
 }
 
 void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& frame,
@@ -131,6 +154,9 @@ void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& 
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz65;
+    const uintptr_t recoverySimple = engine65 ? 0x4247E6 : 0x4247DC;
+    const uintptr_t recoveryAnimated = engine65 ? 0x4249F1 : 0x4249DA;
     if (argc != 2) return 2;
     std::vector<BYTE> image;
     DWORD base = 0;
@@ -145,16 +171,18 @@ int wmain(int argc, wchar_t** argv) {
     Check(layout.settlementCalls.size() == 4 &&
         layout.settlementCalls[0] == 0x405ADC &&
         layout.settlementCalls[1] == 0x4229FC &&
-        layout.settlementCalls[2] == 0x4247DC &&
-        layout.settlementCalls[3] == 0x4249DA,
+        layout.settlementCalls[2] == recoverySimple &&
+        layout.settlementCalls[3] == recoveryAnimated,
         "resolve damage and both real recovery-result calls");
     Check(layout.physicalResultCall == 0x452802 && layout.criticalCommit == 0x405F1A,
         "resolve actual-result entry and committed critical decision");
     Check(layout.criticalOffset == 0x604 && layout.comboOffset == 0x608,
         "derive adjacent critical and extra-strike fields semantically");
+    Check(layout.attackBlockCommit == 0 && layout.spellBlockCommit == 0,
+        "do not infer physical or spell block commits from unverified hit paths");
 
     std::vector<BYTE> changed = image;
-    changed[0x4247DC - base] = 0x90;
+    changed[recoverySimple - base] = 0x90;
     BattleStatsImageLayout partial;
     Check(ResolveBattleStatsImageLayoutForTest(changed.data(), base, partial) &&
         partial.settlementCalls.size() == 4 && !partial.settlementCalls[2] &&
@@ -165,11 +193,13 @@ int wmain(int argc, wchar_t** argv) {
     changed[0x405F1A - base] = 0x90;
     Check(ResolveBattleStatsImageLayoutForTest(changed.data(), base, partial) &&
         !partial.criticalCommit && !partial.physicalResultCall &&
-        partial.settlementCalls[2] == 0x4247DC &&
-        partial.settlementCalls[3] == 0x4249DA,
+        partial.settlementCalls[2] == recoverySimple &&
+        partial.settlementCalls[3] == recoveryAnimated,
         "isolate an invalid critical graph from recovery settlement support");
 
     std::vector<BYTE> units(kUnitStride * kUnitCount, 0);
+    for (size_t slot = 0; slot < kUnitCount; ++slot)
+        PutPerson(units.data() + slot * kUnitStride, static_cast<uint16_t>(1000 + slot));
     constexpr BYTE actorSlot = 2;
     constexpr BYTE friendlyTargetSlot = 7;
     constexpr BYTE secondTargetSlot = 8;
@@ -290,11 +320,23 @@ int wmain(int argc, wchar_t** argv) {
     RecordBattleStatsPhysicalResultForTest(reinterpret_cast<uintptr_t>(physical.data()), kComboOffset);
     RecordBattleStatsCriticalForTest(reinterpret_cast<uintptr_t>(physical.data()), kComboOffset);
 
+    // Only explicit confirmed-result calls count as blocks.  Unchanged HP is
+    // intentionally not used because it also covers misses, immunity and
+    // redirected attacks.
+    RecordBattleStatsAttackBlockForTest(enemyActorSlot, actorSlot);
+    RecordBattleStatsSpellBlockForTest(enemyActorSlot, friendlyTargetSlot);
+    RecordBattleStatsAttackBlockForTest(actorSlot, enemyTargetSlot);
+    RecordBattleStatsSpellBlockForTest(enemyActorSlot, enemyTargetSlot);
+    SetBattleStatsModelActiveForTest(false);
+    RecordBattleStatsAttackBlockForTest(enemyActorSlot, actorSlot);
+    SetBattleStatsModelActiveForTest(true);
+
     BattleStatsSnapshot snapshot;
     Check(ReadBattleStatsSnapshot(snapshot) && snapshot.physicalSettlementAvailable &&
         snapshot.strategyDamageAvailable && snapshot.recoveryAvailable &&
-        snapshot.criticalAvailable && snapshot.comboAvailable,
-        "publish five independent battle-stat capabilities");
+        snapshot.criticalAvailable && snapshot.comboAvailable &&
+        snapshot.attackBlockAvailable && snapshot.spellBlockAvailable,
+        "publish seven independent battle-stat capabilities");
     const BattleUnitTotals* actorTotals = FindUnit(snapshot, actorSlot);
     const BattleUnitTotals* friendlyTotals = FindUnit(snapshot, friendlyTargetSlot);
     const BattleUnitTotals* secondTotals = FindUnit(snapshot, secondTargetSlot);
@@ -310,8 +352,131 @@ int wmain(int argc, wchar_t** argv) {
         "count each actual extra-strike ordinal once");
     Check(actorTotals && actorTotals->criticalCount == 4,
         "count committed critical decisions once per action, strike, and target");
+    Check(actorTotals && actorTotals->attackBlockCount == 1,
+        "attribute confirmed physical blocks to the friendly defender");
+    Check(friendlyTotals && friendlyTotals->spellBlockCount == 1,
+        "attribute confirmed spell blocks to the friendly defender");
     Check(!FindUnit(snapshot, enemyActorSlot),
         "exclude enemy recovery and physical events from friendly totals");
+
+    BattleStatsPersistedState persisted;
+    Check(CaptureBattleStatsState(persisted, 1000) && persisted.active &&
+        persisted.units.size() == snapshot.units.size(),
+        "capture active battle statistics before closing the game");
+    ResetBattleStats();
+    BattleStatsSnapshot cleared;
+    Check(ReadBattleStatsSnapshot(cleared) && !cleared.active && cleared.units.empty(),
+        "clear live statistics independently of the persisted state");
+    Check(RestoreBattleStatsState(persisted, 2000),
+        "restore persisted statistics after a later game launch");
+    BattleStatsSnapshot restored;
+    bool same = ReadBattleStatsSnapshot(restored) && restored.active &&
+        restored.units.size() == snapshot.units.size();
+    if (same) {
+        for (const BattleUnitTotals& expected : snapshot.units) {
+            const BattleUnitTotals* actual = FindUnit(restored, expected.slot);
+            if (!actual || !SameTotals(*actual, expected)) { same = false; break; }
+        }
+    }
+    Check(same, "preserve every unit total when statistics are restored");
+
+    bool sameCampaign = snapshot.units.size() == restored.campaignUnits.size();
+    for (const auto& expected : snapshot.units) {
+        const auto* actual = FindPerson(restored.campaignUnits, expected.personId);
+        if (!actual || !SameTotals(expected, *actual)) sameCampaign = false;
+    }
+    Check(sameCampaign, "update current and campaign ledgers from every confirmed event atomically");
+
+    BattleStatsPersistedState longElapsed = persisted;
+    longElapsed.elapsedMilliseconds = 9000000000000ULL;
+    Check(RestoreBattleStatsState(longElapsed, 100), "restore elapsed time beyond current system uptime");
+    BattleStatsPersistedState timed;
+    Check(CaptureBattleStatsState(timed, 175) &&
+        timed.elapsedMilliseconds == longElapsed.elapsedMilliseconds + 75,
+        "keep accumulated duration when a saved game is opened after an operating system restart");
+
+    NotifyBattleStatsScenarioInstalled(1, true, true, 1000);
+    BattleStatsSnapshot fresh;
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.active && fresh.units.empty() && fresh.campaignUnits.empty() &&
+        fresh.campaignId && fresh.battleInstance == 1,
+        "new campaign starts both ledgers and a real S instance without visible-unit heuristics");
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    NotifyBattleStatsScenarioInstalled(1, false, false, 1100);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 1000 + actorSlot) &&
+        FindPerson(fresh.units, 1000 + actorSlot)->damageDealt == 30,
+        "reobserving the installed scenario preserves the current instance");
+    const uint64_t campaignIdentity = fresh.campaignId;
+    NotifyBattleStatsScenarioInstalled(1, false, true, 1200);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.units.empty() && fresh.battleInstance == 2 && fresh.campaignId == campaignIdentity &&
+        FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 30,
+        "a new instance of the same S clears only current statistics");
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    NotifyBattleStatsScenarioInstalled(2, false, false, 1300);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(!fresh.active && FindPerson(fresh.units, 1000 + actorSlot)->damageDealt == 30 &&
+        FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 60,
+        "R scenes retain the last battlefield and campaign totals while pausing collection");
+    NotifyBattleStatsScenarioInstalled(3, false, false, 1400);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.active && fresh.units.empty() && fresh.campaignUnits.size() == 1,
+        "the next S starts an empty current ledger while retaining all campaign people");
+
+    constexpr BYTE movedSlot = 3;
+    PutPerson(units.data() + movedSlot * kUnitStride, 1000 + actorSlot);
+    PutPerson(units.data() + actorSlot * kUnitStride, 2222);
+    PutByte(context.data() + 1, movedSlot);
+    PutPointer(context.data() + 8, unitBase + movedSlot * kUnitStride);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    PutByte(context.data() + 1, actorSlot);
+    PutPointer(context.data() + 8, actor);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 90 &&
+        FindPerson(fresh.campaignUnits, 2222)->damageDealt == 30 && fresh.units.size() == 2,
+        "person IDs follow characters between slots and keep a reused slot's new character separate");
+
+    SetBattleStatsLoading(true);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    NotifyBattleStatsScenarioInstalled(5, true, true, 1500);
+    BattleStatsPersistedState frozen;
+    Check(CaptureBattleStatsState(frozen, GetTickCount64()) && frozen.scenarioOrdinal == 3 &&
+        FindPerson(frozen.campaignUnits, 2222)->damageDealt == 30,
+        "loading freezes both ledgers and ignores scenario reset notifications");
+    Check(RestoreBattleStatsState(persisted, GetTickCount64()), "replace ledgers with the loaded save");
+    SetBattleStatsLoading(false);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.campaignUnits.size() == persisted.campaignUnits.size() &&
+        !FindPerson(fresh.campaignUnits, 2222) &&
+        FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 30,
+        "loading an older save rolls campaign totals back instead of merging timelines");
+
+    BattleStatsPersistedState legacy = persisted;
+    legacy.schemaVersion = 1;
+    legacy.campaignUnits.clear();
+    for (auto& unit : legacy.units) unit.personId = -1;
+    Check(RestoreBattleStatsState(legacy, 2000), "migrate slot-indexed legacy statistics through current people");
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.historyIncomplete && FindPerson(fresh.units, 2222) &&
+        fresh.units.size() == fresh.campaignUnits.size(),
+        "legacy migration seeds campaign totals and marks the missing earlier campaign history");
+
+    ShutdownBattleStats();
+    Check(RestoreBattleStatsState(persisted, 3000), "restore historical totals when collection hooks are unavailable");
+    ReadBattleStatsSnapshot(fresh);
+    Check(!fresh.hookAvailable && fresh.units.size() == persisted.units.size() &&
+        fresh.campaignUnits.size() == persisted.campaignUnits.size() &&
+        CaptureBattleStatsState(frozen, 3100),
+        "historical display and saving do not depend on current collection-hook support");
 
     ShutdownBattleStats();
     printf("BattleStatsTests: %d failures\n", failures);

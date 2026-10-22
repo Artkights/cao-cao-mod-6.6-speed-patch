@@ -1,4 +1,5 @@
 #include "Patch.h"
+#include "EngineProfile.h"
 #include "InstallCommon.h"
 #include "ResourceIds.h"
 #include "Guide.h"
@@ -8,6 +9,8 @@
 #include "FeatureUi.h"
 #include "SaveEnhancer.h"
 #include "BattleStats.h"
+#include "ScenarioLifecycle.h"
+#include "SaveTransactions.h"
 #include <stdio.h>
 #include <wchar.h>
 #include <stdlib.h>
@@ -83,6 +86,41 @@ volatile LONG gUninstalling = FALSE;
 HHOOK gKeyboardHook = nullptr;
 DWORD gKeyboardThread = 0;
 volatile LONG gCapturedKeys[256] = {};
+SRWLOCK gScenarioCaptureLock = SRWLOCK_INIT;
+// Pending observations contain only a bounded ASCII basename. No guide or
+// game state is touched until the executable has passed profile verification.
+enum class ScenarioCaptureState { Pending, Active, Rejected };
+ScenarioCaptureState gScenarioCaptureState = ScenarioCaptureState::Pending;
+char gPendingScenario[32] = {};
+HANDLE gStartupEvent = nullptr;
+volatile LONG gStartupFinished = FALSE;
+volatile LONG gStartupAccepted = FALSE;
+DWORD gStartupThread = 0;
+using LoaderCalloutFn = BOOLEAN (NTAPI*)();
+LoaderCalloutFn gWithinLoaderCallout = nullptr;
+
+void CompleteStartup() {
+    InterlockedExchange(&gStartupFinished, TRUE);
+    if (gStartupEvent) SetEvent(gStartupEvent);
+}
+
+bool AwaitStartup() {
+    if (!gStartupEvent) return true; // Standalone test harnesses do not run DllMain.
+    const DWORD previousError = GetLastError();
+    bool ready = InterlockedCompareExchange(&gStartupFinished, FALSE, FALSE) != FALSE;
+    if (!ready && GetCurrentThreadId() != gStartupThread && gWithinLoaderCallout &&
+        !gWithinLoaderCallout()) {
+        // The worker cannot initialize until process DLL callouts finish.
+        // Never wait while a loader callback might still own the loader lock.
+        ready = WaitForSingleObject(gStartupEvent, INFINITE) == WAIT_OBJECT_0;
+    }
+    SetLastError(previousError);
+    return ready;
+}
+
+bool StartupUiAvailable() {
+    return !gStartupEvent || InterlockedCompareExchange(&gStartupAccepted, FALSE, FALSE) != FALSE;
+}
 
 void StopKeyboardHook();
 
@@ -215,6 +253,7 @@ void BeginUninstall(HWND owner) {
     StopKeyboardHook();
     if (gSetSpeed) gSetSpeed(0);
     if (gUnIntercept) gUnIntercept();
+    ShutdownScenarioLifecycle();
     ShutdownBattleStats();
     RestoreEngine();
     RestoreSaveEnhancer();
@@ -427,6 +466,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         CloseFeatureSettings();
         CloseSaveBrowser();
         RestoreSaveEnhancer();
+        ShutdownScenarioLifecycle();
         ShutdownBattleStats();
         RestoreEngine();
         if (gSetSpeed) gSetSpeed(0);
@@ -553,10 +593,12 @@ LRESULT DispatchMessageForWindow(const MSG* message) {
 }
 
 LRESULT WINAPI PatchedDispatch(const MSG* message) {
+    if (!AwaitStartup() || !StartupUiAvailable()) return DispatchMessageForWindow(message);
     if (message) {
         AttachWindow(message->hwnd);
         if (gMainWindow) {
             const ULONGLONG now = GetTickCount64();
+            PollSaveEnhancer();
             PollBattleStats(now);
             if (!InterlockedCompareExchange(&gUninstalling, FALSE, FALSE) &&
                 gCompatible && gAddProcess && now - gLastModuleCheck > 1000) {
@@ -568,18 +610,83 @@ LRESULT WINAPI PatchedDispatch(const MSG* message) {
     return DispatchMessageForWindow(message);
 }
 
+bool ScenarioBasenameA(const char* path, char (&name)[32]) {
+    if (!path) return false;
+    const char* basename = path;
+    size_t length = 0;
+    for (; length < 32768 && path[length]; ++length)
+        if (path[length] == '\\' || path[length] == '/') basename = path + length + 1;
+    if (length == 32768 || path + length - basename < 7 || path + length - basename >= 32) return false;
+    if ((basename[0] != 'R' && basename[0] != 'r' && basename[0] != 'S' && basename[0] != 's') ||
+        basename[1] != '_') return false;
+    const char* digit = basename + 2;
+    unsigned number = 0;
+    if (*digit < '0' || *digit > '9') return false;
+    do {
+        number = number * 10 + static_cast<unsigned>(*digit - '0');
+        if (number > 999) return false;
+        ++digit;
+    } while (*digit >= '0' && *digit <= '9');
+    if (path + length - digit != 4 || digit[0] != '.' ||
+        (digit[1] != 'e' && digit[1] != 'E') || (digit[2] != 'e' && digit[2] != 'E') ||
+        (digit[3] != 'x' && digit[3] != 'X')) return false;
+    // Keep the original digits; the guide canonicalizes them after activation.
+    const size_t bytes = static_cast<size_t>(path + length - basename) + 1;
+    memcpy(name, basename, bytes);
+    return true;
+}
+
+void CaptureScenarioOpen(const char* path, HANDLE result) {
+    if (result == INVALID_HANDLE_VALUE) return;
+    char name[32] = {};
+    if (!ScenarioBasenameA(path, name)) return;
+    AcquireSRWLockExclusive(&gScenarioCaptureLock);
+    if (gScenarioCaptureState == ScenarioCaptureState::Pending)
+        memcpy(gPendingScenario, name, sizeof(gPendingScenario));
+    else if (gScenarioCaptureState == ScenarioCaptureState::Active)
+        ObserveGuideScenarioPathA(name);
+    ReleaseSRWLockExclusive(&gScenarioCaptureLock);
+}
+
+void CompleteScenarioCapture(bool accepted) {
+    AcquireSRWLockExclusive(&gScenarioCaptureLock);
+    if (accepted) {
+        // Replay under the same lock as subsequent observations, so an older
+        // pending name can never replace a newer active observation.
+        if (gScenarioCaptureState == ScenarioCaptureState::Pending && gPendingScenario[0])
+            ObserveGuideScenarioPathA(gPendingScenario);
+        gScenarioCaptureState = ScenarioCaptureState::Active;
+    } else {
+        gScenarioCaptureState = ScenarioCaptureState::Rejected;
+    }
+    memset(gPendingScenario, 0, sizeof(gPendingScenario));
+    ReleaseSRWLockExclusive(&gScenarioCaptureLock);
+}
+
+#ifdef XA66_TEST
+using CreateFileATestFn = decltype(&CreateFileA);
+CreateFileATestFn gTestCreateFileA = nullptr;
+#endif
 HANDLE WINAPI PatchedCreateFileA(LPCSTR fileName, DWORD desiredAccess, DWORD shareMode,
     LPSECURITY_ATTRIBUTES security, DWORD creationDisposition, DWORD flags,
     HANDLE templateFile) {
+    AwaitStartup();
     // Only the game's IAT slot is replaced.  This call uses the proxy DLL's
     // own kernel32 import and therefore cannot recurse through this hook.
-    HANDLE result = CreateFileA(fileName, desiredAccess, shareMode, security, creationDisposition,
+    auto forward = &CreateFileA;
+#ifdef XA66_TEST
+    if (gTestCreateFileA) forward = gTestCreateFileA;
+#endif
+    HANDLE result = forward(fileName, desiredAccess, shareMode, security, creationDisposition,
         flags, templateFile);
-    if (result != INVALID_HANDLE_VALUE) ObserveGuideScenarioPathA(fileName);
+    const DWORD error = GetLastError();
+    CaptureScenarioOpen(fileName, result);
+    SetLastError(error);
     return result;
 }
 
 BOOL WINAPI PatchedTranslate(const MSG* message) {
+    if (!AwaitStartup() || !StartupUiAvailable()) return TranslateMessage(message);
     if (message) {
         AttachWindow(message->hwnd);
         if (!InterlockedCompareExchange(&gUninstalling, FALSE, FALSE) && gMainWindow &&
@@ -630,21 +737,51 @@ bool InstallGameImportHook(void* original, void* replacement) {
     return false;
 }
 
-DWORD WINAPI Initialize(void*) {
+void RejectScenarioCapture() {
+    CompleteScenarioCapture(false);
+    // If another component has already changed the slot, the passive wrapper
+    // simply remains a transparent forwarder in its rejected state.
+    InstallGameImportHook(reinterpret_cast<void*>(&PatchedCreateFileA),
+        reinterpret_cast<void*>(&CreateFileA));
+}
+
+DWORD InitializeWorker() {
     const INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
     InitCommonControlsEx(&controls);
     gGameBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     GetModuleFileNameW(gInstance, gDirectory, static_cast<DWORD>(_countof(gDirectory)));
     wchar_t* slash = wcsrchr(gDirectory, L'\\');
-    if (!slash) return 0;
+    if (!slash) { RejectScenarioCapture(); return 0; }
     *slash = 0;
-    swprintf_s(gConfigPath, L"%s\\patch\\xiaoan66\\pl_06.ini", gDirectory);
+    const auto image = reinterpret_cast<const BYTE*>(gGameBase);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
+    EngineDetection detection;
+    std::wstring profileError;
+    if (!DetectEngineProfileImage(image, nt->OptionalHeader.SizeOfImage, gGameBase, detection, profileError) ||
+        detection.profile != CompiledEngineProfile()) {
+        RejectScenarioCapture();
+        if (profileError.empty()) profileError = L"补丁载荷与当前游戏版本不一致，请使用加速补丁安装器重新检测。";
+        CompleteStartup();
+        MessageBoxW(nullptr, profileError.c_str(), L"加速补丁", MB_ICONERROR);
+        return 0;
+    }
+    swprintf_s(gConfigPath, L"%s\\pl_06.ini", PatchPrivatePath(gDirectory, detection.profile).c_str());
+    CompleteScenarioCapture(true);
+    InterlockedExchange(&gStartupAccepted, TRUE);
     LoadFeatureSettings(gDirectory);
     InitializeBattleRuntime(gDirectory);
-    InitializeSaveEnhancer(gDirectory);
     InitializeBattleStats(gDirectory);
+    std::wstring recoveryError;
+    if (!RecoverSaveTransactions(gDirectory,recoveryError)) SetBattleStatsStatus(recoveryError,true);
+    if (!InitializeScenarioLifecycle()) SetBattleStatsStatus(L"战场切换监听不可用，无法确认本场统计的开始和结束。",true);
+    if (!InitializeSaveEnhancer(gDirectory)) SetBattleStatsStatus(L"存档统计监听不可用，请检查补丁与游戏版本。",true);
     SetNativeToggleHandler(&NativeSuperCommand);
     gCompatible = InitializeEngine();
+    // All model, recovery, lifecycle, save and engine hooks are now installed.
+    // Release the game before optional DLL loading, UI or keyboard registration,
+    // any of which can need the game's message thread to run.
+    CompleteStartup();
     if (gCompatible) {
         wchar_t path[32768];
         swprintf_s(path, L"%s\\GearNtKe.dll", gDirectory);
@@ -678,6 +815,23 @@ DWORD WINAPI Initialize(void*) {
     gKeyboardHook = nullptr;
     gKeyboardThread = 0;
     return 0;
+}
+
+DWORD WINAPI Initialize(void*) {
+    gStartupThread = GetCurrentThreadId();
+    struct StartupCompletion {
+        ~StartupCompletion() { CompleteStartup(); }
+    } completion;
+    try {
+        return InitializeWorker();
+    } catch (...) {
+        InterlockedExchange(&gStartupAccepted, FALSE);
+        RejectScenarioCapture();
+        CompleteStartup();
+        MessageBoxW(nullptr, L"加速补丁初始化失败。游戏已解除启动等待，请重新启动后重试。",
+            L"加速补丁", MB_ICONERROR);
+        return 0;
+    }
 }
 }
 
@@ -740,7 +894,7 @@ bool SaveSettings() {
     wchar_t folder[32768], privateFolder[32768], temporary[32768];
     swprintf_s(folder, L"%s\\patch", gDirectory);
     if (!CreateDirectoryW(folder, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
-    swprintf_s(privateFolder, L"%s\\xiaoan66", folder);
+    wcscpy_s(privateFolder, PatchPrivatePath(gDirectory, CompiledEngineProfile()).c_str());
     if (!CreateDirectoryW(privateFolder, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
     swprintf_s(temporary, L"%s.tmp", gConfigPath);
     FILE* file = nullptr;
@@ -758,12 +912,22 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         gInstance = instance;
         DisableThreadLibraryCalls(instance);
-        // Install before the EXE entry point can load its first R/S file.  The
-        // hook only observes successful opens and delegates unchanged.
+        // The event outlives all wrappers until process termination. DllMain
+        // never waits for the worker or for a game thread.
+        gStartupEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) gWithinLoaderCallout = reinterpret_cast<LoaderCalloutFn>(
+            GetProcAddress(ntdll, "RtlIsThreadWithinLoaderCallout"));
+        // Gate the game's first message/input and script I/O before starting
+        // asynchronous initialization. The DLL's own imports remain untouched.
         InstallGameImportHook(reinterpret_cast<void*>(&CreateFileA),
             reinterpret_cast<void*>(&PatchedCreateFileA));
+        InstallGameImportHook(reinterpret_cast<void*>(&DispatchMessageA), reinterpret_cast<void*>(&PatchedDispatch));
+        InstallGameImportHook(reinterpret_cast<void*>(&DispatchMessageW), reinterpret_cast<void*>(&PatchedDispatch));
+        InstallGameImportHook(reinterpret_cast<void*>(&TranslateMessage), reinterpret_cast<void*>(&PatchedTranslate));
         HANDLE thread = CreateThread(nullptr, 0, Initialize, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);
+        else { RejectScenarioCapture(); CompleteStartup(); }
     }
     return TRUE;
 }
