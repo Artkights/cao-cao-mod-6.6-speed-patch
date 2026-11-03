@@ -107,6 +107,17 @@ struct Image {
 
     uintptr_t Find(std::initializer_list<int> pattern, uintptr_t begin = 0, size_t span = 0) const {
         uintptr_t result = 0;
+        size_t anchor = pattern.size();
+        int anchorByte = -1;
+        size_t patternIndex = 0;
+        for (int value : pattern) {
+            if (value >= 0) {
+                anchor = patternIndex;
+                anchorByte = value;
+                break;
+            }
+            ++patternIndex;
+        }
         for (WORD i = 0; i < count; ++i) {
             const auto& section = sections[i];
             if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
@@ -120,10 +131,37 @@ struct Image {
                 if (end > begin + span) end = begin + span;
             }
             if (end <= start || end - start < pattern.size()) continue;
-            for (uintptr_t at = start; at <= end - pattern.size(); ++at) {
-                if (!Match(At(at), pattern.begin(), pattern.size())) continue;
-                if (result) { ++ambiguousSignatures; return 0; }
-                result = at;
+            const size_t candidateCount = end - start - pattern.size() + 1;
+            const BYTE* sectionData = At(start);
+            if (anchorByte >= 0) {
+                // Most signatures have a fixed first byte.  Jump directly
+                // between those anchor bytes instead of invoking the guarded
+                // wildcard matcher at every offset in the executable section.
+                size_t searchOffset = anchor;
+                size_t remaining = candidateCount;
+                while (remaining) {
+                    const BYTE* hit = static_cast<const BYTE*>(memchr(
+                        sectionData + searchOffset, anchorByte, remaining));
+                    if (!hit) break;
+                    const size_t anchorPosition =
+                        static_cast<size_t>(hit - sectionData);
+                    const size_t offset = anchorPosition - anchor;
+                    if (Match(sectionData + offset, pattern.begin(), pattern.size())) {
+                        const uintptr_t at = start + offset;
+                        if (result) { ++ambiguousSignatures; return 0; }
+                        result = at;
+                    }
+                    const size_t consumed = anchorPosition - searchOffset + 1;
+                    searchOffset = anchorPosition + 1;
+                    remaining -= consumed;
+                }
+            } else {
+                for (size_t offset = 0; offset < candidateCount; ++offset) {
+                    if (!Match(sectionData + offset, pattern.begin(), pattern.size())) continue;
+                    const uintptr_t at = start + offset;
+                    if (result) { ++ambiguousSignatures; return 0; }
+                    result = at;
+                }
             }
         }
         if (result) ++uniqueSignatures;
@@ -141,15 +179,26 @@ struct Image {
             size_t length = section.Misc.VirtualSize > section.SizeOfRawData ?
                 section.Misc.VirtualSize : section.SizeOfRawData;
             if (!Contains(start, length) || length < 5) continue;
-            uintptr_t end = start + length - 5;
-            for (uintptr_t at = start; at <= end; ++at) {
+            const BYTE* sectionData = At(start);
+            const size_t candidateCount = length - 4;
+            size_t searchOffset = 0;
+            size_t remaining = candidateCount;
+            while (remaining) {
+                const BYTE* hit = static_cast<const BYTE*>(memchr(
+                    sectionData + searchOffset, 0xE8, remaining));
+                if (!hit) break;
+                const size_t offset = static_cast<size_t>(hit - sectionData);
+                const uintptr_t at = start + offset;
                 BYTE bytes[5] = {};
-                if (!CopyMemoryChecked(bytes, At(at), sizeof(bytes)) || bytes[0] != 0xE8) continue;
+                if (!CopyMemoryChecked(bytes, hit, sizeof(bytes))) break;
                 int32_t displacement = 0;
                 memcpy(&displacement, bytes + 1, sizeof(displacement));
                 const uintptr_t callTarget = static_cast<uint32_t>(at + 5 + displacement);
-                if (callTarget != target || found >= capacity) continue;
-                callers[found++] = at + 5;
+                if (callTarget == target && found < capacity)
+                    callers[found++] = at + 5;
+                const size_t consumed = offset - searchOffset + 1;
+                searchOffset = offset + 1;
+                remaining -= consumed;
             }
         }
         return found;
@@ -255,8 +304,25 @@ void ResolveWaitCallers(const Image& image, EngineLayout& layout) {
         const size_t length = section.Misc.VirtualSize > section.SizeOfRawData ?
             section.Misc.VirtualSize : section.SizeOfRawData;
         if (!image.Contains(start, length) || length < 5) continue;
-        for (uintptr_t at = start; at <= start + length - 5; ++at) {
-            if (image.At(at)[0] != 0xE8 || image.Call(at) != layout.waitWrapper) continue;
+        const BYTE* sectionData = image.At(start);
+        const size_t candidateCount = length - 4;
+        size_t searchOffset = 0;
+        size_t remaining = candidateCount;
+        while (remaining) {
+            const BYTE* hit = static_cast<const BYTE*>(memchr(
+                sectionData + searchOffset, 0xE8, remaining));
+            if (!hit) break;
+            const size_t offset = static_cast<size_t>(hit - sectionData);
+            const uintptr_t at = start + offset;
+            const auto advance = [&]() {
+                const size_t consumed = offset - searchOffset + 1;
+                searchOffset = offset + 1;
+                remaining -= consumed;
+            };
+            if (image.Call(at) != layout.waitWrapper) {
+                advance();
+                continue;
+            }
             int kind = -1;
             bool ambiguous = false;
             for (const auto& signature : kWaitCallerSignatures) {
@@ -268,11 +334,17 @@ void ResolveWaitCallers(const Image& image, EngineLayout& layout) {
                 kind = signature.kind;
             }
             if (ambiguous) ++layout.ambiguousWaitCallers;
-            if (kind < 0 || ambiguous) continue;
+            if (kind < 0 || ambiguous) {
+                advance();
+                continue;
+            }
             bool duplicate = false;
             for (size_t i = 0; i < layout.waitCallerCount; ++i)
                 if (layout.waitCallers[i] == at + 5) duplicate = true;
-            if (duplicate) continue;
+            if (duplicate) {
+                advance();
+                continue;
+            }
             if (layout.waitCallerCount == ARRAYSIZE(layout.waitCallers)) {
                 // An unexpected multiplication of known contexts is ambiguous.
                 layout.waitCallerCount = 0;
@@ -280,6 +352,7 @@ void ResolveWaitCallers(const Image& image, EngineLayout& layout) {
             }
             layout.waitCallers[layout.waitCallerCount] = at + 5;
             layout.waitKinds[layout.waitCallerCount++] = static_cast<unsigned char>(kind);
+            advance();
         }
     }
 }

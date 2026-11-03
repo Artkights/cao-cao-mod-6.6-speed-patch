@@ -396,8 +396,14 @@ ULONGLONG SuperClock() {
         if (gRealCounter(&value)) {
             const ULONGLONG seconds = static_cast<ULONGLONG>(value.QuadPart / gRealFrequency);
             const LONGLONG remainder = value.QuadPart % gRealFrequency;
-            return seconds * 1000000ULL + static_cast<ULONGLONG>(
-                static_cast<double>(remainder) * 1000000.0 / static_cast<double>(gRealFrequency));
+            // Keep the conversion integer-only.  This function runs from the
+            // presentation wait bridge; converting the remainder through a
+            // double needlessly enters the floating-point pipeline and can
+            // round the four-millisecond throttle boundary differently on
+            // different CPUs.
+            return seconds * 1000000ULL +
+                static_cast<ULONGLONG>(remainder) * 1000000ULL /
+                static_cast<ULONGLONG>(gRealFrequency);
         }
     }
     return gRealTick64 ? gRealTick64() * 1000ULL : static_cast<ULONGLONG>(GetTickCount()) * 1000ULL;
@@ -450,12 +456,11 @@ int __cdecl LegacyPhaseHelper(uintptr_t context) {
         (!gLayout.phaseOwnedByPatch && (!gLayout.phaseTable || !gLayout.phaseCounter)) ||
         !gLayout.sleep) return NativeStageCall(context);
 
-    WORD speed = 0;
     BYTE phase = 0;
     BYTE value = 0;
     BYTE counter = 0;
-    if (!ReadBytes(gLayout.speed, &speed, sizeof(speed)) ||
-        !ReadBytes(gLayout.phase, &phase, sizeof(phase)) || phase >= 3) return NativeStageCall(context);
+    if (!ReadBytes(gLayout.phase, &phase, sizeof(phase)) || phase >= 3)
+        return NativeStageCall(context);
 
     if (gLayout.phaseOwnedByPatch) {
         AcquireSRWLockExclusive(&gPhaseLock);
@@ -471,7 +476,9 @@ int __cdecl LegacyPhaseHelper(uintptr_t context) {
         // it here would mix two timers and duplicate a frame wait.
         return 1;
     }
+    WORD speed = 0;
     if (!ReadBytes(gLayout.phaseTable + phase, &value, sizeof(value)) ||
+        !ReadBytes(gLayout.speed, &speed, sizeof(speed)) ||
         !ReadBytes(gLayout.phaseCounter, &counter, sizeof(counter))) return NativeStageCall(context);
 
     int delay = 0;
@@ -519,15 +526,19 @@ int __cdecl SuperYieldWithContext(uintptr_t caller, uintptr_t context) {
     if (camp >= 3 || !gFeatureSettings.animationCamps[camp]) return NativeStageCall(context);
 #endif
     if (gSuperBusy) return 1;
-    const ULONGLONG before = SuperClock();
-    if (gSuperScheduled && before >= gSuperLast && before - gSuperLast < 4000) return 1;
+    // One clock sample is enough for the throttle.  The previous code took a
+    // second QPC sample after pumping; that doubled the cost of this hot
+    // presentation path and could make a long pump appear to have no
+    // throttle interval at all.
+    const ULONGLONG now = SuperClock();
+    if (gSuperScheduled && now >= gSuperLast && now - gSuperLast < 4000) return 1;
     gSuperBusy = true;
     // Keep the native wrapper's completion check and give the window one small
     // scheduling opportunity. This skips intermediate attack frames without
     // starving resource, BUFF and repaint callbacks.
     SuperSleep(0);
     SuperPump();
-    gSuperLast = SuperClock();
+    gSuperLast = now;
     gSuperScheduled = true;
     gSuperBusy = false;
     return 1;

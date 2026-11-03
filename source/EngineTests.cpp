@@ -50,10 +50,11 @@ __declspec(naked) int ThisWaitStage() {
 int __cdecl CdeclWaitStage() { return ++timerStageCalls >= 2 ? 321 : 0; }
 
 ULONGLONG testClock = 10000;
+int clockCalls = 0;
 int sleepCalls = 0;
 int pumpCalls = 0;
 bool recursiveResult = false;
-ULONGLONG WINAPI TestClock() { return testClock; }
+ULONGLONG WINAPI TestClock() { ++clockCalls; return testClock; }
 void WINAPI TestSleep(DWORD value) { if (value == 0) ++sleepCalls; }
 bool __cdecl TestPump() {
     ++pumpCalls;
@@ -190,11 +191,14 @@ int main() {
     EngineTestSuperCallbacks(TestClock, TestSleep, TestPump);
     Check(EngineTestSuperCaller(0x12345678) == 1 && sleepCalls == 1 && pumpCalls == 1 && recursiveResult,
         "known S presentation wait yields once and recursion completes without looping");
+    Check(clockCalls == 1, "known S presentation wait samples the clock once");
     Check(EngineTestSuperCaller(0x12345678) == 1 && sleepCalls == 1 && pumpCalls == 1,
         "four-millisecond throttle suppresses duplicate scheduling work");
+    Check(clockCalls == 2, "throttled S presentation wait samples the clock once");
     testClock += 4000;
     Check(EngineTestSuperCaller(0x12345678) == 1 && sleepCalls == 2 && pumpCalls == 2,
         "known long-running presentation receives another bounded yield after four milliseconds");
+    Check(clockCalls == 3, "long-running S presentation wait keeps one clock sample");
 
     printf("Engine verification: %d failures\n", failures);
     return failures ? 1 : 0;
