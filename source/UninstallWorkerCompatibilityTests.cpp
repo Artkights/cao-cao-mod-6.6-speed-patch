@@ -46,6 +46,32 @@ bool FinishedProcess(HANDLE& inherited) {
     CloseHandle(process.hProcess);
     return result;
 }
+
+bool RunWorker(const std::wstring& worker, const std::wstring& root,
+    const std::wstring& extra, DWORD& code) {
+    HANDLE finished = nullptr;
+    if (!FinishedProcess(finished)) return false;
+    const std::wstring arguments = L"/root \"" + root + L"\" /handle " +
+        std::to_wstring(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(finished))) +
+        L" /quiet" + extra;
+    const bool result = Run(worker, arguments, true, code);
+    CloseHandle(finished);
+    return result;
+}
+
+bool Fixture(const std::wstring& root, const wchar_t* exe, const wchar_t* audio) {
+    return CreateDirectoryW(root.c_str(), nullptr) &&
+        CopyFileW(exe, XiaoAnInstall::JoinPath(root, L"Ekd5.exe").c_str(), TRUE) &&
+        CopyFileW(audio, XiaoAnInstall::JoinPath(root, L"Koeicda.dll").c_str(), TRUE);
+}
+
+bool Restored(const std::wstring& root, const std::wstring& expected) {
+    using namespace XiaoAnInstall;
+    std::wstring actual, error;
+    return Sha256File(JoinPath(root, L"Koeicda.dll"), actual, error) && expected == actual &&
+        !FileExists(ManifestPath(root, EngineProfileId::Ccz66)) &&
+        !FileExists(JoinPath(root, L"Koeicda_org.dll")) && !FileExists(JoinPath(root, L"GearNtKe.dll"));
+}
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -54,44 +80,60 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     using namespace XiaoAnInstall;
-    const std::wstring root = CanonicalRoot(argv[5]);
-    if (root.empty() || FileExists(root) || DirectoryExists(root) || !CreateDirectoryW(root.c_str(), nullptr)) {
+    const std::wstring workspace = CanonicalRoot(argv[5]);
+    if (workspace.empty() || FileExists(workspace) || DirectoryExists(workspace) || !CreateDirectoryW(workspace.c_str(), nullptr)) {
         fprintf(stderr, "The test work directory must be new.\n");
         return 2;
     }
-    Check(CopyFileW(argv[3], JoinPath(root, L"Ekd5.exe").c_str(), TRUE) &&
-        CopyFileW(argv[4], JoinPath(root, L"Koeicda.dll").c_str(), TRUE),
-        "create an isolated 6.6 fixture without starting the game");
     DWORD code = 999;
-    Check(Run(argv[2], L"\"" + root + L"\" /install /quiet", false, code) && code == 0,
-          "new installer creates a 6.6 schema 1 manifest");
     std::wstring error;
-    HMODULE oldInstaller = LoadLibraryExW(argv[1], nullptr, LOAD_LIBRARY_AS_DATAFILE);
-    std::vector<unsigned char> oldProxy, oldWorker;
-    Check(oldInstaller && ReadResourceBytes(oldInstaller, IDR_INSTALL_PROXY, oldProxy, error),
-          "extract the historical 6.6 proxy as a data resource");
-    if (oldInstaller) FreeLibrary(oldInstaller);
-    const std::wstring proxyPath = JoinPath(root, L"historical-proxy.dll");
-    Check(WriteBytes(proxyPath, oldProxy, error), "write the historical proxy only inside the fixture");
+    HMODULE newInstaller = LoadLibraryExW(argv[2], nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    std::vector<unsigned char> newProxy, newWorker;
+    Check(newInstaller && ReadResourceBytes(newInstaller, IDR_INSTALL_PROXY, newProxy, error),
+          "extract the new 6.6 proxy as a data resource");
+    if (newInstaller) FreeLibrary(newInstaller);
+    const std::wstring proxyPath = JoinPath(workspace, L"current-proxy.dll");
+    Check(WriteBytes(proxyPath, newProxy, error), "write the current proxy only inside the test workspace");
     HMODULE proxy = LoadLibraryExW(proxyPath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
-    Check(proxy && ReadResourceBytes(proxy, IDR_UNINSTALL_WORKER, oldWorker, error),
-          "extract the historical standalone worker without executing the proxy");
+    Check(proxy && ReadResourceBytes(proxy, IDR_UNINSTALL_WORKER, newWorker, error),
+          "extract the new standalone worker without executing the proxy");
     if (proxy) FreeLibrary(proxy);
-    const std::wstring workerPath = JoinPath(root, L"historical-worker.exe");
-    Check(WriteBytes(workerPath, oldWorker, error) && ValidatePe32Executable(workerPath, error),
-          "historical worker is a complete x86 PE32 executable");
-    HANDLE finished = nullptr;
-    Check(FinishedProcess(finished), "create an inheritable signaled process handle without launching a game");
-    const std::wstring arguments = L"/root \"" + root + L"\" /handle " +
-        std::to_wstring(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(finished))) + L" /quiet";
-    Check(finished && Run(workerPath, arguments, true, code) && code == 0,
-          "historical worker restores a new 6.6 manifest using its unchanged internal CLI");
-    if (finished) CloseHandle(finished);
-    std::wstring expected, actual;
-    Check(Sha256File(argv[4], expected, error) && Sha256File(JoinPath(root, L"Koeicda.dll"), actual, error) &&
-        expected == actual && !FileExists(ManifestPath(root, EngineProfileId::Ccz66)) &&
-        !FileExists(JoinPath(root, L"Koeicda_org.dll")) && !FileExists(JoinPath(root, L"GearNtKe.dll")),
-        "historical worker restores original bytes and file existence from the new manifest");
+    const std::wstring workerPath = JoinPath(workspace, L"current-worker.exe");
+    Check(WriteBytes(workerPath, newWorker, error) && ValidatePe32Executable(workerPath, error),
+          "new worker is a complete x86 PE32 executable");
+    if (newWorker.empty()) return 1;
+    std::wstring expected;
+    Check(Sha256File(argv[4], expected, error), "hash the original audio baseline");
+
+    const std::wstring historical = JoinPath(workspace, L"schema-one");
+    Manifest manifest;
+    Check(Fixture(historical, argv[3], argv[4]) &&
+        Run(argv[1], L"\"" + historical + L"\" /install /quiet", false, code) && code == 0 &&
+        LoadManifest(historical, manifest, error) && manifest.schemaVersion == 1,
+        "historical installer creates an authentic schema-one fixture");
+    Check(RunWorker(workerPath, historical, L"", code) && code == 0 && Restored(historical, expected),
+        "new worker restores schema one using the unchanged root, handle, and quiet CLI");
+
+    const std::wstring current = JoinPath(workspace, L"schema-two");
+    Check(Fixture(current, argv[3], argv[4]) &&
+        Run(argv[2], L"\"" + current + L"\" /install /quiet", false, code) && code == 0 &&
+        LoadManifest(current, manifest, error) && manifest.schemaVersion == kManifestSchema,
+        "new installer creates a schema-two all-feature fixture");
+    Check(RunWorker(workerPath, current, L"", code) && code == 0 && Restored(current, expected),
+        "new worker restores schema two through the original full-uninstall CLI");
+
+    const std::wstring selective = JoinPath(workspace, L"selective");
+    Check(Fixture(selective, argv[3], argv[4]) &&
+        Run(argv[2], L"\"" + selective + L"\" /install /quiet", false, code) && code == 0,
+        "create an all-feature fixture for numeric feature-mask arguments");
+    const std::wstring selectiveManifest = ManifestPath(selective, EngineProfileId::Ccz66);
+    Check(RunWorker(workerPath, selective, L" /features 2", code) && code == 0 &&
+        LoadManifest(selective, manifest, error) &&
+        manifest.featureMask == (FeatureAccelerator | FeatureBattleStats) &&
+        FileExists(JoinPath(selective, L"GearNtKe.dll")) && FileExists(selectiveManifest),
+        "numeric features two removes only guide and preserves accelerator and statistics");
+    Check(RunWorker(workerPath, selective, L" /features 5", code) && code == 0 && Restored(selective, expected),
+        "numeric features five removes the remaining functions and restores the original files");
     printf("UninstallWorkerCompatibilityTests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

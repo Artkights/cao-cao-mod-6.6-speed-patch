@@ -218,6 +218,23 @@ int main() {
     swprintf_s(gDirectory, L"%sCczConfigStartupTests-%u-%llu", temporary, GetCurrentProcessId(), GetTickCount64());
     std::filesystem::create_directories(gDirectory);
     swprintf_s(gConfigPath, L"%s\\pl_06.ini", PatchPrivatePath(gDirectory, CompiledEngineProfile()).c_str());
+    check(LoadInstalledFeatures(gDirectory, CompiledEngineProfile()) &&
+        gInstalledFeatures == XiaoAnInstall::FeatureAll,
+        "a historical installation without feature-state retains all functions");
+    const std::wstring featureState = PatchPrivatePath(gDirectory, CompiledEngineProfile()) + L"\\feature-state.ini";
+    std::filesystem::create_directories(PatchPrivatePath(gDirectory, CompiledEngineProfile()));
+    check(WritePrivateProfileStringW(L"Install", L"SchemaVersion", L"1", featureState.c_str()) &&
+        WritePrivateProfileStringW(L"Install", L"FeatureMask", L"2", featureState.c_str()) &&
+        LoadInstalledFeatures(gDirectory, CompiledEngineProfile()) &&
+        HasFeature(XiaoAnInstall::FeatureGuide) && !HasFeature(XiaoAnInstall::FeatureAccelerator) &&
+        ResolveKeyCommand(VK_TAB, 0) == -1,
+        "a guide-only installation keeps accelerator shortcuts inactive");
+    check(WritePrivateProfileStringW(L"Install", L"FeatureMask", L"999", featureState.c_str()) &&
+        !LoadInstalledFeatures(gDirectory, CompiledEngineProfile()) &&
+        gInstalledFeatures == XiaoAnInstall::FeatureNone,
+        "a damaged feature-state disables optional functions");
+    DeleteFileW(featureState.c_str());
+    gInstalledFeatures = XiaoAnInstall::FeatureAll;
     gSettings = Settings();
     gConfigLines[30] = 77;
     gSettings.superEnabled = true;
@@ -282,11 +299,15 @@ int main() {
     HWND guideMap = guide ? FindWindowExW(guide, nullptr, L"XiaoAn66GuideMap", nullptr) : nullptr;
     HWND firstCombo = guide ? FindWindowExW(guide, nullptr, WC_COMBOBOXW, nullptr) : nullptr;
     HWND secondCombo = firstCombo ? FindWindowExW(guide, firstCombo, WC_COMBOBOXW, nullptr) : nullptr;
+    HWND firstEdit = guide ? FindWindowExW(guide, nullptr, WC_EDITW, nullptr) : nullptr;
+    HWND secondEdit = firstEdit ? FindWindowExW(guide, firstEdit, WC_EDITW, nullptr) : nullptr;
     HWND reload = guide ? FindWindowExW(guide, nullptr, WC_BUTTONW, L"重新读取") : nullptr;
+    HWND exportButton = guide ? FindWindowExW(guide, nullptr, WC_BUTTONW, L"导出攻略") : nullptr;
     HWND guideText = guide ? FindWindowExW(guide, nullptr, RICHEDIT_CLASSW, nullptr) : nullptr;
-    check(guide && !guideTabs && !guideMap && firstCombo && secondCombo && reload && guideText &&
-        IsWindowUnicode(firstCombo) && IsWindowUnicode(secondCombo) && IsWindowUnicode(guideText),
-        "guide directly exposes the Unicode text view without map or view tabs");
+    check(guide && !guideTabs && !guideMap && firstCombo && !secondCombo && firstEdit && secondEdit &&
+        !reload && exportButton && guideText && IsWindowUnicode(firstCombo) && IsWindowUnicode(firstEdit) &&
+        IsWindowUnicode(secondEdit) && IsWindowUnicode(guideText),
+        "guide exposes one scenario selector and native display parameter inputs");
     CloseGuide();
 
     check(OpenBattleInfo(owner), "open the modeless battle statistics window for Unicode verification");
@@ -299,8 +320,9 @@ int main() {
         ColumnText(battleList, 0) == L"单位" && ColumnText(battleList, 1) == L"造成伤害" &&
         ColumnText(battleList, 2) == L"承受伤害" && ColumnText(battleList, 3) == L"回复量" &&
         ColumnText(battleList, 4) == L"暴击次数" && ColumnText(battleList, 5) == L"连击次数" &&
-        ColumnText(battleList, 6) == L"攻击格挡" && ColumnText(battleList, 7) == L"法术格挡",
-        "battle statistics exposes current and campaign tabs with eight Unicode columns");
+        ColumnText(battleList, 6) == L"攻击闪避" && ColumnText(battleList, 7) == L"策略闪避" &&
+        ColumnText(battleList, 8) == L"物理受击" && ColumnText(battleList, 9) == L"策略受击",
+        "battle statistics exposes current and campaign tabs with ten Unicode columns");
     BattleStatsPersistedState historical;
     historical.scenario = L"S_07.eex";
     historical.knownMetrics = BattleStatsDamageDealt;

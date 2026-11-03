@@ -17,6 +17,21 @@ constexpr uint32_t kMaxUnits = 250;
 constexpr uint32_t kMaxScenarioCharacters = 1024;
 constexpr uint32_t kMaxLabelCharacters = 256;
 
+class ReadHandle {
+public:
+    explicit ReadHandle(HANDLE handle) noexcept : handle_(handle) {}
+    ~ReadHandle() { if (handle_!=INVALID_HANDLE_VALUE) CloseHandle(handle_); }
+    bool Close() noexcept {
+        const HANDLE handle=handle_;
+        handle_=INVALID_HANDLE_VALUE;
+        return handle==INVALID_HANDLE_VALUE || CloseHandle(handle)!=FALSE;
+    }
+    ReadHandle(const ReadHandle&)=delete;
+    ReadHandle& operator=(const ReadHandle&)=delete;
+private:
+    HANDLE handle_;
+};
+
 #pragma pack(push, 1)
 struct FileHeader {
     char magic[8];
@@ -97,6 +112,7 @@ bool ReadWholeFile(const std::wstring& path, std::vector<unsigned char>& bytes,
         error = L"无法打开战斗统计旁路文件。";
         return false;
     }
+    ReadHandle readHandle(file);
     LARGE_INTEGER size = {};
     bool okay = GetFileSizeEx(file, &size) && size.QuadPart >= static_cast<LONGLONG>(sizeof(FileHeader)) &&
         size.QuadPart <= static_cast<LONGLONG>(kMaxSidecarBytes);
@@ -107,12 +123,12 @@ bool ReadWholeFile(const std::wstring& path, std::vector<unsigned char>& bytes,
             read == bytes.size();
     }
     const DWORD failure = okay ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(file);
-    if (!okay) {
+    const bool closed=readHandle.Close();
+    if (!okay || !closed) {
         error = L"战斗统计旁路文件不完整，Windows 错误码：" + std::to_wstring(failure);
         bytes.clear();
     }
-    return okay;
+    return okay && closed;
 }
 
 bool WriteAtomic(const std::wstring& path, const std::vector<unsigned char>& bytes,
@@ -268,9 +284,13 @@ static_assert(sizeof(wchar_t) == 2, "Statistics strings use UTF-16 code units");
 constexpr std::array<char, 8> kPayloadMagic = {'X','A','S','T','A','T','2','P'};
 constexpr std::array<char, 8> kFooterMagic = {'X','A','S','T','A','T','2','F'};
 constexpr std::array<char, 8> kFooterEnd = {'X','A','S','T','A','T','E','N'};
-constexpr uint32_t kEmbeddedSchema = 2;
+// The stable envelope markers are retained so schema-2 damage/truncation
+// detection also applies to schema 3. The schema field defines the row format.
+constexpr uint32_t kEmbeddedSchema = 3;
+constexpr uint32_t kOldEmbeddedSchema = 2;
 constexpr uint32_t kPersonCount = 65535; // 0xFFFF is the engine's empty ID.
-constexpr uint32_t kKnownMetricsMask = 0xFF;
+constexpr uint32_t kKnownMetricsMask = 0x3FF;
+constexpr uint32_t kOldKnownMetricsMask = 0xFF;
 constexpr uint32_t kMaxStatusCharacters = 4096;
 constexpr uint64_t kMaxNativeBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kMaxPayloadBytes = 64ull * 1024 * 1024;
@@ -294,6 +314,10 @@ struct EmbeddedHeader {
 struct EmbeddedUnitHeader {
     int32_t personId;
     UnitHeader totals;
+};
+struct ReceivedUnitCounts {
+    int64_t physical;
+    int64_t strategy;
 };
 struct EmbeddedFooter {
     char magic[8];
@@ -324,6 +348,7 @@ bool ReadSaveBytes(const std::wstring& path, std::vector<unsigned char>& bytes,
         error = L"无法打开存档读取战场统计，Windows 错误码：" + std::to_wstring(GetLastError());
         return false;
     }
+    ReadHandle readHandle(file);
     LARGE_INTEGER length = {};
     bool okay = GetFileSizeEx(file, &length) && length.QuadPart > 0 &&
         static_cast<uint64_t>(length.QuadPart) <= kMaxNativeBytes + kMaxPayloadBytes + sizeof(EmbeddedFooter);
@@ -334,7 +359,7 @@ bool ReadSaveBytes(const std::wstring& path, std::vector<unsigned char>& bytes,
             read == bytes.size();
     }
     const DWORD failure = okay ? ERROR_SUCCESS : GetLastError();
-    const bool closed = CloseHandle(file) != FALSE;
+    const bool closed = readHandle.Close();
     if (!okay || !closed) {
         error = L"存档长度无效或未完整读取，Windows 错误码：" + std::to_wstring(failure);
         bytes.clear();
@@ -359,7 +384,8 @@ bool ValidTotals(const BattleUnitTotals& unit) {
         unit.label.size() <= kMaxLabelCharacters && unit.defeatedEnemies >= 0 &&
         unit.damageDealt >= 0 && unit.damageReceived >= 0 && unit.recoveryDone >= 0 &&
         unit.criticalCount >= 0 && unit.comboExtraHitCount >= 0 &&
-        unit.attackBlockCount >= 0 && unit.spellBlockCount >= 0;
+        unit.attackBlockCount >= 0 && unit.spellBlockCount >= 0 &&
+        unit.physicalReceivedCount >= 0 && unit.strategyReceivedCount >= 0;
 }
 
 bool AppendGroup(std::vector<unsigned char>& bytes, const std::vector<BattleUnitTotals>& units,
@@ -384,21 +410,31 @@ bool AppendGroup(std::vector<unsigned char>& bytes, const std::vector<BattleUnit
         row.totals.spellBlockCount = unit.spellBlockCount;
         row.totals.labelCharacters = static_cast<uint32_t>(unit.label.size());
         AppendValue(bytes, row);
+        const ReceivedUnitCounts received = {unit.physicalReceivedCount, unit.strategyReceivedCount};
+        AppendValue(bytes, received);
         AppendWide(bytes, unit.label);
     }
     return true;
 }
 
 bool ReadGroup(const std::vector<unsigned char>& bytes, size_t& offset, uint32_t count,
-    std::vector<BattleUnitTotals>& units) {
-    if (offset > bytes.size() || count > (bytes.size() - offset) / sizeof(EmbeddedUnitHeader)) return false;
+    uint32_t schema, std::vector<BattleUnitTotals>& units) {
+    const size_t minimumRow = sizeof(EmbeddedUnitHeader) +
+        (schema >= 3 ? sizeof(ReceivedUnitCounts) : 0);
+    if (offset > bytes.size() || count > (bytes.size() - offset) / minimumRow) return false;
     std::vector<bool> seen(kPersonCount, false);
     units.reserve(count);
     for (uint32_t index = 0; index < count; ++index) {
         EmbeddedUnitHeader row = {};
         BattleUnitTotals unit;
-        if (!ReadValue(bytes, offset, row) || row.totals.labelCharacters > kMaxLabelCharacters ||
-            !ReadWide(bytes, offset, row.totals.labelCharacters, unit.label)) return false;
+        if (!ReadValue(bytes, offset, row) || row.totals.labelCharacters > kMaxLabelCharacters) return false;
+        if (schema >= 3) {
+            ReceivedUnitCounts received = {};
+            if (!ReadValue(bytes, offset, received)) return false;
+            unit.physicalReceivedCount = received.physical;
+            unit.strategyReceivedCount = received.strategy;
+        }
+        if (!ReadWide(bytes, offset, row.totals.labelCharacters, unit.label)) return false;
         unit.personId = row.personId;
         unit.slot = row.totals.slot;
         unit.defeatedEnemies = row.totals.defeatedEnemies;
@@ -427,7 +463,7 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
         error = L"存档中的战场统计扩展块被截断或尾部标记已损坏。";
         return BattleStatsReadResult::Corrupt;
     }
-    if (footer.schema != kEmbeddedSchema) {
+    if (footer.schema != kEmbeddedSchema && footer.schema != kOldEmbeddedSchema) {
         error = L"存档使用了当前补丁不支持的战场统计版本。";
         return BattleStatsReadResult::Unsupported;
     }
@@ -451,18 +487,19 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     EmbeddedHeader header = {};
     if (!ReadValue(payload, offset, header) ||
         memcmp(header.magic, kPayloadMagic.data(), kPayloadMagic.size()) ||
-        header.schema != kEmbeddedSchema || header.headerBytes != sizeof(header) ||
+        header.schema != footer.schema || header.headerBytes != sizeof(header) ||
         (header.flags & ~3u) || header.unitCount > kMaxUnits || header.campaignUnitCount > kPersonCount ||
         header.scenarioCharacters > kMaxScenarioCharacters || header.statusCharacters > kMaxStatusCharacters ||
         header.scenarioOrdinal < -1 || header.scenarioOrdinal >= static_cast<int32_t>(kPersonCount) ||
-        (header.knownMetrics & ~kKnownMetricsMask)) {
+        (header.knownMetrics & ~(footer.schema == kOldEmbeddedSchema ?
+            kOldKnownMetricsMask : kKnownMetricsMask))) {
         error = L"存档中的战场统计版本字段、人物数量或文本长度无效。";
         return BattleStatsReadResult::Corrupt;
     }
     BattleStatsPersistedState decoded;
-    decoded.schemaVersion = kEmbeddedSchema;
+    decoded.schemaVersion = header.schema;
     decoded.active = (header.flags & 1) != 0;
-    decoded.historyIncomplete = (header.flags & 2) != 0;
+    decoded.historyIncomplete = (header.flags & 2) != 0 || header.schema < kEmbeddedSchema;
     decoded.scenarioOrdinal = header.scenarioOrdinal;
     decoded.knownMetrics = header.knownMetrics;
     decoded.elapsedMilliseconds = header.elapsedMilliseconds;
@@ -470,8 +507,8 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     decoded.battleInstance = header.battleInstance;
     if (!ReadWide(payload, offset, header.scenarioCharacters, decoded.scenario) ||
         !ReadWide(payload, offset, header.statusCharacters, decoded.status) ||
-        !ReadGroup(payload, offset, header.unitCount, decoded.units) ||
-        !ReadGroup(payload, offset, header.campaignUnitCount, decoded.campaignUnits) || offset != payload.size()) {
+        !ReadGroup(payload, offset, header.unitCount, header.schema, decoded.units) ||
+        !ReadGroup(payload, offset, header.campaignUnitCount, header.schema, decoded.campaignUnits) || offset != payload.size()) {
         error = L"存档中的战场统计人物数据不完整、重复或包含非法计数。";
         return BattleStatsReadResult::Corrupt;
     }

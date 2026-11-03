@@ -30,6 +30,121 @@ bool ValidateStateFormatting() {
     return true;
 }
 
+bool ValidateAuthorGuideFormatting() {
+    // The parser accepts both the compact heading requested for authored files
+    // and the spaced heading used by the generated guide, then normalizes all
+    // line endings for the returned body.
+    const wchar_t authored[] =
+        L"第01关简易攻略\n"
+        L"第一关作者攻略。\n"
+        L"第 00 关简易攻略\r\n"
+        L"零关作者攻略。";
+    std::vector<GuideAuthorSectionTest> sections;
+    if (!ParseGuideAuthorTextForTest(authored, sections) || sections.size() != 2) return false;
+    if (sections[0].number != 0 || sections[0].text != L"零关作者攻略。") return false;
+    if (sections[1].number != 1 || sections[1].text != L"第一关作者攻略。") return false;
+
+    std::wstring selected;
+    if (!SelectGuideAuthorTextForTest(authored, 1, selected) ||
+        selected != L"第一关作者攻略。") return false;
+
+    // A matching authored section wins over generated content.  A missing
+    // section reports a miss so the caller can retain its generated fallback.
+    const std::wstring generated = L"自动生成攻略。";
+    std::wstring displayed = generated;
+    if (SelectGuideAuthorTextForTest(authored, 0, selected)) displayed = selected;
+    if (displayed != L"零关作者攻略。") return false;
+    displayed = generated;
+    selected.clear();
+    if (SelectGuideAuthorTextForTest(authored, 2, selected)) displayed = selected;
+    if (displayed != generated || !selected.empty()) return false;
+
+    // Empty or whitespace-only sections behave like an absent authored guide.
+    // The helpers clear prior output on misses to prevent stale author text
+    // from remaining visible after a reload or a change of battlefield.
+    selected = L"stale";
+    if (SelectGuideAuthorTextForTest(L"", 0, selected) || !selected.empty()) return false;
+    selected = L"stale";
+    if (SelectGuideAuthorTextForTest(L"第00关简易攻略\r\n \t\r\n", 0, selected) ||
+        !selected.empty()) return false;
+    sections.push_back({99, L"stale"});
+    if (!ParseGuideAuthorTextForTest(L"", sections) || !sections.empty()) return false;
+
+    const wchar_t duplicate[] =
+        L"第03关简易攻略\r\n旧攻略\r\n"
+        L"第 03 关简易攻略\r\n最后修订的攻略";
+    if (!SelectGuideAuthorTextForTest(duplicate, 3, selected) ||
+        selected != L"最后修订的攻略") return false;
+    const wchar_t duplicateEmpty[] =
+        L"第03关简易攻略\r\n旧攻略\r\n"
+        L"第03关简易攻略\r\n\t ";
+    selected = L"stale";
+    if (SelectGuideAuthorTextForTest(duplicateEmpty, 3, selected) || !selected.empty()) return false;
+
+    // Only a complete heading line starts a section.  Incidental references to
+    // the title in an author's prose remain part of that author's text.
+    const wchar_t prose[] =
+        L"文件说明：第04关简易攻略不应成为分隔标记。\n"
+        L"第04关简易攻略\n"
+        L"请阅读第05关简易攻略作为参考。\n"
+        L"第05关简易攻略附注\n"
+        L"第05关简易攻略\n"
+        L"第五关正文";
+    if (!ParseGuideAuthorTextForTest(prose, sections) || sections.size() != 2 ||
+        sections[0].number != 4 || sections[1].number != 5) return false;
+    if (sections[0].text != L"请阅读第05关简易攻略作为参考。\r\n第05关简易攻略附注")
+        return false;
+
+    const wchar_t boundaries[] =
+        L"第-1关简易攻略\n无效负编号\n"
+        L"第1000关简易攻略\n无效超界编号\n"
+        L"第000关简易攻略\n零号正文\n"
+        L"第999关简易攻略\n最大编号正文";
+    if (!ParseGuideAuthorTextForTest(boundaries, sections) || sections.size() != 2 ||
+        sections[0].number != 0 || sections[0].text != L"零号正文" ||
+        sections[1].number != 999 || sections[1].text != L"最大编号正文") return false;
+    selected = L"stale";
+    if (SelectGuideAuthorTextForTest(boundaries, -1, selected) || !selected.empty()) return false;
+    selected = L"stale";
+    if (SelectGuideAuthorTextForTest(boundaries, 1000, selected) || !selected.empty()) return false;
+
+    const wchar_t layout[] =
+        L"第10关简易攻略\n"
+        L"\n"
+        L"一、准备\r"
+        L"\t先补给。\r\n"
+        L"\r\n"
+        L"二、进军\n"
+        L"第11关简易攻略\n下一关正文";
+    if (!SelectGuideAuthorTextForTest(layout, 10, selected) ||
+        selected != L"\r\n一、准备\r\n\t先补给。\r\n\r\n二、进军") return false;
+
+    // Export is sorted by battlefield number, de-duplicates repeated numbers
+    // using the last supplied body, and removes trailing CRLF from each body.
+    const std::vector<GuideExportSectionTest> exportSections = {
+        {2, L"旧的二关内容。"},
+        {0, L"零关自动攻略。"},
+        {2, L"最终的二关内容。\r\n\r\n"}
+    };
+    std::wstring exported;
+    if (!BuildGuideExportTextForTest(exportSections, exported)) return false;
+    const std::wstring expected =
+        L"第 00 关简易攻略\r\n"
+        L"零关自动攻略。\r\n\r\n"
+        L"第 02 关简易攻略\r\n"
+        L"最终的二关内容。";
+    if (exported != expected) return false;
+    if (!BuildGuideExportTextForTest({{999, L"最大编号正文"}}, exported) ||
+        exported != L"第 999 关简易攻略\r\n最大编号正文") return false;
+    exported = L"stale";
+    if (BuildGuideExportTextForTest({}, exported) || !exported.empty()) return false;
+    exported = L"stale";
+    if (BuildGuideExportTextForTest({{-1, L"无效编号"}}, exported) || !exported.empty()) return false;
+    exported = L"stale";
+    if (BuildGuideExportTextForTest({{1000, L"无效编号"}}, exported) || !exported.empty()) return false;
+    return true;
+}
+
 size_t CountScenarioFiles(const std::wstring& root, const wchar_t* pattern) {
     WIN32_FIND_DATAW data = {};
     HANDLE find = FindFirstFileW((root + L"\\RS\\" + pattern).c_str(), &data);
@@ -173,9 +288,40 @@ bool ValidateStandard65(const std::wstring& value, const GuideTestStats& stats, 
     return stats.commands == 819 && stats.dialogEntries == 2 && stats.aiEntries == 1 && stats.rewardEntries == 7;
 }
 
+bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool finalStage) {
+    if (!ValidatePlayerText(value) || value.find(L"本关暂无可整理的攻略信息") != std::wstring::npos)
+        return false;
+    static const wchar_t* first[] = {
+        L"第 01 关简易攻略",
+        L"第 2 回合时，西凉骑1、轻骑兵1等人触发对话",
+        L"壮汉1爆发下降、陷入麻痹和混乱和中毒并HP减少 40",
+        L"第 3 回合时，6 支隐藏敌军在（8，1）至（11，2）范围出现。",
+        L"初始部署于（2，9）、（2，13）的敌军由坚守原地改为主动出击。",
+        L"初始部署于（9，10）的敌军由主动出击改为攻击指定武将。"
+    };
+    static const wchar_t* last[] = {
+        L"第 61 关简易攻略",
+        L"杨双与杜伏威相邻后，触发对话并且杜伏威爆发下降。",
+        L"普罗与苗海潮相邻后，触发对话；触发单挑；苗海潮防御下降、陷入麻痹并HP减少 200，并且获得将军印。",
+        L"击退辅公祏时，辅公祏触发对话并且获得腾蛇越涧。",
+        L"（13，9）至（22，11）范围的敌军由坚守原地改为主动出击。",
+        L"完成本关后，获得将军印并且获得 5000 金钱。",
+        L"我方部队到达（7，27）后，获得珍珠。"
+    };
+    if (finalStage) {
+        for (const wchar_t* item : last) if (value.find(item) == std::wstring::npos) return false;
+        return stats.commands == 1198 && stats.dialogEntries == 9 && stats.ambushEntries == 0 &&
+            stats.aiEntries == 2 && stats.rewardEntries == 21;
+    }
+    for (const wchar_t* item : first) if (value.find(item) == std::wstring::npos) return false;
+    return stats.commands == 508 && stats.dialogEntries == 1 && stats.ambushEntries == 1 &&
+        stats.aiEntries == 2 && stats.rewardEntries == 1;
+}
+
 int wmain(int argc, wchar_t** argv) {
     if (argc != 3 && argc != 4) return 2;
     if (!ValidateStateFormatting()) return 7;
+    if (!ValidateAuthorGuideFormatting()) return 16;
     if (argc == 4 && wcscmp(argv[3], L"--jumps") == 0) {
         std::vector<std::wstring> targets;
         if (!ListGuideScenarioJumpsForTest(argv[1], targets)) return 12;
@@ -244,6 +390,12 @@ int wmain(int argc, wchar_t** argv) {
         if (!BuildGuideStatsForTest(argv[1], argv[2], stats) ||
             !ValidateStandard65(text, stats, wcscmp(argv[3], L"--standard65-s58") == 0) ||
             !ValidateScenarioSelection(argv[2])) return 14;
+    } else if (argc == 4 && (wcscmp(argv[3], L"--xisui-s01") == 0 ||
+        wcscmp(argv[3], L"--xisui-s61") == 0)) {
+        GuideTestStats stats;
+        if (!BuildGuideStatsForTest(argv[1], argv[2], stats) ||
+            !ValidateXiSui(text, stats, wcscmp(argv[3], L"--xisui-s61") == 0) ||
+            !ValidateScenarioSelection(argv[2])) return 15;
     } else if (argc == 4) {
         return 2;
     }

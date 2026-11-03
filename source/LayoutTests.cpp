@@ -7,6 +7,7 @@ HMODULE gInstance = nullptr;
 uintptr_t gGameBase = 0;
 bool EngineTestInitializeImage(uintptr_t virtualBase);
 void EngineTestFailWrite(int index);
+bool EngineTestOwnedPhaseState(int phase, int& value, int& counter);
 
 namespace {
 int failures = 0;
@@ -63,16 +64,21 @@ int wmain(int argc, wchar_t** argv) {
             static_cast<unsigned>(layout.sites[4]), static_cast<unsigned>(layout.sites[5]),
             static_cast<unsigned>(layout.nativeStage), static_cast<unsigned>(layout.phase),
             static_cast<unsigned>(layout.speed));
+        const bool is64 = layout.profile == EngineProfileId::Ccz64;
         const bool is65 = layout.profile == EngineProfileId::Ccz65;
-        Check((is65 && layout.nativeSuper == 0x4250B3 && layout.nativeSuperState == 0x4CE7BF &&
+        Check((is64 && layout.nativeSuper == 0 && layout.nativeSuperState == 0 &&
+            layout.waitWrapper == 0x42C4E0 && layout.timerContext == 0x4B1B18 &&
+            layout.stageUsesThis && layout.phaseOwnedByPatch &&
+            layout.sites[SiteMapText] == 0x4327EF && !layout.dialog3Applicable) ||
+            (is65 && layout.nativeSuper == 0x4250B3 && layout.nativeSuperState == 0x4CE7BF &&
             layout.waitWrapper == 0x42C4E0 && layout.timerContext == 0x4B1B18 && layout.stageUsesThis &&
             layout.sites[SiteMapText] == 0x4327EF && !layout.dialog3Applicable) ||
-            (!is65 && layout.nativeSuper == 0x4250E6 && layout.nativeSuperState == 0x500ADB &&
+            (!is64 && !is65 && layout.nativeSuper == 0x4250E6 && layout.nativeSuperState == 0x500ADB &&
             layout.waitWrapper == 0x42C4E5 && !layout.stageUsesThis && layout.dialog3Applicable),
             "identify independent profile, native owner and timer ABI");
         Check(layout.sites[SiteExtraDelay] == 0x415B40 && layout.sites[SiteWaitBranch] == 0x42C4EF &&
             layout.sites[SiteDialogDisplay] == 0x42C812 && layout.sites[SiteExtendedDisplay] == 0x455CE5 &&
-            (is65 ? layout.sites[SiteDialog3] == 0 : layout.sites[SiteDialog3] == 0x42DB2C),
+            (is64 || is65 ? layout.sites[SiteDialog3] == 0 : layout.sites[SiteDialog3] == 0x42DB2C),
             "resolve every acceleration site implemented by this engine profile");
         if (is65) {
             DWORD dialog3, next;
@@ -83,18 +89,84 @@ int wmain(int argc, wchar_t** argv) {
         }
         const unsigned requiredCapabilities = CapabilitySuperDialog|CapabilitySuperMapText|
             CapabilitySuperDelay|CapabilitySuperR|CapabilitySuperS|CapabilityPhase|CapabilityInput|
-            CapabilityExtraDelay|CapabilityDialogDisplay|CapabilityExtendedDisplay|CapabilityNativeSuper|
-            (is65 ? 0u : CapabilityDialog3);
+            CapabilityExtraDelay|CapabilityDialogDisplay|CapabilityExtendedDisplay|
+            (is64 ? 0u : CapabilityNativeSuper) |
+            (is64 || is65 ? 0u : CapabilityDialog3);
         wprintf(L"capabilities=%08X expected=%08X callers=%u nativeCall=%08X\n", layout.capabilities, requiredCapabilities, static_cast<unsigned>(layout.waitCallerCount), static_cast<unsigned>(layout.nativeSuperCall));
         const bool complete = (layout.capabilities & requiredCapabilities) == requiredCapabilities;
         Check(complete, "all acceleration capabilities implemented by this profile pass semantic checks");
         // Never index a missing site after a failed resolver assertion.
         if (!complete) continue;
-        bool safeCallers = layout.waitCallerCount == (is65 ? 16u : 17u);
+        bool safeCallers = is64 ? layout.waitCallerCount > 0 :
+            layout.waitCallerCount == (is65 ? 16u : 17u);
         for (size_t i = 0; i < layout.waitCallerCount; ++i)
             safeCallers = safeCallers && layout.waitCallers[i] != layout.sites[SiteRWait] + 5;
         Check(safeCallers, "profile-specific S wait whitelist excludes the separately controlled R wait");
         const auto original = image;
+        if (is64) {
+            // Exercise the same public settings transaction without indexing
+            // native Z/phase-table fields that do not exist in 6.4.
+            gGameBase = reinterpret_cast<uintptr_t>(image.data());
+            Check(EngineTestInitializeImage(base), "initialize 6.4 mapped base without its original hash");
+            Settings ownedSettings;
+            ownedSettings.superEnabled = true;
+            bool allRestored = true;
+            for (unsigned mask = 0; mask < 32; ++mask) {
+                for (unsigned flag = 0; flag < 5; ++flag)
+                    ownedSettings.superFlags[flag] = (mask & (1u << flag)) != 0;
+                const bool applied = ApplyEngineState(ownedSettings);
+                if (mask & 1u) {
+                    allRestored = allRestored &&
+                        memcmp(image.data() + layout.sites[SiteDialog] - 0x400000,
+                            layout.siteEnabled[SiteDialog], 4) == 0 &&
+                        memcmp(image.data() + layout.sites[SiteDialogDisplay] - 0x400000,
+                            layout.siteEnabled[SiteDialogDisplay], 2) == 0;
+                }
+                allRestored = applied && !EngineError()[0] && allRestored;
+                RestoreEngine();
+                allRestored = image == original && allRestored;
+            }
+            Check(allRestored, "6.4 all 32 super combinations use profile bytes and restore exactly");
+            ownedSettings = Settings();
+            ownedSettings.phaseEnabled = true;
+            ownedSettings.phase[0] = 60;
+            ownedSettings.phase[1] = 61;
+            ownedSettings.phase[2] = 62;
+            int value = -1, counter = -1;
+            const bool ownedApplied = ApplyEngineState(ownedSettings);
+            Check(ownedApplied && !EngineError()[0] &&
+                EngineTestOwnedPhaseState(1, value, counter) && value == 61 && counter == 0 &&
+                memcmp(image.data() + layout.sites[SiteWaitCall] - 0x400000,
+                    original.data() + layout.sites[SiteWaitCall] - 0x400000, 5) != 0,
+                "6.4 phase acceleration installs a bridge and keeps parameters in the proxy");
+            ownedSettings.phaseFlags[1] = false;
+            Check(ApplyEngineState(ownedSettings) && EngineTestOwnedPhaseState(1, value, counter) &&
+                value == 50, "6.4 excluded phase retains the established fixed-50 behavior");
+            RestoreEngine();
+            Check(image == original && !EngineTestOwnedPhaseState(1, value, counter),
+                "6.4 phase uninstall restores every byte and clears proxy parameters");
+            EngineTestFailWrite(0);
+            Check(!ApplyEngineState(ownedSettings) && image == original &&
+                !EngineTestOwnedPhaseState(1, value, counter),
+                "6.4 phase bridge write failure keeps original bytes and inactive proxy state");
+            EngineTestFailWrite(-1);
+            ownedSettings = Settings();
+            ownedSettings.superEnabled = true;
+            for (bool& flag : ownedSettings.superFlags) flag = false;
+            ownedSettings.superFlags[0] = true;
+            Check(ApplyEngineState(ownedSettings), "6.4 dialog applies before conflict test");
+            image[layout.sites[SiteDialog] - 0x400000] ^= 1;
+            const BYTE conflict = image[layout.sites[SiteDialog] - 0x400000];
+            RestoreEngine();
+            Check(image[layout.sites[SiteDialog] - 0x400000] == conflict &&
+                wcsstr(EngineError(), L"运行时恢复冲突") != nullptr,
+                "6.4 recovery journal protects a dialog site changed by another patch");
+            image = original;
+            Check(EngineTestInitializeImage(base), "6.4 reinitializes after the protected conflict");
+            RestoreEngine();
+            Check(image == original, "6.4 initialization leaves the mapped image unchanged on restore");
+            continue;
+        }
         gGameBase = reinterpret_cast<uintptr_t>(image.data());
         const bool initialized = EngineTestInitializeImage(base);
         Check(initialized, "initialize real mapped base without its original hash");
@@ -110,6 +182,30 @@ int wmain(int argc, wchar_t** argv) {
             "dialog switch covers this profile's dialogue paths and owns native Z");
         RestoreEngine();
         Check(image == original, "dialog3 and native Z routing restore byte-for-byte");
+        Check(ApplyEngineState(settings), "apply dialog state before restore rollback test");
+        const auto beforeRestoreFailure = image;
+        EngineTestFailWrite(1);
+        RestoreEngine();
+        Check(image == beforeRestoreFailure && wcsstr(EngineError(), L"写入失败") != nullptr,
+            "failed multi-site restore rolls back every earlier write and preserves installed state");
+        EngineTestFailWrite(-1);
+        RestoreEngine();
+        Check(image == original, "restoration can retry after its failed transaction rolled back");
+        Check(ApplyEngineState(settings), "apply dialog state before already-restored site test");
+        memcpy(image.data() + layout.sites[SiteDialog] - 0x400000,
+            original.data() + layout.sites[SiteDialog] - 0x400000, 4);
+        RestoreEngine();
+        Check(image == original && !EngineError()[0],
+            "journal accepts a site already restored to its captured original bytes");
+        Check(ApplyEngineState(settings), "reapply dialog state before conflict journal test");
+        image[layout.sites[SiteDialog] - 0x400000] ^= 0x01;
+        const BYTE conflicting = image[layout.sites[SiteDialog] - 0x400000];
+        RestoreEngine();
+        Check(image[layout.sites[SiteDialog] - 0x400000] == conflicting &&
+            wcsstr(EngineError(), L"运行时恢复冲突") != nullptr,
+            "runtime journal refuses to overwrite a site changed by another patch");
+        image = original;
+        Check(EngineTestInitializeImage(base), "reinitialize after a protected restore conflict");
         EngineTestFailWrite(1);
         Check(!ApplyEngineState(settings) && image == original,
             "multi-site dialog transaction restores earlier writes after an injected failure");
@@ -183,8 +279,12 @@ int wmain(int argc, wchar_t** argv) {
             image[layout.phaseTable - 0x400000 + 1] == 50 &&
             image[layout.phaseTable - 0x400000 + 2] == 62,
             "an unchecked phase uses the legacy fixed 50 value");
+        image[layout.phaseCounter - 0x400000] = 7;
+        image[layout.nativeSuperState - 0x400000] ^= 1;
+        image[layout.nativeSuperBusy - 0x400000] = 1;
         RestoreEngine();
-        Check(stageApplied && image == original, "stage call and native modifier restore this base exactly");
+        Check(stageApplied && image == original && !EngineError()[0],
+            "restore ignores live phase counter and native state changes while restoring the initial snapshot");
         image[layout.phase - 0x400000] = 2;
         Check(CurrentGamePhase() == 2, "wheel phase reads the address resolved from this base");
         image = original;
@@ -256,7 +356,9 @@ int wmain(int argc, wchar_t** argv) {
         memcpy(backup.data(), image.data() + delay + 0x100, backup.size());
         memcpy(image.data() + delay + 0x100, image.data() + delay, backup.size());
         Check(ResolveEngineLayout(image.data(), altered, base) &&
-            !(altered.capabilities & CapabilitySuperDelay),
+            !(altered.capabilities & CapabilitySuperDelay) &&
+            altered.plan.status == EnginePlanStatus::ForceRequired &&
+            altered.plan.evidence.find(L"Resolution=Ambiguous") != std::wstring::npos,
             "ambiguous delay signatures disable only the affected feature");
         memset(image.data() + delay, 0x90, backup.size());
         const size_t callOffsets[] = {is65 ? 12u : 6u, is65 ? 20u : 11u, is65 ? 34u : 25u};
@@ -278,7 +380,9 @@ int wmain(int argc, wchar_t** argv) {
         memcpy(image.data() + delay + 0x100, backup.data(), backup.size());
         image[delay + (is65 ? 32 : 23)] = 0x90;
         Check(ResolveEngineLayout(image.data(), altered, base) &&
-            !(altered.capabilities & CapabilitySuperDelay),
+            !(altered.capabilities & CapabilitySuperDelay) &&
+            altered.plan.status == EnginePlanStatus::ForceRequired &&
+            altered.plan.evidence.find(L"Resolution=Missing") != std::wstring::npos,
             "unrecognized wait semantics disable only the affected feature");
     }
     wprintf(L"LayoutTests: %d failures\n", failures);

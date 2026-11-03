@@ -6,6 +6,8 @@
 
 enum class BattleStatsReadResult { Loaded, Missing, Corrupt, Unsupported };
 
+// Writes embedded schema 3 and reads schema 2/3. Legacy schema 2 counters
+// remain unchanged; received counts start at zero with incomplete history.
 // The E5S native prefix is preserved byte for byte. Call the writer only after
 // the native writer has closed its fresh transaction file; the save coordinator
 // remains responsible for committing that file to the player's save slot.

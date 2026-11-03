@@ -153,20 +153,30 @@ bool DetectEngineProfileImage(const unsigned char* image, size_t size, uintptr_t
     unsigned generation = 0;
     if (!ResourceVersion(image, size, nt, generation, error)) return false;
     EngineLayout layout;
-    if (!ResolveEngineLayout(image, layout, virtualBase) ||
-        (layout.profile != EngineProfileId::Ccz65 && layout.profile != EngineProfileId::Ccz66) ||
-        !layout.waitWrapper || !layout.nativeStage || !layout.nativeSuper ||
-        !layout.nativeSuperState || !layout.phase || !layout.speed || !layout.phaseTable ||
-        !(layout.capabilities & CapabilityPhase) || !(layout.capabilities & CapabilityNativeSuper)) {
-        error = L"无法唯一确认标准 6.5 或 6.6 的等待、阶段和原生加速调用关系，未安装补丁。";
+    const bool resolved = ResolveEngineLayout(image, layout, virtualBase);
+    const bool phaseOwnedByPatch = layout.phaseOwnedByPatch;
+    if (!resolved ||
+        (layout.profile != EngineProfileId::Ccz64 && layout.profile != EngineProfileId::Ccz65 && layout.profile != EngineProfileId::Ccz66) ||
+        !layout.waitWrapper || !layout.nativeStage || !layout.phase || !layout.speed ||
+        !(layout.capabilities & CapabilityPhase) ||
+        (!phaseOwnedByPatch && (!layout.nativeSuper || !layout.nativeSuperState || !layout.phaseTable ||
+            !(layout.capabilities & CapabilityNativeSuper))) ||
+        layout.plan.status != EnginePlanStatus::AutoVerified) {
+        detection.forceRequired = true;
+        detection.planReport = EnginePatchPlanReport(layout.plan);
+        detection.evidence = layout.plan.evidence;
+        error = L"无法唯一确认完整加速功能的站点、调用关系及文件偏移，需要明确选择强制模板。";
         return false;
     }
-    const unsigned expected = layout.profile == EngineProfileId::Ccz65 ? 5 : 6;
+    detection.confidence = layout.plan.confidence;
+    const unsigned expected = layout.profile == EngineProfileId::Ccz64 ? 4 :
+        layout.profile == EngineProfileId::Ccz65 ? 5 : 6;
     if (generation && generation != expected) {
         error = L"主程序版本资源与引擎调用布局冲突，未安装补丁。";
         return false;
     }
     detection.profile = layout.profile;
+    detection.planReport = EnginePatchPlanReport(layout.plan);
     detection.evidence = std::wstring(L"已识别 ") + EngineProfileName(layout.profile) +
         L"：已校验等待包装、阶段函数、原生加速及状态变量" +
         (generation ? L"，版本资源一致。" : L"；版本资源缺失，使用独立调用布局确认。");
@@ -201,6 +211,65 @@ bool DetectEngineProfile(const std::wstring& root, EngineDetection& detection, s
     if (!Hash(raw, detection.exeSha256)) {
         detection = EngineDetection();
         error = L"无法计算主程序指纹，未安装补丁。";
+        return false;
+    }
+    return true;
+}
+
+bool DetectForcedEngineProfileImage(const unsigned char* image, size_t size, uintptr_t virtualBase,
+    EngineProfileId selectedProfile, EngineDetection& detection, std::wstring& error) {
+    detection = EngineDetection();
+    error.clear();
+    IMAGE_NT_HEADERS32 nt = {};
+    size_t sectionOffset = 0;
+    if (!Headers(image, size, nt, sectionOffset) || nt.OptionalHeader.SizeOfImage > size) {
+        error = L"目标主程序不是结构完整的 32 位 PE，不能强制注入。";
+        return false;
+    }
+    EngineLayout layout;
+    if (!ResolveForcedEngineLayout(image, size, selectedProfile, layout, virtualBase)) {
+        detection.forceRequired = true;
+        error = L"所选强制模板的站点超出目标 PE 边界，不能安全保存恢复基线。";
+        return false;
+    }
+    detection.profile = selectedProfile;
+    detection.forced = true;
+    detection.confidence = layout.plan.confidence;
+    detection.evidence = layout.plan.evidence;
+    detection.planReport = EnginePatchPlanReport(layout.plan);
+    return true;
+}
+
+bool DetectForcedEngineProfile(const std::wstring& root, EngineProfileId selectedProfile,
+    EngineDetection& detection, std::wstring& error) {
+    detection = EngineDetection();
+    const std::wstring path = root + L"\\Ekd5.exe";
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"rb") || !file) {
+        error = L"无法读取游戏根目录的 Ekd5.exe。";
+        return false;
+    }
+    bool ok = _fseeki64(file, 0, SEEK_END) == 0;
+    const __int64 length = ok ? _ftelli64(file) : -1;
+    ok = ok && length >= 256 && length <= kMaximumImage && _fseeki64(file, 0, SEEK_SET) == 0;
+    std::vector<BYTE> raw(ok ? static_cast<size_t>(length) : 0);
+    ok = ok && fread(raw.data(), 1, raw.size(), file) == raw.size();
+    fclose(file);
+    if (!ok) {
+        error = L"无法完整读取主程序，或主程序大小异常。";
+        return false;
+    }
+    std::vector<BYTE> mapped;
+    uintptr_t base = 0;
+    if (!MapImage(raw, mapped, base)) {
+        error = L"主程序 PE 段结构无效，不能强制注入。";
+        return false;
+    }
+    if (!DetectForcedEngineProfileImage(mapped.data(), mapped.size(), base, selectedProfile,
+        detection, error)) return false;
+    if (!Hash(raw, detection.exeSha256)) {
+        detection = EngineDetection();
+        error = L"无法计算主程序指纹，未强制注入补丁。";
         return false;
     }
     return true;

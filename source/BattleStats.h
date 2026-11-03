@@ -14,7 +14,13 @@ enum BattleStatsMetric : uint32_t {
     BattleStatsCombo = 1u << 4,
     BattleStatsAttackBlock = 1u << 5,
     BattleStatsSpellBlock = 1u << 6,
-    BattleStatsDefeatedEnemies = 1u << 7
+    // Binary schema 2 keeps the old field/bit positions. These two metrics
+    // now mean genuine native final hit-test failures for the defender.
+    BattleStatsAttackDodge = BattleStatsAttackBlock,
+    BattleStatsStrategyDodge = BattleStatsSpellBlock,
+    BattleStatsDefeatedEnemies = 1u << 7,
+    BattleStatsPhysicalReceived = 1u << 8,
+    BattleStatsStrategyReceived = 1u << 9
 };
 
 struct BattleUnitTotals {
@@ -26,11 +32,16 @@ struct BattleUnitTotals {
     long long recoveryDone = 0;
     long long criticalCount = 0;
     long long comboExtraHitCount = 0;
-    // Counts only explicit, successful result commits.  They must not be
-    // inferred from unchanged HP, misses, immunity, or target redirection.
+    // Schema 2 compatibility names: counts of real physical / hostile
+    // strategy final hit-test failures, excluding immunity and invalid targets.
+    // Each independent judgment counts once; no inference from HP or animation.
     long long attackBlockCount = 0;
     long long spellBlockCount = 0;
     int defeatedEnemies = 0;
+    // Actual hostile attack segments accepted by this player unit. Misses,
+    // immunity and zero damage count; damage plus status in one segment is one.
+    long long physicalReceivedCount = 0;
+    long long strategyReceivedCount = 0;
 };
 
 struct BattleStatsSnapshot {
@@ -40,13 +51,15 @@ struct BattleStatsSnapshot {
     bool recoveryAvailable = false;
     bool criticalAvailable = false;
     bool comboAvailable = false;
-    // False means the current executable has no uniquely verified block
-    // result commit; the UI renders that column as "--".
+    // True only after the complete native final-hit / eligibility call graph
+    // is verified and all observer CALL patches install together.
     bool attackBlockAvailable = false;
     bool spellBlockAvailable = false;
+    bool physicalReceivedAvailable = false;
+    bool strategyReceivedAvailable = false;
     bool active = false;
     bool loading = false;
-    uint32_t schemaVersion = 2;
+    uint32_t schemaVersion = 3;
     int scenarioOrdinal = -1;
     uint64_t campaignId = 0;
     uint64_t battleInstance = 0;
@@ -60,7 +73,7 @@ struct BattleStatsSnapshot {
 };
 
 struct BattleStatsPersistedState {
-    uint32_t schemaVersion = 2;
+    uint32_t schemaVersion = 3;
     int scenarioOrdinal = -1;
     uint64_t campaignId = 0;
     uint64_t battleInstance = 0;
@@ -83,14 +96,23 @@ struct BattleStatsImageLayout {
     uintptr_t criticalCommit = 0;
     uintptr_t attackBlockCommit = 0;
     uintptr_t spellBlockCommit = 0;
+    bool dodgeAvailable = false;
+    uintptr_t finalHit = 0;
     uint32_t criticalOffset = 0;
     uint32_t comboOffset = 0;
+    bool physicalReceivedAvailable = false;
+    bool strategyReceivedAvailable = false;
+    std::vector<uintptr_t> receivedCalls;
     std::vector<uintptr_t> settlementCalls;
 };
 
 void InitializeBattleStats(const wchar_t* gameRoot);
 void PollBattleStats(ULONGLONG now);
-void ResetBattleStats();
+void ResetBattleStats(const wchar_t* reason = L"explicit-reset");
+// A successful native load has already replaced the game. Even when its
+// statistics cannot be decoded or allocated, continue from that scenario
+// without retaining another save's ledgers. Core replacement allocates no memory.
+void ResetBattleStatsForLoadedScenario(const wchar_t* reason, int ordinal) noexcept;
 void ShutdownBattleStats();
 bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot);
 bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now);
@@ -115,3 +137,22 @@ void RecordBattleStatsPhysicalResultForTest(uintptr_t context, uint32_t comboOff
 void RecordBattleStatsCriticalForTest(uintptr_t context, uint32_t comboOffset);
 void RecordBattleStatsAttackBlockForTest(int attackerSlot, int targetSlot);
 void RecordBattleStatsSpellBlockForTest(int attackerSlot, int targetSlot);
+
+#ifdef XA66_TEST
+bool ConfigureBattleStatsReceivedForTest(const BYTE* image, uintptr_t virtualBase);
+void DispatchBattleStatsReceivedForTest(void* snapshot, unsigned role);
+void RecordBattleStatsReceivedForTest(bool strategy, int attackerSlot, int targetSlot);
+bool ConfigureBattleStatsDodgeForTest(const BYTE* image, uintptr_t virtualBase);
+void SetBattleStatsDodgeTargetForTest(unsigned role, uintptr_t target);
+void DispatchBattleStatsDodgeForTest(void* snapshot, unsigned role);
+bool BattleStatsDodgeObservationActiveForTest();
+bool InstallBattleStatsDodgeHooksForTest(BYTE* mapped, unsigned sabotage,
+    std::vector<uintptr_t>& sites);
+bool InstallAllBattleStatsHooksForTest(BYTE* mapped, uintptr_t virtualBase,
+    std::vector<uintptr_t>& sites);
+// Failure 1 rejects initial protection; 2 leaves post-copy protection pending;
+// failure 3 leaves instruction-cache flush pending. Negative index disables it.
+void SetBattleStatsWriteFaultForTest(int forwardIndex,unsigned forwardFailure,
+    int restoreIndex,unsigned restoreFailure);
+bool BattleStatsRecoveryPendingForTest();
+#endif

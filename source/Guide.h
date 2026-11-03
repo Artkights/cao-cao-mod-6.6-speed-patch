@@ -31,6 +31,34 @@ bool SelectObservedGuideScenarioForTest(const wchar_t* gameRoot, std::wstring& s
 bool FormatGuideStateSummaryForTest(unsigned attributeMask, int change, int abnormalMask,
     int hpLoss, int mpLoss, std::wstring& text);
 
+// Pure in-memory helpers for the author-authored guide document and the
+// generated all-battlefield export.  The production guide keeps file I/O and
+// window state outside these helpers so the regression test can exercise the
+// document format without a game installation or a modeless window.
+struct GuideAuthorSectionTest {
+    int number = -1;
+    std::wstring text;
+};
+
+bool ParseGuideAuthorTextForTest(const wchar_t* source,
+    std::vector<GuideAuthorSectionTest>& sections);
+bool SelectGuideAuthorTextForTest(const wchar_t* source, int battlefieldNumber,
+    std::wstring& text);
+
+struct GuideExportSectionTest {
+    int number = -1;
+    std::wstring body;
+};
+
+bool BuildGuideExportTextForTest(const std::vector<GuideExportSectionTest>& sections,
+    std::wstring& text);
+
+bool BuildGuideDisplayTextForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot,
+    std::wstring& text, bool& authored);
+bool ExportGuideBookForTest(const wchar_t* root, size_t& success,
+    std::vector<int>& skipped, std::wstring& error);
+bool DecodeGuideDocumentForTest(const std::vector<unsigned char>& bytes, std::wstring& text);
+
 struct GuideTestStats {
     size_t commands = 0;
     size_t ambushCommands = 0;

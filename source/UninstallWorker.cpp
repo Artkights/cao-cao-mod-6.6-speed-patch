@@ -6,12 +6,13 @@
 
 namespace {
 
-bool ParseArguments(std::wstring& root, HANDLE& process, bool& quiet) {
+bool ParseArguments(std::wstring& root, HANDLE& process, bool& quiet, unsigned& features) {
     int count = 0;
     wchar_t** values = CommandLineToArgvW(GetCommandLineW(), &count);
     if (!values) return false;
     process = nullptr;
     quiet = false;
+    features = XiaoAnInstall::FeatureAll;
     for (int i = 1; i < count; ++i) {
         if (!_wcsicmp(values[i], L"/root") && i + 1 < count) root = values[++i];
         else if (!_wcsicmp(values[i], L"/handle") && i + 1 < count) {
@@ -22,6 +23,14 @@ bool ParseArguments(std::wstring& root, HANDLE& process, bool& quiet) {
                 return false;
             }
             process = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(raw));
+        } else if (!_wcsicmp(values[i], L"/features") && i + 1 < count) {
+            wchar_t* end = nullptr;
+            const unsigned long value = wcstoul(values[++i], &end, 10);
+            if (!end || *end || !value || value > XiaoAnInstall::FeatureAll) {
+                LocalFree(values);
+                return false;
+            }
+            features = static_cast<unsigned>(value);
         } else if (!_wcsicmp(values[i], L"/quiet")) quiet = true;
     }
     LocalFree(values);
@@ -45,7 +54,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring root;
     HANDLE process = nullptr;
     bool quiet = false;
-    if (!ParseArguments(root, process, quiet)) {
+    unsigned features = XiaoAnInstall::FeatureAll;
+    if (!ParseArguments(root, process, quiet, features)) {
         Show(quiet, L"卸载助手参数无效。", MB_ICONERROR);
         return 2;
     }
@@ -61,7 +71,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 3;
     }
     std::wstring report, error;
-    if (!XiaoAnInstall::RestorePatch(root, report, error, true)) {
+    if (!XiaoAnInstall::RestorePatch(root, report, error, true, features)) {
         Show(quiet, L"卸载未完成。原始备份和安装清单已保留，可使用安装器的应急卸载入口重试。\r\n\r\n" + error,
              MB_ICONERROR);
         ScheduleSelfDelete();

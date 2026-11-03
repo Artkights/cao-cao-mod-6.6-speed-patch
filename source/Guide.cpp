@@ -1,4 +1,5 @@
-#include "Guide.h"
+﻿#include "Guide.h"
+#include "EngineProfile.h"
 #include "ResourceIds.h"
 
 #include <windows.h>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -20,9 +22,10 @@
 namespace {
 
 constexpr UINT kGuideReadComplete = WM_APP + 0x670;
-constexpr UINT kGuideReload = 0x6701;
-constexpr UINT kGuideFilter = 0x6702;
 constexpr UINT kGuideScenario = 0x6703;
+constexpr UINT kGuideExport = 0x6704;
+constexpr UINT kGuideFontSize = 0x6705;
+constexpr UINT kGuideLineSpacing = 0x6706;
 
 enum class GuideFilter : int { All, Dialog, Ambush, Ai, Rewards };
 
@@ -60,6 +63,14 @@ struct GuideUnit {
 struct GuideResult {
     std::wstring title;
     std::vector<GuideEntry> entries;
+    bool authored = false;
+    std::wstring authoredBody;
+    bool parsed = false;
+};
+
+struct GuideBook {
+    bool readable = false;
+    std::unordered_map<int, std::wstring> sections;
 };
 
 struct GuideTaskState {
@@ -68,6 +79,11 @@ struct GuideTaskState {
     HWND window = nullptr;
     unsigned request = 0;
     GuideResult result;
+    bool exporting = false;
+    size_t exportSuccess = 0;
+    std::wstring exportText;
+    std::vector<int> exportSkipped;
+    std::wstring exportError;
 };
 
 struct GuideCondition {
@@ -96,30 +112,53 @@ struct GuideContext {
 HWND gGuideWindow = nullptr;
 HWND gGuideLevelLabel = nullptr;
 HWND gGuideScenarioBox = nullptr;
-HWND gGuideFilterBox = nullptr;
-HWND gGuideReload = nullptr;
+HWND gGuideExport = nullptr;
+HWND gGuideFontLabel = nullptr;
+HWND gGuideFontSize = nullptr;
+HWND gGuideSpacingLabel = nullptr;
+HWND gGuideLineSpacing = nullptr;
 HWND gGuideText = nullptr;
 std::wstring gGuideRoot;
 std::vector<GuideFile> gGuideFiles;
 std::shared_ptr<GuideTaskState> gGuideTask;
 GuideResult gGuideResult;
-GuideFilter gGuideCurrentFilter = GuideFilter::All;
 unsigned gGuideRequest = 0;
 HFONT gGuideFont = nullptr;
 bool gGuideFontOwned = false;
+HFONT gGuideBodyFont = nullptr;
 HMODULE gGuideRichEditModule = nullptr;
 bool gGuideUsesRichEdit = false;
 SRWLOCK gObservedScenarioLock = SRWLOCK_INIT;
 std::wstring gObservedScenarioName;
+std::mutex gGuideDocumentLock;
+
+// RichEdit stores both values in twips (1/20 point).  They intentionally stay
+// as native values in the settings UI so users can tune the renderer without
+// a hidden unit conversion.
+struct GuideDisplaySettings {
+    int fontSize = 220;
+    int lineSpacing = 45;
+};
+
+GuideDisplaySettings gGuideDisplaySettings;
+bool gGuideDisplaySettingsReady = false;
+
+constexpr int kGuideFontSizeMinimum = 80;
+constexpr int kGuideFontSizeMaximum = 640;
+constexpr int kGuideLineSpacingMinimum = 0;
+constexpr int kGuideLineSpacingMaximum = 400;
 
 constexpr size_t kGuideTextCharacters = 1024u * 1024u;
+constexpr size_t kGuideBookBytes = 64u * 1024u * 1024u;
 
-bool ReadFileBytes(const std::wstring& path, std::vector<unsigned char>& bytes) {
+bool ReadFileBytes(const std::wstring& path, std::vector<unsigned char>& bytes,
+    size_t maximum = 0x7fffffffu) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size = {};
-    const bool sized = GetFileSizeEx(file, &size) != FALSE && size.QuadPart >= 0 && size.QuadPart <= 0x7fffffff;
+    const bool sized = GetFileSizeEx(file, &size) != FALSE && size.QuadPart >= 0 &&
+        static_cast<uint64_t>(size.QuadPart) <= maximum;
     if (!sized) { CloseHandle(file); return false; }
     bytes.resize(static_cast<size_t>(size.QuadPart));
     DWORD read = 0;
@@ -162,6 +201,161 @@ std::wstring DecodeGbk(const unsigned char* data, size_t length) {
     while (!result.empty() && result.front() == L' ') result.erase(result.begin());
     while (!result.empty() && result.back() == L' ') result.pop_back();
     return result;
+}
+
+bool DecodeGuideDocument(const std::vector<unsigned char>& bytes, std::wstring& text,
+    const std::atomic<bool>* cancelled = nullptr) {
+    text.clear();
+    if (cancelled && cancelled->load()) return false;
+    if (bytes.size() > kGuideBookBytes) return false;
+    if (bytes.empty()) return true;
+    size_t offset = 0;
+    if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+        offset = 2;
+        if ((bytes.size() - offset) % 2 != 0) return false;
+        const size_t count = (bytes.size() - offset) / 2;
+        text.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            if ((index & 4095u) == 0 && cancelled && cancelled->load()) return false;
+            const size_t at = offset + index * 2;
+            text.push_back(static_cast<wchar_t>(bytes[at] |
+                (static_cast<uint16_t>(bytes[at + 1]) << 8)));
+        }
+    } else {
+        const bool utf8Marked = bytes.size() >= 3 && bytes[0] == 0xEF &&
+            bytes[1] == 0xBB && bytes[2] == 0xBF;
+        offset = utf8Marked ? 3 : 0;
+        const unsigned char* data = bytes.data() + offset;
+        const size_t length = bytes.size() - offset;
+        if (!length) return true;
+        auto decode = [&](UINT codePage, DWORD flags, std::wstring& output) {
+            if (length > static_cast<size_t>(INT_MAX)) return false;
+            const int required = MultiByteToWideChar(codePage, flags,
+                reinterpret_cast<const char*>(data), static_cast<int>(length), nullptr, 0);
+            if (required <= 0) return false;
+            output.assign(static_cast<size_t>(required), L'\0');
+            return MultiByteToWideChar(codePage, flags, reinterpret_cast<const char*>(data),
+                static_cast<int>(length), output.data(), required) == required;
+        };
+        if (!decode(CP_UTF8, MB_ERR_INVALID_CHARS, text)) {
+            if (utf8Marked || !decode(936, MB_ERR_INVALID_CHARS, text)) {
+                text.clear();
+                return false;
+            }
+        }
+    }
+    for (size_t index = 0; index < text.size(); ++index) {
+        if ((index & 4095u) == 0 && cancelled && cancelled->load()) return false;
+        const wchar_t ch = text[index];
+        if (ch == 0 || (ch >= 0xDC00 && ch <= 0xDFFF)) { text.clear(); return false; }
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (++index >= text.size() || text[index] < 0xDC00 || text[index] > 0xDFFF) {
+                text.clear();
+                return false;
+            }
+        }
+    }
+    std::wstring normalized;
+    normalized.reserve(text.size() + 16);
+    for (size_t index = 0; index < text.size(); ++index) {
+        if ((index & 4095u) == 0 && cancelled && cancelled->load()) return false;
+        const wchar_t ch = text[index];
+        if (ch == L'\r') {
+            normalized += L"\r\n";
+            if (index + 1 < text.size() && text[index + 1] == L'\n') ++index;
+        } else if (ch == L'\n') {
+            normalized += L"\r\n";
+        } else {
+            normalized.push_back(ch);
+        }
+    }
+    text.swap(normalized);
+    return true;
+}
+
+bool GuideTextBlank(const std::wstring& text) {
+    return std::all_of(text.begin(), text.end(), [](wchar_t ch) {
+        return iswspace(ch) != 0;
+    });
+}
+
+bool ParseGuideHeading(const std::wstring& line, int& number) {
+    size_t cursor = 0;
+    while (cursor < line.size() && iswspace(line[cursor])) ++cursor;
+    if (cursor >= line.size() || line[cursor++] != L'第') return false;
+    while (cursor < line.size() && iswspace(line[cursor])) ++cursor;
+    const size_t digitsStart = cursor;
+    while (cursor < line.size() && line[cursor] >= L'0' && line[cursor] <= L'9') ++cursor;
+    if (cursor == digitsStart || cursor - digitsStart > 3) return false;
+    int parsed = 0;
+    for (size_t at = digitsStart; at < cursor; ++at) parsed = parsed * 10 + (line[at] - L'0');
+    while (cursor < line.size() && iswspace(line[cursor])) ++cursor;
+    static const std::wstring suffix = L"关简易攻略";
+    if (line.compare(cursor, suffix.size(), suffix) != 0) return false;
+    cursor += suffix.size();
+    while (cursor < line.size() && iswspace(line[cursor])) ++cursor;
+    if (cursor != line.size() || parsed < 0 || parsed > 999) return false;
+    number = parsed;
+    return true;
+}
+
+void FlushGuideSection(int number, const std::wstring& body, GuideBook& book) {
+    if (number < 0) return;
+    book.sections.erase(number);
+    if (!GuideTextBlank(body)) book.sections[number] = body;
+}
+
+bool ParseGuideDocument(const std::wstring& text, GuideBook& book,
+    const std::atomic<bool>* cancelled = nullptr) {
+    book.sections.clear();
+    book.readable = true;
+    int current = -1;
+    std::wstring body;
+    bool hasBodyLine = false;
+    size_t cursor = 0;
+    while (cursor <= text.size()) {
+        if (cancelled && cancelled->load()) return false;
+        const size_t lineEnd = text.find(L"\r\n", cursor);
+        const size_t end = lineEnd == std::wstring::npos ? text.size() : lineEnd;
+        const std::wstring line = text.substr(cursor, end - cursor);
+        int heading = -1;
+        if (ParseGuideHeading(line, heading)) {
+            FlushGuideSection(current, body, book);
+            current = heading;
+            body.clear();
+            hasBodyLine = false;
+        } else if (current >= 0) {
+            if (hasBodyLine) body += L"\r\n";
+            body += line;
+            hasBodyLine = true;
+        }
+        if (lineEnd == std::wstring::npos) break;
+        cursor = lineEnd + 2;
+    }
+    FlushGuideSection(current, body, book);
+    return true;
+}
+
+bool ReadGuideBook(const std::wstring& root, GuideBook& book,
+    const std::atomic<bool>* cancelled = nullptr) {
+    book = GuideBook();
+    // Scenario changes can cancel detached reads. Serialize large document
+    // decoding so cancelled readers cannot exhaust the x86 game's memory.
+    std::lock_guard<std::mutex> lock(gGuideDocumentLock);
+    if (cancelled && cancelled->load()) return false;
+    std::vector<unsigned char> bytes;
+    if (!ReadFileBytes(root + L"\\简易攻略.txt", bytes, kGuideBookBytes)) return false;
+    std::wstring text;
+    if (!DecodeGuideDocument(bytes, text, cancelled)) return false;
+    return ParseGuideDocument(text, book, cancelled);
+}
+
+bool GetAuthoredGuideBody(const GuideBook& book, int number, std::wstring& body) {
+    body.clear();
+    const auto found = book.sections.find(number);
+    if (found == book.sections.end() || GuideTextBlank(found->second)) return false;
+    body = found->second;
+    return true;
 }
 
 bool HasPlayerText(const std::wstring& text) {
@@ -1261,6 +1455,7 @@ GuideResult AnalyzeScenario(const GuideFile& file, const std::wstring& root, con
     if (cancelled || !ReadFileBytes(file.battlefieldPath, bytes)) return result;
     GuideContext context;
     if (cancelled || !ParseEex(bytes, context.commands, &cancelled)) return result;
+    result.parsed = true;
     if (cancelled) return result;
     LoadNames(root, context);
     if (cancelled) return result;
@@ -1271,6 +1466,21 @@ GuideResult AnalyzeScenario(const GuideFile& file, const std::wstring& root, con
     AddRewardEntries(context, result);
     MergeAndPruneNarrativeEntries(result);
     return result;
+}
+
+GuideResult ReadGuideDisplay(const GuideFile& file, const std::wstring& root,
+    const std::atomic<bool>& cancelled) {
+    GuideBook book;
+    std::wstring body;
+    if (ReadGuideBook(root, book, &cancelled) && !cancelled.load() &&
+        GetAuthoredGuideBody(book, file.battlefieldNumber, body)) {
+        GuideResult result;
+        result.title = FileTitle(file.battlefieldPath, file.battlefieldNumber) + L"简易攻略";
+        result.authored = true;
+        result.authoredBody = std::move(body);
+        return result;
+    }
+    return AnalyzeScenario(file, root, cancelled);
 }
 
 std::wstring FileTitle(const std::wstring& path, int number) {
@@ -1403,6 +1613,203 @@ void ScanFiles() {
     });
 }
 
+std::wstring RenderGuideBody(const GuideResult& result);
+
+struct GuideExportPiece {
+    int number = 0;
+    std::wstring body;
+};
+
+std::wstring TrimGuideLineBreaks(std::wstring value) {
+    while (value.size() >= 2 && value[value.size() - 2] == L'\r' && value.back() == L'\n')
+        value.resize(value.size() - 2);
+    return value;
+}
+
+std::wstring BuildGuideExportText(const std::vector<GuideExportPiece>& pieces) {
+    std::wstring output;
+    for (const GuideExportPiece& piece : pieces) {
+        if (!output.empty()) output += L"\r\n\r\n";
+        output += FileTitle(L"", piece.number) + L"简易攻略\r\n";
+        output += TrimGuideLineBreaks(piece.body);
+    }
+    return output;
+}
+
+std::wstring GuideSystemError(const wchar_t* action, DWORD code) {
+    wchar_t* description = nullptr;
+    FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+        FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0,
+        reinterpret_cast<wchar_t*>(&description), 0, nullptr);
+    std::wstring error = action;
+    if (description) { error += L"\n"; error += description; LocalFree(description); }
+    error += L"\n错误代码：" + std::to_wstring(code);
+    return error;
+}
+
+bool WriteGuideBookFile(const std::wstring& root, const std::wstring& text, std::wstring& error,
+    const std::atomic<bool>* cancelled = nullptr) {
+    error.clear();
+    if (text.empty() || text.size() > static_cast<size_t>(INT_MAX)) {
+        error = L"攻略内容为空或过长，未修改原文件。";
+        return false;
+    }
+    const int bytesRequired = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (bytesRequired <= 0 || static_cast<size_t>(bytesRequired) > kGuideBookBytes - 3) {
+        error = L"无法将攻略转换为 UTF-8。";
+        return false;
+    }
+    std::string utf8(static_cast<size_t>(bytesRequired), '\0');
+    if (bytesRequired > 0 && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(),
+        static_cast<int>(text.size()), utf8.data(), bytesRequired, nullptr, nullptr) != bytesRequired) {
+        error = L"无法将攻略转换为 UTF-8。";
+        return false;
+    }
+    std::vector<unsigned char> bytes;
+    bytes.reserve(3 + utf8.size());
+    bytes.push_back(0xEF);
+    bytes.push_back(0xBB);
+    bytes.push_back(0xBF);
+    bytes.insert(bytes.end(), utf8.begin(), utf8.end());
+
+    const std::wstring target = root + L"\\简易攻略.txt";
+    std::wstring temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0; attempt < 8 && file == INVALID_HANDLE_VALUE; ++attempt) {
+        temporary = root + L"\\简易攻略.txt.tmp-" + std::to_wstring(GetCurrentProcessId()) +
+            L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
+        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GuideSystemError(L"无法创建攻略临时文件。", GetLastError());
+        return false;
+    }
+    DWORD written = 0;
+    const bool wrote = bytes.empty() || (bytes.size() <= 0xffffffffu &&
+        WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) != FALSE &&
+        written == bytes.size());
+    const bool flushed = wrote && FlushFileBuffers(file) != FALSE;
+    const DWORD writeError = flushed ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    if (cancelled && cancelled->load()) {
+        DeleteFileW(temporary.c_str());
+        error = L"导出已取消。";
+        return false;
+    }
+    if (!flushed || MoveFileExW(temporary.c_str(), target.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        const DWORD code = flushed ? GetLastError() : writeError;
+        DeleteFileW(temporary.c_str());
+        error = GuideSystemError(L"无法保存简易攻略.txt，原文件未修改。", code);
+        return false;
+    }
+    return true;
+}
+
+bool EnumerateExportGuideFiles(const std::wstring& root, std::vector<GuideFile>& files,
+    std::vector<int>& skipped, std::wstring& error, const std::atomic<bool>* cancelled) {
+    files.clear();
+    skipped.clear();
+    const std::wstring pattern = root + L"\\RS\\S_*.eex";
+    WIN32_FIND_DATAW data = {};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return true;
+        error = GuideSystemError(L"无法扫描 RS 文件夹。", code);
+        return false;
+    }
+    std::vector<GuideFile> candidates;
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring path = root + L"\\RS\\" + data.cFileName;
+        GuideFile file;
+        if (!BuildGuideFile(path, root, file) || !file.isBattlefield) continue;
+        // Empty placeholders are outside the requested export range.
+        if (data.nFileSizeHigh == 0 && data.nFileSizeLow == 0) continue;
+        candidates.push_back(std::move(file));
+    } while (FindNextFileW(find, &data));
+    const DWORD scanError = GetLastError();
+    FindClose(find);
+    if (scanError != ERROR_NO_MORE_FILES) {
+        error = GuideSystemError(L"扫描 RS 文件夹时失败。", scanError);
+        return false;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const GuideFile& left, const GuideFile& right) {
+        if (left.number != right.number) return left.number < right.number;
+        const std::wstring canonical = L"S_" + std::wstring(left.number < 10 ? L"0" : L"") +
+            std::to_wstring(left.number) + L".eex";
+        const bool leftCanonical = !_wcsicmp(left.name.c_str(), canonical.c_str());
+        const bool rightCanonical = !_wcsicmp(right.name.c_str(), canonical.c_str());
+        if (leftCanonical != rightCanonical) return leftCanonical;
+        return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+    });
+    for (size_t start = 0; start < candidates.size();) {
+        size_t end = start + 1;
+        while (end < candidates.size() && candidates[end].number == candidates[start].number) ++end;
+        bool found = false;
+        for (size_t index = start; index < end && !found; ++index) {
+            if (cancelled && cancelled->load()) return false;
+            std::vector<unsigned char> bytes;
+            std::vector<GuideCommand> commands;
+            if (ReadFileBytes(candidates[index].path, bytes) && !bytes.empty() &&
+                ParseEex(bytes, commands, cancelled)) {
+                files.push_back(std::move(candidates[index]));
+                found = true;
+            }
+        }
+        if (!found) skipped.push_back(candidates[start].number);
+        start = end;
+    }
+    return true;
+}
+
+bool BuildGuideExportForRoot(const std::wstring& root, std::wstring& text,
+    std::vector<int>& skipped, size_t& success, std::wstring& error,
+    const std::atomic<bool>* cancelled = nullptr) {
+    text.clear();
+    error.clear();
+    success = 0;
+    std::vector<GuideFile> files;
+    if (!EnumerateExportGuideFiles(root, files, skipped, error, cancelled)) {
+        return false;
+    }
+    if (files.empty()) {
+        error = L"没有找到可导出的有效 S 剧本。";
+        return false;
+    }
+    std::vector<GuideExportPiece> pieces;
+    pieces.reserve(files.size());
+    size_t characters = 0;
+    for (const GuideFile& file : files) {
+        if (cancelled && cancelled->load()) return false;
+        const std::atomic<bool> neverCancelled(false);
+        GuideResult result = AnalyzeScenario(file, root, cancelled ? *cancelled : neverCancelled);
+        if (!result.parsed) {
+            skipped.push_back(file.number);
+            continue;
+        }
+        std::wstring body = RenderGuideBody(result);
+        characters += body.size() + result.title.size() + 4;
+        if (characters > kGuideBookBytes / sizeof(wchar_t)) {
+            error = L"攻略内容超过 64 MiB，未修改原文件。";
+            return false;
+        }
+        pieces.push_back({file.number, std::move(body)});
+    }
+    if (pieces.empty()) {
+        error = L"没有成功生成任何攻略内容。";
+        return false;
+    }
+    text = BuildGuideExportText(pieces);
+    std::sort(skipped.begin(), skipped.end());
+    skipped.erase(std::unique(skipped.begin(), skipped.end()), skipped.end());
+    success = pieces.size();
+    return !text.empty();
+}
+
 std::wstring ObservedScenarioName() {
     AcquireSRWLockShared(&gObservedScenarioLock);
     const std::wstring result = gObservedScenarioName;
@@ -1421,30 +1828,168 @@ int DefaultScenarioIndex() {
     return gGuideFiles.empty() ? -1 : 0;
 }
 
-void SetGuideText(const std::wstring& text) {
+std::wstring GuideDisplaySettingsPath() {
+    return gGuideRoot.empty() ? std::wstring() :
+        PatchPrivatePath(gGuideRoot, CompiledEngineProfile()) + L"\\guide-ui.ini";
+}
+
+void NormalizeGuideDisplaySettings(GuideDisplaySettings& settings) {
+    settings.fontSize = std::clamp(settings.fontSize,
+        kGuideFontSizeMinimum, kGuideFontSizeMaximum);
+    settings.lineSpacing = std::clamp(settings.lineSpacing,
+        kGuideLineSpacingMinimum, kGuideLineSpacingMaximum);
+}
+
+void LoadGuideDisplaySettings() {
+    gGuideDisplaySettings = GuideDisplaySettings();
+    const std::wstring path = GuideDisplaySettingsPath();
+    if (!path.empty()) {
+        gGuideDisplaySettings.fontSize = GetPrivateProfileIntW(
+            L"Guide", L"FontHeightTwips", gGuideDisplaySettings.fontSize, path.c_str());
+        gGuideDisplaySettings.lineSpacing = GetPrivateProfileIntW(
+            L"Guide", L"LineSpacingTwips", gGuideDisplaySettings.lineSpacing, path.c_str());
+    }
+    NormalizeGuideDisplaySettings(gGuideDisplaySettings);
+}
+
+bool SaveGuideDisplaySettings() {
+    const std::wstring path = GuideDisplaySettingsPath();
+    if (path.empty()) return false;
+    CreateDirectoryW((gGuideRoot + L"\\patch").c_str(), nullptr);
+    CreateDirectoryW(PatchPrivatePath(gGuideRoot, CompiledEngineProfile()).c_str(), nullptr);
+    const std::wstring contents = L"\xfeff[Guide]\r\nFontHeightTwips=" +
+        std::to_wstring(gGuideDisplaySettings.fontSize) + L"\r\nLineSpacingTwips=" +
+        std::to_wstring(gGuideDisplaySettings.lineSpacing) + L"\r\n";
+    std::wstring temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0; attempt < 8 && file == INVALID_HANDLE_VALUE; ++attempt) {
+        temporary = path + L".tmp-" + std::to_wstring(GetCurrentProcessId()) +
+            L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
+        file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const DWORD bytes = static_cast<DWORD>(contents.size() * sizeof(wchar_t));
+    DWORD written = 0;
+    const bool saved = WriteFile(file, contents.data(), bytes, &written, nullptr) != FALSE &&
+        written == bytes && FlushFileBuffers(file) != FALSE;
+    const bool closed = CloseHandle(file) != FALSE;
+    if (!saved || !closed || MoveFileExW(temporary.c_str(), path.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    // Flush the profile API cache so a later window reads the replaced file.
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return true;
+}
+
+bool ReadGuideDisplayValue(HWND control, int minimum, int maximum, int& value) {
+    if (!control) return false;
+    wchar_t buffer[64] = {};
+    const int length = GetWindowTextW(control, buffer, static_cast<int>(_countof(buffer)));
+    if (length <= 0 || length >= static_cast<int>(_countof(buffer))) return false;
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(buffer, &end, 10);
+    if (end == buffer || *end != L'\0' || parsed < minimum || parsed > maximum) return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+void WriteGuideDisplayControls() {
+    if (gGuideFontSize)
+        SetDlgItemInt(gGuideWindow, kGuideFontSize,
+            static_cast<UINT>(gGuideDisplaySettings.fontSize), FALSE);
+    if (gGuideLineSpacing)
+        SetDlgItemInt(gGuideWindow, kGuideLineSpacing,
+            static_cast<UINT>(gGuideDisplaySettings.lineSpacing), FALSE);
+}
+
+void ApplyGuideTextFormat(bool preservePosition = false) {
     if (!gGuideText) return;
-    SetWindowTextW(gGuideText, text.c_str());
-    if (gGuideUsesRichEdit) {
-        CHARFORMAT2W character = {};
-        character.cbSize = sizeof(character);
-        character.dwMask = CFM_FACE | CFM_SIZE;
-        character.yHeight = 220;
-        wcscpy_s(character.szFaceName, L"Microsoft YaHei UI");
-        PARAFORMAT2 format = {};
-        format.cbSize = sizeof(format);
-        format.dwMask = PFM_SPACEAFTER;
-        format.bLineSpacingRule = 1;
-        format.dyLineSpacing = 0;
-        format.dySpaceAfter = 45;
-        SendMessageW(gGuideText, EM_SETSEL, 0, -1);
-        SendMessageW(gGuideText, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&character));
-        SendMessageW(gGuideText, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
+    if (!gGuideUsesRichEdit) {
+        int dpi = 96;
+        HDC dc = GetDC(gGuideText);
+        if (dc) { dpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(gGuideText, dc); }
+        HFONT font = CreateFontW(-MulDiv(gGuideDisplaySettings.fontSize, dpi, 1440),
+            0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+        if (font) {
+            SendMessageW(gGuideText, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            if (gGuideBodyFont) DeleteObject(gGuideBodyFont);
+            gGuideBodyFont = font;
+        }
+        return;
+    }
+    CHARRANGE selection = {};
+    POINT scroll = {};
+    if (preservePosition) {
+        SendMessageW(gGuideText, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        SendMessageW(gGuideText, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    }
+    CHARFORMAT2W character = {};
+    character.cbSize = sizeof(character);
+    character.dwMask = CFM_FACE | CFM_SIZE;
+    character.yHeight = gGuideDisplaySettings.fontSize;
+    wcscpy_s(character.szFaceName, L"Microsoft YaHei UI");
+    PARAFORMAT2 format = {};
+    format.cbSize = sizeof(format);
+    format.dwMask = PFM_SPACEAFTER;
+    format.bLineSpacingRule = 1;
+    format.dyLineSpacing = 0;
+    format.dySpaceAfter = gGuideDisplaySettings.lineSpacing;
+    SendMessageW(gGuideText, EM_SETSEL, 0, -1);
+    SendMessageW(gGuideText, EM_SETCHARFORMAT, SCF_SELECTION,
+        reinterpret_cast<LPARAM>(&character));
+    SendMessageW(gGuideText, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format));
+    if (preservePosition) {
+        SendMessageW(gGuideText, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        SendMessageW(gGuideText, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    } else {
         SendMessageW(gGuideText, EM_SETSEL, 0, 0);
         SendMessageW(gGuideText, EM_SCROLLCARET, 0, 0);
     }
 }
 
-std::wstring RenderGuideText(const GuideResult& result, GuideFilter filter) {
+void ApplyGuideDisplaySettingsFromControls(bool persist, bool normalizeInvalid) {
+    if (!gGuideDisplaySettingsReady) return;
+    int fontSize = 0;
+    int lineSpacing = 0;
+    const bool fontValid = ReadGuideDisplayValue(gGuideFontSize,
+        kGuideFontSizeMinimum, kGuideFontSizeMaximum, fontSize);
+    const bool spacingValid = !gGuideUsesRichEdit || ReadGuideDisplayValue(gGuideLineSpacing,
+        kGuideLineSpacingMinimum, kGuideLineSpacingMaximum, lineSpacing);
+    if (!gGuideUsesRichEdit) lineSpacing = gGuideDisplaySettings.lineSpacing;
+    if (!fontValid || !spacingValid) {
+        if (normalizeInvalid) WriteGuideDisplayControls();
+        return;
+    }
+    const bool changed = fontSize != gGuideDisplaySettings.fontSize ||
+        lineSpacing != gGuideDisplaySettings.lineSpacing;
+    const GuideDisplaySettings previous = gGuideDisplaySettings;
+    gGuideDisplaySettings.fontSize = fontSize;
+    gGuideDisplaySettings.lineSpacing = lineSpacing;
+    if (changed && persist && !SaveGuideDisplaySettings()) {
+        gGuideDisplaySettings = previous;
+        gGuideDisplaySettingsReady = false;
+        WriteGuideDisplayControls();
+        gGuideDisplaySettingsReady = true;
+        return;
+    }
+    if (changed) ApplyGuideTextFormat(true);
+}
+
+void SetGuideText(const std::wstring& text) {
+    if (!gGuideText) return;
+    SendMessageW(gGuideText, EM_SETLIMITTEXT,
+        static_cast<WPARAM>(std::max(kGuideTextCharacters, text.size())), 0);
+    SetWindowTextW(gGuideText, text.c_str());
+    ApplyGuideTextFormat();
+}
+
+std::wstring RenderGuideText(const GuideResult& result, GuideFilter filter,
+    size_t maximum = kGuideTextCharacters) {
+    if (result.authored) return result.title + L"\r\n" + result.authoredBody;
     std::wstring output = result.title + L"\r\n";
     const GuideFilter filters[] = {GuideFilter::Dialog, GuideFilter::Ambush, GuideFilter::Ai, GuideFilter::Rewards};
     const wchar_t* headings[] = {L"一、人物对话与单挑", L"二、伏兵", L"三、敌军 AI", L"四、状态与奖惩"};
@@ -1461,7 +2006,7 @@ std::wstring RenderGuideText(const GuideResult& result, GuideFilter filter) {
         bool sectionHasEntry = false;
         for (const std::wstring& line : lines) {
             const std::wstring rendered = L"  " + line + L"\r\n";
-            if (output.size() + section.size() + rendered.size() + 2 > kGuideTextCharacters) break;
+            if (output.size() + section.size() + rendered.size() + 2 > maximum) break;
             section += rendered;
             sectionHasEntry = true;
         }
@@ -1473,12 +2018,29 @@ std::wstring RenderGuideText(const GuideResult& result, GuideFilter filter) {
     return output;
 }
 
+std::wstring RenderGuideBody(const GuideResult& result) {
+    if (result.authored) return result.authoredBody;
+    const std::wstring rendered = RenderGuideText(result, GuideFilter::All, kGuideBookBytes);
+    const std::wstring prefix = result.title + L"\r\n";
+    if (rendered.compare(0, prefix.size(), prefix) == 0) return rendered.substr(prefix.size());
+    return rendered;
+}
+
 void RenderGuide() {
-    SetGuideText(RenderGuideText(gGuideResult, gGuideCurrentFilter));
+    SetGuideText(RenderGuideText(gGuideResult, GuideFilter::All));
+}
+
+void SetGuideBusy(bool busy) {
+    EnableWindow(gGuideScenarioBox, busy ? FALSE : TRUE);
+    EnableWindow(gGuideExport, busy ? FALSE : TRUE);
+    EnableWindow(gGuideFontSize, busy ? FALSE : TRUE);
+    EnableWindow(gGuideLineSpacing, busy ? FALSE : TRUE);
+    SetWindowTextW(gGuideExport, busy ? L"导出中……" : L"导出攻略");
 }
 
 void StartRead() {
-    if (!gGuideWindow || gGuideFiles.empty() || !gGuideScenarioBox) return;
+    if (!gGuideWindow || gGuideFiles.empty() || !gGuideScenarioBox ||
+        (gGuideTask && gGuideTask->exporting)) return;
     const int index = static_cast<int>(SendMessageW(gGuideScenarioBox, CB_GETCURSEL, 0, 0));
     if (index < 0 || static_cast<size_t>(index) >= gGuideFiles.size()) return;
     if (gGuideTask) gGuideTask->cancelled.store(true);
@@ -1489,13 +2051,14 @@ void StartRead() {
     const GuideFile file = gGuideFiles[static_cast<size_t>(index)];
     const std::wstring root = gGuideRoot;
     gGuideTask = state;
+    EnableWindow(gGuideExport, FALSE);
     gGuideResult = GuideResult();
     gGuideResult.title = FileTitle(file.battlefieldPath, file.battlefieldNumber) + L"简易攻略";
     SetGuideText(L"正在整理本关攻略……");
     try {
         std::thread([state, request, file, root]() {
             try {
-                state->result = AnalyzeScenario(file, root, state->cancelled);
+                state->result = ReadGuideDisplay(file, root, state->cancelled);
             } catch (...) {
                 state->result = GuideResult();
                 state->result.title = FileTitle(file.battlefieldPath, file.battlefieldNumber) + L"简易攻略";
@@ -1507,8 +2070,82 @@ void StartRead() {
     } catch (...) {
         state->cancelled.store(true);
         gGuideTask.reset();
+        EnableWindow(gGuideExport, TRUE);
         RenderGuide();
     }
+}
+
+void StartExport() {
+    if (!gGuideWindow || gGuideRoot.empty() || gGuideTask) return;
+    const HWND window = gGuideWindow;
+    const std::wstring root = gGuideRoot;
+    const unsigned beforeConfirmation = gGuideRequest;
+    const std::wstring target = root + L"\\简易攻略.txt";
+    WIN32_FILE_ATTRIBUTE_DATA existing = {};
+    const bool exists = GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &existing) != FALSE;
+    const DWORD attributesError = exists ? ERROR_SUCCESS : GetLastError();
+    if (!exists && attributesError != ERROR_FILE_NOT_FOUND && attributesError != ERROR_PATH_NOT_FOUND) {
+        const std::wstring error = GuideSystemError(L"无法检查现有简易攻略.txt。", attributesError);
+        MessageBoxW(gGuideWindow, error.c_str(), L"导出攻略失败", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (exists && (existing.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        MessageBoxW(gGuideWindow, L"简易攻略.txt 是一个文件夹，无法导出。", L"导出攻略失败", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (exists && (existing.nFileSizeHigh || existing.nFileSizeLow)) {
+        const int response = MessageBoxW(gGuideWindow,
+            L"当前目录已有简易攻略.txt，导出将覆盖作者内容。\n是否继续？",
+            L"导出攻略", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (response != IDOK) return;
+    }
+    // MessageBox runs a nested loop. A confirmation belongs only to the
+    // window and request for which it was shown.
+    if (gGuideWindow != window || !IsWindow(window) || gGuideRoot != root ||
+        gGuideRequest != beforeConfirmation || gGuideTask) return;
+    auto state = std::make_shared<GuideTaskState>();
+    state->window = gGuideWindow;
+    state->request = ++gGuideRequest;
+    state->exporting = true;
+    const unsigned request = state->request;
+    gGuideTask = state;
+    SetGuideBusy(true);
+    try {
+        std::thread([state, request, root]() {
+            try {
+                if (!BuildGuideExportForRoot(root, state->exportText, state->exportSkipped,
+                    state->exportSuccess, state->exportError, &state->cancelled) && state->exportError.empty())
+                    state->exportError = L"导出已取消。";
+                if (state->exportError.empty() && !state->cancelled.load()) {
+                    std::wstring writeError;
+                    if (!WriteGuideBookFile(root, state->exportText, writeError, &state->cancelled))
+                        state->exportError = writeError;
+                }
+            } catch (...) {
+                state->exportError = L"导出攻略时发生未知错误。";
+            }
+            if (state->cancelled.load()) return;
+            state->completed.store(true, std::memory_order_release);
+            if (IsWindow(state->window)) PostMessageW(state->window, kGuideReadComplete, request, 0);
+        }).detach();
+    } catch (...) {
+        state->cancelled.store(true);
+        gGuideTask.reset();
+        SetGuideBusy(false);
+        RenderGuide();
+        MessageBoxW(gGuideWindow, L"无法启动导出任务。", L"导出攻略失败", MB_OK | MB_ICONERROR);
+    }
+}
+
+int GuideScale(HWND window, int value) {
+    int dpi = 96;
+    HDC dc = GetDC(window);
+    if (dc) {
+        const int detected = GetDeviceCaps(dc, LOGPIXELSY);
+        if (detected > 0) dpi = detected;
+        ReleaseDC(window, dc);
+    }
+    return MulDiv(value, dpi, 96);
 }
 
 void LayoutGuide(HWND window) {
@@ -1516,12 +2153,34 @@ void LayoutGuide(HWND window) {
     GetClientRect(window, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
-    const int margin = 10;
-    MoveWindow(gGuideLevelLabel, margin, margin + 3, 52, 20, TRUE);
-    MoveWindow(gGuideScenarioBox, margin + 52, margin, std::max(100, width - 262), 24, TRUE);
-    MoveWindow(gGuideFilterBox, width - 190, margin, 100, 24, TRUE);
-    MoveWindow(gGuideReload, width - 80, margin, 70, 24, TRUE);
-    MoveWindow(gGuideText, margin, 42, std::max(100, width - 2 * margin), std::max(80, height - 52), TRUE);
+    const int margin = GuideScale(window, 10);
+    const int exportWidth = GuideScale(window, 78);
+    const int valueWidth = GuideScale(window, 60);
+    const int labelWidth = GuideScale(window, 76);
+    const int gap = GuideScale(window, 6);
+    const int controlHeight = GuideScale(window, 24);
+    const int labelTop = margin + GuideScale(window, 3);
+    const int exportLeft = width - margin - exportWidth;
+    const int scenarioLeft = margin + GuideScale(window, 52);
+    // Keep the scenario selector compact while leaving enough room for the
+    // longest localized title at 96 DPI.  It no longer expands with the
+    // window; the remaining toolbar space is reserved for the two native
+    // display parameters and export action.
+    const int scenarioWidth = GuideScale(window, 240);
+    const int fontLabelLeft = scenarioLeft + scenarioWidth + gap;
+    const int fontValueLeft = fontLabelLeft + labelWidth;
+    const int spacingLabelLeft = fontValueLeft + valueWidth + gap;
+    const int spacingValueLeft = spacingLabelLeft + labelWidth;
+    MoveWindow(gGuideLevelLabel, margin, labelTop, GuideScale(window, 52), GuideScale(window, 20), TRUE);
+    MoveWindow(gGuideScenarioBox, scenarioLeft, margin, scenarioWidth, controlHeight, TRUE);
+    MoveWindow(gGuideExport, exportLeft, margin, exportWidth, controlHeight, TRUE);
+    MoveWindow(gGuideFontLabel, fontLabelLeft, labelTop, labelWidth, GuideScale(window, 20), TRUE);
+    MoveWindow(gGuideFontSize, fontValueLeft, margin, valueWidth, controlHeight, TRUE);
+    MoveWindow(gGuideSpacingLabel, spacingLabelLeft, labelTop, labelWidth, GuideScale(window, 20), TRUE);
+    MoveWindow(gGuideLineSpacing, spacingValueLeft, margin, valueWidth, controlHeight, TRUE);
+    const int bodyTop = GuideScale(window, 44);
+    MoveWindow(gGuideText, margin, bodyTop, std::max(100, width - 2 * margin),
+        std::max(80, height - bodyTop - margin), TRUE);
     if (gGuideText && gGuideUsesRichEdit) {
         RECT textRect = {};
         GetClientRect(gGuideText, &textRect);
@@ -1558,8 +2217,34 @@ LRESULT CALLBACK GuideProcedure(HWND window, UINT message, WPARAM wParam, LPARAM
         const unsigned request = static_cast<unsigned>(wParam);
         if (request == gGuideRequest && gGuideTask && gGuideTask->request == request &&
             gGuideTask->completed.load(std::memory_order_acquire)) {
+            if (gGuideTask->exporting) {
+                const std::wstring error = gGuideTask->exportError;
+                const size_t success = gGuideTask->exportSuccess;
+                const std::vector<int> skipped = gGuideTask->exportSkipped;
+                gGuideTask.reset();
+                SetGuideBusy(false);
+                if (!error.empty()) {
+                    RenderGuide();
+                    MessageBoxW(window, error.c_str(), L"导出攻略失败", MB_OK | MB_ICONERROR);
+                } else {
+                    std::wstring messageText = L"已导出到：\n" + gGuideRoot +
+                        L"\\简易攻略.txt\n成功生成 " + std::to_wstring(success) +
+                        L" 关，跳过 " + std::to_wstring(skipped.size()) + L" 关。";
+                    if (!skipped.empty()) {
+                        messageText += L"，跳过关卡：";
+                        for (size_t index = 0; index < skipped.size(); ++index) {
+                            if (index) messageText += L"、";
+                            messageText += std::to_wstring(skipped[index]);
+                        }
+                    }
+                    StartRead();
+                    MessageBoxW(window, messageText.c_str(), L"导出攻略", MB_OK | MB_ICONINFORMATION);
+                }
+                return 0;
+            }
             gGuideResult = std::move(gGuideTask->result);
             gGuideTask.reset();
+            EnableWindow(gGuideExport, TRUE);
             RenderGuide();
         }
         return 0;
@@ -1573,12 +2258,19 @@ LRESULT CALLBACK GuideProcedure(HWND window, UINT message, WPARAM wParam, LPARAM
         gGuideScenarioBox = CreateWindowExW(0, WC_COMBOBOXW, nullptr,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST, 0, 0, 100, 24, window,
             reinterpret_cast<HMENU>(kGuideScenario), gInstance, nullptr);
-        gGuideFilterBox = CreateWindowExW(0, WC_COMBOBOXW, nullptr,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST, 0, 0, 100, 24, window,
-            reinterpret_cast<HMENU>(kGuideFilter), gInstance, nullptr);
-        gGuideReload = CreateWindowExW(0, WC_BUTTONW, L"重新读取",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 70, 24, window,
-            reinterpret_cast<HMENU>(kGuideReload), gInstance, nullptr);
+        gGuideFontLabel = CreateWindowExW(0, WC_STATICW, L"字体大小：",
+            WS_CHILD | WS_VISIBLE, 0, 0, 42, 20, window, nullptr, gInstance, nullptr);
+        gGuideFontSize = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
+            0, 0, 42, 24, window, reinterpret_cast<HMENU>(kGuideFontSize), gInstance, nullptr);
+        gGuideSpacingLabel = CreateWindowExW(0, WC_STATICW, L"行间距：",
+            WS_CHILD | WS_VISIBLE, 0, 0, 42, 20, window, nullptr, gInstance, nullptr);
+        gGuideLineSpacing = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
+            0, 0, 42, 24, window, reinterpret_cast<HMENU>(kGuideLineSpacing), gInstance, nullptr);
+        gGuideExport = CreateWindowExW(0, WC_BUTTONW, L"导出攻略",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 64, 24, window,
+            reinterpret_cast<HMENU>(kGuideExport), gInstance, nullptr);
         gGuideRichEditModule = LoadLibraryW(L"Riched20.dll");
         gGuideUsesRichEdit = gGuideRichEditModule != nullptr;
         gGuideText = CreateWindowExW(WS_EX_CLIENTEDGE,
@@ -1602,14 +2294,31 @@ LRESULT CALLBACK GuideProcedure(HWND window, UINT message, WPARAM wParam, LPARAM
         SendMessageW(gGuideLevelLabel, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
         SendMessageW(gGuideText, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
         SendMessageW(gGuideScenarioBox, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
-        SendMessageW(gGuideFilterBox, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
-        SendMessageW(gGuideReload, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
-        SendMessageW(gGuideFilterBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"全部"));
-        SendMessageW(gGuideFilterBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"人物对话与单挑"));
-        SendMessageW(gGuideFilterBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"伏兵"));
-        SendMessageW(gGuideFilterBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"敌军 AI"));
-        SendMessageW(gGuideFilterBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"状态与奖惩"));
-        SendMessageW(gGuideFilterBox, CB_SETCURSEL, 0, 0);
+        SendMessageW(gGuideFontLabel, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
+        SendMessageW(gGuideFontSize, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
+        SendMessageW(gGuideSpacingLabel, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
+        SendMessageW(gGuideLineSpacing, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
+        SendMessageW(gGuideFontSize, EM_SETLIMITTEXT, 6, 0);
+        SendMessageW(gGuideLineSpacing, EM_SETLIMITTEXT, 6, 0);
+        SendMessageW(gGuideExport, WM_SETFONT, reinterpret_cast<WPARAM>(gGuideFont), TRUE);
+        LoadGuideDisplaySettings();
+        WriteGuideDisplayControls();
+        if (!gGuideUsesRichEdit) {
+            EnableWindow(gGuideLineSpacing, FALSE);
+            HWND tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+                CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, gInstance, nullptr);
+            if (tooltip) {
+                TOOLINFOW tool = {sizeof(tool)};
+                tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+                tool.hwnd = window;
+                tool.uId = reinterpret_cast<UINT_PTR>(gGuideSpacingLabel);
+                tool.lpszText = const_cast<wchar_t*>(
+                    L"当前系统使用兼容文本控件，不支持行间距调整；字体大小仍可调整。");
+                SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
+            }
+        }
+        gGuideDisplaySettingsReady = true;
         ScanFiles();
         for (const GuideFile& file : gGuideFiles)
             SendMessageW(gGuideScenarioBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(file.title.c_str()));
@@ -1617,37 +2326,32 @@ LRESULT CALLBACK GuideProcedure(HWND window, UINT message, WPARAM wParam, LPARAM
             SendMessageW(gGuideScenarioBox, CB_SETCURSEL, DefaultScenarioIndex(), 0);
             StartRead();
         } else SetGuideText(L"本关暂无可整理的攻略信息。");
+        SetGuideBusy(false);
         LayoutGuide(window);
         return 0;
     }
     case WM_SIZE:
         LayoutGuide(window);
         return 0;
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = GuideScale(window, 700);
+        info->ptMinTrackSize.y = GuideScale(window, 240);
+        return 0;
+    }
     case WM_COMMAND:
-        if (LOWORD(wParam) == kGuideReload && HIWORD(wParam) == BN_CLICKED) {
-            if (gGuideTask) gGuideTask->cancelled.store(true);
-            ++gGuideRequest;
-            gGuideTask.reset();
-            ScanFiles();
-            SendMessageW(gGuideScenarioBox, CB_RESETCONTENT, 0, 0);
-            for (const GuideFile& file : gGuideFiles)
-                SendMessageW(gGuideScenarioBox, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(file.title.c_str()));
-            if (!gGuideFiles.empty()) {
-                SendMessageW(gGuideScenarioBox, CB_SETCURSEL, DefaultScenarioIndex(), 0);
-                StartRead();
-            } else SetGuideText(L"本关暂无可整理的攻略信息。");
+        if (LOWORD(wParam) == kGuideExport && HIWORD(wParam) == BN_CLICKED) {
+            StartExport();
             return 0;
         }
         if (LOWORD(wParam) == kGuideScenario && HIWORD(wParam) == CBN_SELCHANGE) {
+            if (gGuideTask && gGuideTask->exporting) return 0;
             StartRead();
             return 0;
         }
-        if (LOWORD(wParam) == kGuideFilter && HIWORD(wParam) == CBN_SELCHANGE) {
-            const LRESULT selection = SendMessageW(gGuideFilterBox, CB_GETCURSEL, 0, 0);
-            if (selection < static_cast<LRESULT>(GuideFilter::All) ||
-                selection > static_cast<LRESULT>(GuideFilter::Rewards)) return 0;
-            gGuideCurrentFilter = static_cast<GuideFilter>(selection);
-            RenderGuide();
+        if ((LOWORD(wParam) == kGuideFontSize || LOWORD(wParam) == kGuideLineSpacing) &&
+            (HIWORD(wParam) == EN_CHANGE || HIWORD(wParam) == EN_KILLFOCUS)) {
+            ApplyGuideDisplaySettingsFromControls(true, HIWORD(wParam) == EN_KILLFOCUS);
             return 0;
         }
         break;
@@ -1661,12 +2365,18 @@ LRESULT CALLBACK GuideProcedure(HWND window, UINT message, WPARAM wParam, LPARAM
         gGuideWindow = nullptr;
         gGuideLevelLabel = nullptr;
         gGuideScenarioBox = nullptr;
-        gGuideFilterBox = nullptr;
-        gGuideReload = nullptr;
+        gGuideExport = nullptr;
+        gGuideFontLabel = nullptr;
+        gGuideFontSize = nullptr;
+        gGuideSpacingLabel = nullptr;
+        gGuideLineSpacing = nullptr;
         gGuideText = nullptr;
+        gGuideDisplaySettingsReady = false;
         if (gGuideFontOwned && gGuideFont) DeleteObject(gGuideFont);
         gGuideFont = nullptr;
         gGuideFontOwned = false;
+        if (gGuideBodyFont) DeleteObject(gGuideBodyFont);
+        gGuideBodyFont = nullptr;
         if (gGuideRichEditModule) FreeLibrary(gGuideRichEditModule);
         gGuideRichEditModule = nullptr;
         gGuideUsesRichEdit = false;
@@ -1702,12 +2412,11 @@ bool OpenGuide(HWND owner, const wchar_t* gameRoot) {
     }
     if (!gameRoot || !*gameRoot || !RegisterGuideClass()) return false;
     gGuideRoot = gameRoot;
-    gGuideCurrentFilter = GuideFilter::All;
     gGuideResult = GuideResult();
     RECT ownerRect = {};
     if (!GetWindowRect(owner, &ownerRect)) SetRect(&ownerRect, 100, 100, 900, 700);
-    const int width = 620;
-    const int height = 480;
+    const int width = GuideScale(owner, 760);
+    const int height = GuideScale(owner, 480);
     int x = ownerRect.right + 8;
     int y = ownerRect.top;
     HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
@@ -1775,6 +2484,89 @@ bool BuildGuideTextForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot,
     if (result.title.empty()) return false;
     text = RenderGuideText(result, GuideFilter::All);
     return true;
+}
+
+std::wstring NormalizeGuideTestText(const std::wstring& input) {
+    std::wstring normalized;
+    normalized.reserve(input.size() + 16);
+    for (size_t index = 0; index < input.size(); ++index) {
+        if (input[index] == L'\r') {
+            normalized += L"\r\n";
+            if (index + 1 < input.size() && input[index + 1] == L'\n') ++index;
+        } else if (input[index] == L'\n') {
+            normalized += L"\r\n";
+        } else {
+            normalized.push_back(input[index]);
+        }
+    }
+    return normalized;
+}
+
+bool ParseGuideAuthorTextForTest(const wchar_t* source,
+    std::vector<GuideAuthorSectionTest>& sections) {
+    sections.clear();
+    if (!source) return false;
+    GuideBook book;
+    if (!ParseGuideDocument(NormalizeGuideTestText(source), book)) return false;
+    for (const auto& item : book.sections) sections.push_back({item.first, item.second});
+    std::sort(sections.begin(), sections.end(), [](const GuideAuthorSectionTest& left,
+        const GuideAuthorSectionTest& right) { return left.number < right.number; });
+    return true;
+}
+
+bool SelectGuideAuthorTextForTest(const wchar_t* source, int battlefieldNumber,
+    std::wstring& text) {
+    text.clear();
+    if (!source || battlefieldNumber < 0 || battlefieldNumber > 999) return false;
+    GuideBook book;
+    if (!ParseGuideDocument(NormalizeGuideTestText(source), book)) return false;
+    return GetAuthoredGuideBody(book, battlefieldNumber, text);
+}
+
+bool BuildGuideExportTextForTest(const std::vector<GuideExportSectionTest>& sections,
+    std::wstring& text) {
+    text.clear();
+    std::unordered_map<int, GuideExportPiece> unique;
+    for (const GuideExportSectionTest& section : sections) {
+        if (section.number < 0 || section.number > 999) return false;
+        unique[section.number] = {section.number, NormalizeGuideTestText(section.body)};
+    }
+    std::vector<GuideExportPiece> pieces;
+    pieces.reserve(unique.size());
+    for (auto& item : unique) pieces.push_back(std::move(item.second));
+    std::sort(pieces.begin(), pieces.end(), [](const GuideExportPiece& left,
+        const GuideExportPiece& right) { return left.number < right.number; });
+    text = BuildGuideExportText(pieces);
+    return !text.empty();
+}
+
+bool BuildGuideDisplayTextForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot,
+    std::wstring& text, bool& authored) {
+    text.clear();
+    authored = false;
+    if (!scenarioPath || !gameRoot || !*scenarioPath || !*gameRoot) return false;
+    GuideFile file;
+    if (!BuildGuideFile(scenarioPath, gameRoot, file)) return false;
+    const std::atomic<bool> cancelled(false);
+    const GuideResult result = ReadGuideDisplay(file, gameRoot, cancelled);
+    authored = result.authored;
+    text = RenderGuideText(result, GuideFilter::All);
+    return !text.empty();
+}
+
+bool ExportGuideBookForTest(const wchar_t* root, size_t& success,
+    std::vector<int>& skipped, std::wstring& error) {
+    success = 0;
+    skipped.clear();
+    error.clear();
+    if (!root || !*root) return false;
+    std::wstring text;
+    return BuildGuideExportForRoot(root, text, skipped, success, error) &&
+        WriteGuideBookFile(root, text, error);
+}
+
+bool DecodeGuideDocumentForTest(const std::vector<unsigned char>& bytes, std::wstring& text) {
+    return DecodeGuideDocument(bytes, text);
 }
 
 bool ResolveGuideScenarioForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot,

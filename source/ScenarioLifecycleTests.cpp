@@ -75,6 +75,20 @@ void ValidateImage(const std::filesystem::path& path, bool engine65) {
     Check(!ResolveScenarioLifecycleForTest(changed.data(), base, relocated),
         "reject a changed success-result frame before installing any hook");
     changed = image;
+    changed[layout.progressCall - base - 8] ^= 1;
+    Check(!ResolveScenarioLifecycleForTest(changed.data(), base, relocated),
+        "reject a changed inline ordinal increment or helper call before classifying progression");
+    const size_t incrementCall = layout.progressCall - base - 8;
+    if (image[incrementCall] == 0xE8) {
+        int32_t relative = 0;
+        memcpy(&relative, image.data() + incrementCall + 1, sizeof(relative));
+        const size_t increment = static_cast<size_t>(static_cast<int64_t>(incrementCall) + 5 + relative);
+        changed = image;
+        changed[increment + 6] ^= 1;
+        Check(!ResolveScenarioLifecycleForTest(changed.data(), base, relocated),
+            "reject a 6.4 helper that increments a field other than the authoritative ordinal");
+    }
+    changed = image;
     const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(changed.data());
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(changed.data() + dos->e_lfanew);
     const auto sections = IMAGE_FIRST_SECTION(nt);
@@ -203,6 +217,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     ValidateImage(argc > 1 ? std::filesystem::path(argv[1]) : root / L"基底/加强版6.5未加密版/Ekd5.exe", true);
     ValidateImage(argc > 2 ? std::filesystem::path(argv[2]) : root / L"基底/复刻版6.6山贼 国庆/Ekd5.exe", false);
+    ValidateImage(argc > 3 ? std::filesystem::path(argv[3]) : root / L"基底/洗隋/Ekd5.exe", true);
     ValidateLifecycle();
     ValidateBridge();
     printf("ScenarioLifecycleTests: %d failures\n", failures);

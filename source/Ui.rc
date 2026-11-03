@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include "UiIds.h"
 #include "ResourceIds.h"
+#include "FeatureSelection.rc"
 
 IDI_DORO_WHITE ICON "Doro-white.ico"
 IDR_UNINSTALL_WORKER RCDATA "UninstallWorker.exe"

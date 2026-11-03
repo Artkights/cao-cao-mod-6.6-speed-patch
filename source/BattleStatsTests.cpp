@@ -154,9 +154,10 @@ void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& 
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz65;
+    const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz64 || CompiledEngineProfile() == EngineProfileId::Ccz65;
     const uintptr_t recoverySimple = engine65 ? 0x4247E6 : 0x4247DC;
     const uintptr_t recoveryAnimated = engine65 ? 0x4249F1 : 0x4249DA;
+    const uintptr_t damageCall = CompiledEngineProfile() == EngineProfileId::Ccz64 ? 0x405B0B : 0x405ADC;
     if (argc != 2) return 2;
     std::vector<BYTE> image;
     DWORD base = 0;
@@ -169,7 +170,7 @@ int wmain(int argc, wchar_t** argv) {
     Check(layout.strategyBase == 0x4A3E77 && layout.strategyCount == kStrategyCount,
         "derive the loaded strategy table and its row count from executable semantics");
     Check(layout.settlementCalls.size() == 4 &&
-        layout.settlementCalls[0] == 0x405ADC &&
+        layout.settlementCalls[0] == damageCall &&
         layout.settlementCalls[1] == 0x4229FC &&
         layout.settlementCalls[2] == recoverySimple &&
         layout.settlementCalls[3] == recoveryAnimated,
@@ -187,7 +188,7 @@ int wmain(int argc, wchar_t** argv) {
     Check(ResolveBattleStatsImageLayoutForTest(changed.data(), base, partial) &&
         partial.settlementCalls.size() == 4 && !partial.settlementCalls[2] &&
         !partial.settlementCalls[3] &&
-        partial.settlementCalls[0] == 0x405ADC && partial.settlementCalls[1] == 0x4229FC,
+        partial.settlementCalls[0] == damageCall && partial.settlementCalls[1] == 0x4229FC,
         "disable complete recovery capability when either result path is missing");
     changed = image;
     changed[0x405F1A - base] = 0x90;

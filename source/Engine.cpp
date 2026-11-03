@@ -18,6 +18,14 @@ struct Site {
     unsigned capability;
     bool available;
 };
+struct RuntimeJournalEntry {
+    bool active = false;
+    bool expectedValid = false;
+    uintptr_t address = 0;
+    size_t length = 0;
+    BYTE original[8] = {};
+    BYTE expected[8] = {};
+};
 Site gSites[] = {
     {0x42D5B0, 4, {0x55, 0x8B, 0xEC, 0xE8}, {}, CapabilitySuperDialog, true},
     {0x4332A6, 4, {0x55, 0x8B, 0xEC, 0x6A}, {}, CapabilitySuperMapText, true},
@@ -69,6 +77,10 @@ EngineLayout DefaultLayout() {
     return layout;
 }
 EngineLayout gLayout = DefaultLayout();
+RuntimeJournalEntry gSiteJournal[kSiteCount] = {};
+RuntimeJournalEntry gPhaseJournal = {};
+RuntimeJournalEntry gNativeStateJournal = {};
+RuntimeJournalEntry gNativeBusyJournal = {};
 bool gInitialized = false;
 wchar_t gError[256] = {};
 SRWLOCK gPhaseLock = SRWLOCK_INIT;
@@ -76,6 +88,7 @@ struct PhaseState {
     bool enabled;
     bool flags[3];
     int values[3];
+    int counters[3];
 };
 PhaseState gPhase = {};
 BYTE gPhaseOriginal[4] = {};
@@ -118,6 +131,8 @@ void SetErrorIfEmpty(const wchar_t* text) {
     if (!gError[0]) SetError(text);
 }
 
+bool WriteMemory(uintptr_t address, const BYTE* bytes, size_t length);
+
 BYTE* At(uintptr_t address) {
     return reinterpret_cast<BYTE*>(gGameBase + address - kPreferredBase);
 }
@@ -135,6 +150,51 @@ bool MatchBytes(uintptr_t address, const BYTE* expected, size_t length) {
     BYTE actual[16] = {};
     return length <= sizeof(actual) && ReadBytes(address, actual, length) &&
         memcmp(actual, expected, length) == 0;
+}
+
+void StartJournal(RuntimeJournalEntry& entry, uintptr_t address, size_t length,
+    const BYTE* original) {
+    entry = RuntimeJournalEntry();
+    if (!address || !length || length > sizeof(entry.original) || !original) return;
+    entry.active = true;
+    entry.expectedValid = true;
+    entry.address = address;
+    entry.length = length;
+    memcpy(entry.original, original, length);
+    memcpy(entry.expected, original, length);
+}
+
+void JournalExpected(RuntimeJournalEntry& entry, const BYTE* expected) {
+    if (!entry.active || !expected) return;
+    memcpy(entry.expected, expected, entry.length);
+    entry.expectedValid = true;
+}
+
+bool RestoreMemoryJournal(RuntimeJournalEntry& entry, const wchar_t* label,
+    size_t ownedLength = SIZE_MAX) {
+    if (!entry.active || !entry.expectedValid || !entry.address) return true;
+    BYTE actual[8] = {};
+    if (!ReadBytes(entry.address, actual, entry.length)) {
+        SetError(label);
+        return false;
+    }
+    if (ownedLength == SIZE_MAX) ownedLength = entry.length;
+    if (ownedLength > entry.length ||
+        (memcmp(actual, entry.expected, ownedLength) != 0 &&
+         memcmp(actual, entry.original, ownedLength) != 0)) {
+        SetError(label);
+        return false;
+    }
+    if (memcmp(actual, entry.original, entry.length) == 0) {
+        JournalExpected(entry, entry.original);
+        return true;
+    }
+    if (!WriteMemory(entry.address, entry.original, entry.length)) {
+        SetError(label);
+        return false;
+    }
+    JournalExpected(entry, entry.original);
+    return true;
 }
 
 void BytesToText(const BYTE* bytes, size_t length, wchar_t* text, size_t capacity) {
@@ -199,6 +259,51 @@ bool WriteMemory(uintptr_t address, const BYTE* bytes, size_t length) {
     DWORD ignored = 0;
     const BOOL restored = VirtualProtect(location, length, protection, &ignored);
     return written && restored;
+}
+
+bool RestoreSiteJournals() {
+    // Check every site before writing any of them.  A third-party patch that
+    // changed one site therefore cannot leave earlier sites half-restored.
+    BYTE previousActual[kSiteCount][8] = {};
+    for (size_t i = 0; i < kSiteCount; ++i) {
+        RuntimeJournalEntry& entry = gSiteJournal[i];
+        if (!entry.active || !entry.expectedValid || !entry.address) continue;
+        if (!ReadBytes(entry.address, previousActual[i], entry.length) ||
+            (memcmp(previousActual[i], entry.expected, entry.length) != 0 &&
+             memcmp(previousActual[i], entry.original, entry.length) != 0)) {
+            SetError(L"运行时恢复冲突：目标指令已被其它补丁修改，未覆盖现有字节。");
+            return false;
+        }
+    }
+    size_t restored[ARRAYSIZE(gSiteJournal)] = {};
+    size_t count = 0;
+    for (size_t i = 0; i < kSiteCount; ++i) {
+        RuntimeJournalEntry& entry = gSiteJournal[i];
+        if (!entry.active || !entry.expectedValid ||
+            memcmp(previousActual[i], entry.original, entry.length) == 0) continue;
+        if (!WriteSite(gSites[i], entry.original)) {
+            // A failed write can have copied bytes before protection/cache
+            // restoration failed. Include that site in the rollback as well.
+            bool rolledBack = WriteSite(gSites[i], previousActual[i], true);
+            for (size_t j = 0; j < count; ++j) {
+                const bool okay = WriteSite(gSites[restored[j]], previousActual[restored[j]], true);
+                rolledBack = okay && rolledBack;
+            }
+            SetError(rolledBack ? L"运行时恢复写入失败，未完成恢复。" :
+                L"运行时恢复和回滚均失败，请重启游戏后重试。");
+            return false;
+        }
+        restored[count++] = i;
+    }
+    // Commit journal state only after the entire instruction transaction has
+    // succeeded. A retry after rollback must still expect the installed bytes.
+    for (size_t i = 0; i < kSiteCount; ++i) {
+        RuntimeJournalEntry& entry = gSiteJournal[i];
+        if (!entry.active || !entry.expectedValid) continue;
+        JournalExpected(entry, entry.original);
+        memcpy(gSites[i].current, entry.original, entry.length);
+    }
+    return true;
 }
 
 bool Rel32Reachable(uintptr_t instruction, uintptr_t target) {
@@ -332,17 +437,41 @@ int NativeStageCall(uintptr_t context) {
     return CallTimerFunction(gLayout.nativeStage, context);
 }
 
+static int LegacyStageDelay(int value, int& counter) {
+    if (value > 50) return value - 50;
+    ++counter;
+    const int delay = counter < value ? 1 : 0;
+    if (counter >= 50) counter -= 50;
+    return delay;
+}
+
 int __cdecl LegacyPhaseHelper(uintptr_t context) {
     if (!gPhaseInstalled || !gPhaseDataAvailable || !gLayout.speed || !gLayout.phase ||
-        !gLayout.phaseTable || !gLayout.phaseCounter || !gLayout.sleep) return NativeStageCall(context);
+        (!gLayout.phaseOwnedByPatch && (!gLayout.phaseTable || !gLayout.phaseCounter)) ||
+        !gLayout.sleep) return NativeStageCall(context);
 
     WORD speed = 0;
     BYTE phase = 0;
     BYTE value = 0;
     BYTE counter = 0;
     if (!ReadBytes(gLayout.speed, &speed, sizeof(speed)) ||
-        !ReadBytes(gLayout.phase, &phase, sizeof(phase)) || phase >= 3 ||
-        !ReadBytes(gLayout.phaseTable + phase, &value, sizeof(value)) ||
+        !ReadBytes(gLayout.phase, &phase, sizeof(phase)) || phase >= 3) return NativeStageCall(context);
+
+    if (gLayout.phaseOwnedByPatch) {
+        AcquireSRWLockExclusive(&gPhaseLock);
+        if (!gPhase.enabled) {
+            ReleaseSRWLockExclusive(&gPhaseLock);
+            return NativeStageCall(context);
+        }
+        const int selected = gPhase.flags[phase] ? gPhase.values[phase] : 50;
+        const int delay = LegacyStageDelay(selected, gPhase.counters[phase]);
+        ReleaseSRWLockExclusive(&gPhaseLock);
+        reinterpret_cast<void (__stdcall*)(DWORD)>(At(gLayout.sleep))(static_cast<DWORD>(delay));
+        // Proxy-owned 6.4 pacing replaces the native deadline path. Calling
+        // it here would mix two timers and duplicate a frame wait.
+        return 1;
+    }
+    if (!ReadBytes(gLayout.phaseTable + phase, &value, sizeof(value)) ||
         !ReadBytes(gLayout.phaseCounter, &counter, sizeof(counter))) return NativeStageCall(context);
 
     int delay = 0;
@@ -471,6 +600,10 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     gInitialized = false;
     gPhaseDataAvailable = false;
     gNativeDataAvailable = false;
+    for (size_t i = 0; i < kSiteCount; ++i) gSiteJournal[i] = RuntimeJournalEntry();
+    gPhaseJournal = RuntimeJournalEntry();
+    gNativeStateJournal = RuntimeJournalEntry();
+    gNativeBusyJournal = RuntimeJournalEntry();
     gError[0] = 0;
     if (!gGameBase) {
         SetError(L"\u65e0\u6cd5\u5b9a\u4f4d\u6e38\u620f\u4e3b\u7a0b\u5e8f\u3002");
@@ -478,7 +611,33 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     }
     if (resolveLayout) {
         EngineLayout layout;
-        if (!ResolveEngineLayout(reinterpret_cast<const BYTE*>(gGameBase), layout, virtualBase)) {
+        const BYTE* image = reinterpret_cast<const BYTE*>(gGameBase);
+        bool forced = false;
+#ifndef XA66_TEST
+        wchar_t modulePath[32768] = {};
+        if (gInstance && GetModuleFileNameW(gInstance, modulePath, static_cast<DWORD>(_countof(modulePath)))) {
+            wchar_t* slash = wcsrchr(modulePath, L'\\');
+            if (slash) {
+                *slash = 0;
+                const std::wstring statePath = PatchPrivatePath(modulePath, CompiledEngineProfile()) +
+                    L"\\feature-state.ini";
+                wchar_t mode[32] = {};
+                GetPrivateProfileStringW(L"Install", L"EngineMode", L"Automatic", mode,
+                    static_cast<DWORD>(_countof(mode)), statePath.c_str());
+                const unsigned selected = GetPrivateProfileIntW(L"Install", L"EngineProfile", 0,
+                    statePath.c_str());
+                forced = !_wcsicmp(mode, L"Forced") && selected == static_cast<unsigned>(CompiledEngineProfile());
+            }
+        }
+#endif
+        bool resolved = false;
+        if (forced) {
+            const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+            const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
+            resolved = ResolveForcedEngineLayout(image, nt->OptionalHeader.SizeOfImage,
+                CompiledEngineProfile(), layout, virtualBase);
+        } else resolved = ResolveEngineLayout(image, layout, virtualBase);
+        if (!resolved) {
             SetError(L"\u672a\u80fd\u5b9a\u4f4d\u6b64\u57fa\u5e95\u7684\u52a0\u901f\u51fd\u6570\u3002");
             return false;
         }
@@ -533,7 +692,9 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
         !ReadBytes(gSites[kNativeRouteSite].address, gSites[kNativeRouteSite].original,
             gSites[kNativeRouteSite].length))
         gSites[kNativeRouteSite].available = false;
-    if (!NormalizeNativeToggleLayout()) return false;
+    if (gLayout.plan.mode != EngineResolveMode::Forced && !NormalizeNativeToggleLayout()) return false;
+    if (gLayout.plan.mode == EngineResolveMode::Forced) gNativeDataAvailable =
+        gLayout.nativeSuperState != 0 && gLayout.nativeSuperBusy != 0;
     for (size_t i = 0; i < kSiteCount; ++i) {
         if (!gSites[i].available) continue;
         if (i == SiteWaitCall || i == SiteRWait || i == kNativeRouteSite) {
@@ -561,11 +722,31 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
         }
         memcpy(gSites[i].current, gSites[i].original, gSites[i].length);
     }
+    for (size_t i = 0; i < kSiteCount; ++i) {
+        if (gSites[i].available)
+            StartJournal(gSiteJournal[i], gSites[i].address, gSites[i].length, gSites[i].original);
+    }
     gPhaseDataAvailable = false;
-    if ((gLayout.capabilities & CapabilityPhase) && gLayout.phaseTable && gLayout.phaseCounter &&
+    if ((gLayout.capabilities & CapabilityPhase) && gLayout.phaseOwnedByPatch &&
+        gLayout.phase && gLayout.speed && gLayout.sleep && gLayout.nativeStage) {
+        // 6.4 has no native phase table. Its parameters and counters belong
+        // to the proxy, so only the wait CALL participates in the byte journal.
+        gPhaseDataAvailable = true;
+    } else if ((gLayout.capabilities & CapabilityPhase) && gLayout.phaseTable && gLayout.phaseCounter &&
         ReadBytes(gLayout.phaseTable, gPhaseOriginal, 4)) {
         memcpy(gPhaseCurrent, gPhaseOriginal, 3);
         gPhaseDataAvailable = true;
+        StartJournal(gPhaseJournal, gLayout.phaseTable, sizeof(gPhaseOriginal), gPhaseOriginal);
+    }
+    if (gNativeDataAvailable) {
+        BYTE state = 0, busy = 0;
+        if (ReadBytes(gLayout.nativeSuperState, &state, 1) &&
+            ReadBytes(gLayout.nativeSuperBusy, &busy, 1)) {
+            StartJournal(gNativeStateJournal, gLayout.nativeSuperState, 1, &state);
+            StartJournal(gNativeBusyJournal, gLayout.nativeSuperBusy, 1, &busy);
+        } else {
+            gNativeDataAvailable = false;
+        }
     }
     AcquireSRWLockExclusive(&gPhaseLock);
     gPhase = {};
@@ -593,12 +774,17 @@ bool ApplyBytes(const BYTE desired[kSiteCount][8]) {
         if (!WriteSite(gSites[i], desired[i])) {
             bool rolledBack = true;
             for (size_t j = 0; j <= i; ++j) {
-                if (changed[j]) rolledBack = WriteSite(gSites[j], gSites[j].current, true) && rolledBack;
+                if (changed[j]) {
+                    const bool okay = WriteSite(gSites[j], gSites[j].current, true);
+                    if (okay) JournalExpected(gSiteJournal[j], gSites[j].current);
+                    rolledBack = okay && rolledBack;
+                }
             }
             SetError(rolledBack ? L"\u65e0\u6cd5\u5199\u5165\u52a0\u901f\u6307\u4ee4\uff0c\u672c\u6b21\u4fee\u6539\u5df2\u56de\u9000\u3002" :
                 L"\u52a0\u901f\u6307\u4ee4\u5199\u5165\u548c\u56de\u9000\u5931\u8d25\uff0c\u8bf7\u91cd\u65b0\u542f\u52a8\u6e38\u620f\u3002");
             return false;
         }
+        JournalExpected(gSiteJournal[i], desired[i]);
     }
     for (size_t i = 0; i < kSiteCount; ++i) memcpy(gSites[i].current, desired[i], gSites[i].length);
     return true;
@@ -654,24 +840,20 @@ bool ApplyEngineState(const Settings& settings) {
         (gLayout.capabilities & CapabilitySuperS) != 0;
     if (settings.superEnabled) {
         if (settings.superFlags[0] && dialogReady) {
-            const BYTE dialog[] = {0xC2,0x0C,0x00,0xE8};
-            const BYTE dialog3[] = {0xC2,0x04,0x00,0x6A};
-            memcpy(desired[SiteDialog], dialog, sizeof(dialog));
-            if (gLayout.dialog3Applicable) memcpy(desired[SiteDialog3], dialog3, sizeof(dialog3));
+            memcpy(desired[SiteDialog], gLayout.siteEnabled[SiteDialog], gSites[SiteDialog].length);
+            if (gLayout.dialog3Applicable)
+                memcpy(desired[SiteDialog3], gLayout.siteEnabled[SiteDialog3], gSites[SiteDialog3].length);
         }
         if (settings.superFlags[1] && mapReady) {
-            const BYTE map[] = {0xC2,0x10,0x00,0x6A};
-            memcpy(desired[SiteMapText], map, sizeof(map));
+            memcpy(desired[SiteMapText], gLayout.siteEnabled[SiteMapText], gSites[SiteMapText].length);
         }
         if ((settings.superFlags[0] && dialogReady) || (settings.superFlags[1] && mapReady)) {
-            desired[SiteDialogDisplay][0] = 0xEB;
-            desired[SiteDialogDisplay][1] = 0x1D;
+            memcpy(desired[SiteDialogDisplay], gLayout.siteEnabled[SiteDialogDisplay],
+                gSites[SiteDialogDisplay].length);
         }
         if (settings.superFlags[2] && delayReady) {
-            const BYTE delay[] = {0xC2,0x04,0x00};
-            memcpy(desired[SiteDelay], delay, sizeof(delay));
-            desired[SiteExtraDelay][0] = 0xEB;
-            desired[SiteExtraDelay][1] = 0x06;
+            memcpy(desired[SiteDelay], gLayout.siteEnabled[SiteDelay], gSites[SiteDelay].length);
+            memcpy(desired[SiteExtraDelay], gLayout.siteEnabled[SiteExtraDelay], gSites[SiteExtraDelay].length);
         }
         if (settings.superFlags[3] && rReady)
             memset(desired[SiteRWait], 0x90, gSites[SiteRWait].length);
@@ -702,7 +884,8 @@ bool ApplyEngineState(const Settings& settings) {
     BYTE newPhase[4] = {};
     const bool phaseWrite = settings.phaseEnabled && phaseInstalled;
     if (phaseUnavailable) SetErrorIfEmpty(L"阶段加速原生阶段表无法定位，已停用阶段加速。");
-    if (gPhaseDataAvailable) {
+    const bool nativePhaseData = gPhaseDataAvailable && !gLayout.phaseOwnedByPatch;
+    if (nativePhaseData) {
         if (!ReadBytes(gLayout.phaseTable, oldPhase, sizeof(oldPhase))) {
             SetError(L"无法读取阶段表当前值，已停用阶段加速。");
             return false;
@@ -713,7 +896,7 @@ bool ApplyEngineState(const Settings& settings) {
             newPhase[3] = 0;
         } else memcpy(newPhase, gPhaseOriginal, sizeof(newPhase));
     }
-    const bool phaseChanged = gPhaseDataAvailable && memcmp(oldPhase, newPhase, sizeof(newPhase)) != 0;
+    const bool phaseChanged = nativePhaseData && memcmp(oldPhase, newPhase, sizeof(newPhase)) != 0;
     BYTE oldNativeState = 0;
     BYTE oldNativeBusy = 0;
     const BYTE busy = 1;
@@ -729,11 +912,14 @@ bool ApplyEngineState(const Settings& settings) {
         SetError(L"阶段参数写入失败，已回滚本次设置。");
         return false;
     }
+    if (phaseChanged) JournalExpected(gPhaseJournal, newPhase);
     BYTE previous[kSiteCount][8] = {};
     for (size_t i = 0; i < kSiteCount; ++i) memcpy(previous[i], gSites[i].current, gSites[i].length);
     if (!ApplyBytes(desired)) {
-        if (phaseChanged) WriteMemory(gLayout.phaseTable, oldPhase, sizeof(oldPhase));
-        if (gNativeDataAvailable) WriteMemory(gLayout.nativeSuperBusy, &oldNativeBusy, 1);
+        if (phaseChanged && WriteMemory(gLayout.phaseTable, oldPhase, sizeof(oldPhase)))
+            JournalExpected(gPhaseJournal, oldPhase);
+        if (gNativeDataAvailable && WriteMemory(gLayout.nativeSuperBusy, &oldNativeBusy, 1))
+            JournalExpected(gNativeBusyJournal, &oldNativeBusy);
         return false;
     }
     if (gNativeDataAvailable) {
@@ -742,15 +928,20 @@ bool ApplyEngineState(const Settings& settings) {
         if (!WriteMemory(gLayout.nativeSuperState, &state, 1) ||
             !WriteMemory(gLayout.nativeSuperBusy, &unlocked, 1)) {
             ApplyBytes(previous);
-            if (phaseChanged) WriteMemory(gLayout.phaseTable, oldPhase, sizeof(oldPhase));
-            WriteMemory(gLayout.nativeSuperState, &oldNativeState, 1);
-            WriteMemory(gLayout.nativeSuperBusy, &oldNativeBusy, 1);
+            if (phaseChanged && WriteMemory(gLayout.phaseTable, oldPhase, sizeof(oldPhase)))
+                JournalExpected(gPhaseJournal, oldPhase);
+            if (WriteMemory(gLayout.nativeSuperState, &oldNativeState, 1))
+                JournalExpected(gNativeStateJournal, &oldNativeState);
+            if (WriteMemory(gLayout.nativeSuperBusy, &oldNativeBusy, 1))
+                JournalExpected(gNativeBusyJournal, &oldNativeBusy);
             SetError(L"原生超级加速状态同步失败，本次设置已回滚。");
             return false;
         }
+        JournalExpected(gNativeStateJournal, &state);
+        JournalExpected(gNativeBusyJournal, &unlocked);
     }
-    if (gPhaseDataAvailable) memcpy(gPhaseCurrent, newPhase, 3);
-    if (!nativeRouteInstalled)
+    if (nativePhaseData) memcpy(gPhaseCurrent, newPhase, 3);
+    if (!nativeRouteInstalled && (gLayout.capabilities & CapabilityNativeSuper))
         SetErrorIfEmpty(L"原生 Z 键入口接管失败；已停用原生快捷键兜底，其它可用功能保持不变。");
     if (settings.superEnabled && settings.superFlags[0] && !dialogReady)
         SetErrorIfEmpty(L"超级加速对白功能定位失败，已停用该子项。");
@@ -770,6 +961,9 @@ bool ApplyEngineState(const Settings& settings) {
     AcquireSRWLockExclusive(&gPhaseLock);
     gPhase.enabled = phaseInstalled && !phaseUnavailable;
     for (int phase = 0; phase < 3; ++phase) {
+        if (gPhase.values[phase] != settings.phase[phase] ||
+            gPhase.flags[phase] != settings.phaseFlags[phase] || !phaseInstalled)
+            gPhase.counters[phase] = 0;
         gPhase.flags[phase] = settings.phaseFlags[phase];
         gPhase.values[phase] = settings.phase[phase];
     }
@@ -779,24 +973,29 @@ bool ApplyEngineState(const Settings& settings) {
 
 void RestoreEngine() {
     if (!gInitialized) return;
-    BYTE desired[kSiteCount][8] = {};
-    for (size_t i = 0; i < kSiteCount; ++i) memcpy(desired[i], gSites[i].original, gSites[i].length);
-    bool restored = ApplyBytes(desired);
-    if (gPhaseDataAvailable) {
-        restored = WriteMemory(gLayout.phaseTable, gPhaseOriginal, sizeof(gPhaseOriginal)) && restored;
-        memcpy(gPhaseCurrent, gPhaseOriginal, 3);
-    }
-    if (gNativeDataAvailable) {
-        const BYTE zero = 0;
-        restored = WriteMemory(gLayout.nativeSuperState, &zero, 1) && restored;
-        restored = WriteMemory(gLayout.nativeSuperBusy, &zero, 1) && restored;
-    }
+    SetError(L"");
+    bool restored = RestoreSiteJournals();
+    if (!restored) return;
+    // The first three phase bytes are settings owned by this patch; the fourth
+    // is the game's live counter. Native state/busy are also live game fields.
+    // Restore their snapshots without treating normal game updates as conflicts.
+    restored = RestoreMemoryJournal(gPhaseJournal,
+        L"运行时恢复冲突：阶段表已被其它补丁修改，未覆盖现有字节。", 3) && restored;
+    restored = RestoreMemoryJournal(gNativeStateJournal,
+        L"运行时恢复失败：无法恢复原生加速状态。", 0) && restored;
+    restored = RestoreMemoryJournal(gNativeBusyJournal,
+        L"运行时恢复失败：无法恢复原生加速忙标志。", 0) && restored;
+    if (restored && gPhaseDataAvailable) memcpy(gPhaseCurrent, gPhaseOriginal, 3);
     gPhaseInstalled = false;
     if (restored) {
         AcquireSRWLockExclusive(&gPhaseLock);
         gPhase = {};
         ReleaseSRWLockExclusive(&gPhaseLock);
     }
+}
+
+const EnginePatchPlan& RuntimeEnginePatchPlan() {
+    return gLayout.plan;
 }
 
 const wchar_t* EngineError() {
@@ -810,6 +1009,12 @@ void SetNativeToggleHandler(void (__cdecl* handler)()) {
 #ifdef XA66_TEST
 bool EngineTestInitialize() { return InitializeSites(false); }
 bool EngineTestInitializeImage(uintptr_t virtualBase) { return InitializeSites(true, virtualBase); }
+bool EngineTestOwnedPhaseState(int phase, int& value, int& counter) {
+    if (!gLayout.phaseOwnedByPatch || !gPhaseInstalled || !gPhase.enabled || phase < 0 || phase >= 3) return false;
+    value = gPhase.flags[phase] ? gPhase.values[phase] : 50;
+    counter = gPhase.counters[phase];
+    return true;
+}
 void EngineTestFailWrite(int index) { gFailWrite = index; gWriteCount = 0; }
 int EngineTestSuperCaller(uintptr_t caller) { return SuperYieldWithContext(caller, 0); }
 void EngineTestSuperWhitelist(uintptr_t caller) {

@@ -3,6 +3,7 @@
 
 #include "BattleStats.h"
 #include "BattleStatsPersistence.h"
+#include "StatsDiagnostics.h"
 #include "SaveTransactions.h"
 #include "ScenarioLifecycle.h"
 #include "Features.h"
@@ -34,7 +35,15 @@ using NativeAutoFn = void (__thiscall*)(void*);
 using NativeSaveFn = void (__thiscall*)(void*, int);
 using NativeFilenameFn = void (__stdcall*)(char*, int);
 
+enum class NativeExtensionCapability : unsigned char {
+    Unsupported,
+    None,
+    Verified
+};
+
 struct SaveLayout {
+    NativeExtensionCapability extensionCapability = NativeExtensionCapability::Unsupported;
+    BYTE* extensionLoadSite = nullptr;
     BYTE* extensionSaveSite = nullptr;
     uintptr_t extensionSaveSlot = 0;
     BYTE originalExtensionSave[6] = {}, patchedExtensionSave[6] = {};
@@ -112,6 +121,7 @@ thread_local bool gPrivateSaveSucceeded = false;
 thread_local int gPrivateSaveRawSlot = -1;
 constexpr int kPrivateSaveSlot65 = 256;
 constexpr char kPrivateSaveFilename65[] = "SV\\XA65.E5S";
+constexpr char kPrivateSaveFilename64[] = "SV\\XA64.E5S";
 volatile LONG gPendingLoadSlot = -1;
 struct LoadContext { int slot; std::wstring path; };
 thread_local std::vector<LoadContext> gLoadContexts;
@@ -505,9 +515,82 @@ bool ResolveSaveLayout65InImage(BYTE* base, uintptr_t virtualBase, SaveLayout& r
     return ResolveNativeSaveBypass(base, virtualBase, nt->OptionalHeader.SizeOfImage, nativeSave, result);
 }
 
+// 6.4 keeps the 20-slot autosaver, a direct end-of-turn save, and a
+// padded-name builder. Its native writer/transaction ABI is shared, not its
+// 6.5 rotating-boundary or filename prologue.
+bool ResolveSaveLayout64InImage(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
+    if (!base) return false;
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return false;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+    BYTE* text = nullptr; size_t size = 0;
+    const auto sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i=0; i<nt->FileHeader.NumberOfSections; ++i) if (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+        if (sections[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage ||
+            sections[i].Misc.VirtualSize > nt->OptionalHeader.SizeOfImage-sections[i].VirtualAddress) return false;
+        text=base+sections[i].VirtualAddress; size=sections[i].Misc.VirtualSize; break;
+    }
+    auto inside=[&](const BYTE* p,size_t n) { return text && p>=text && n<=size && static_cast<size_t>(p-text)<=size-n; };
+    BYTE* nativeAuto=nullptr; unsigned matches=0;
+    const BYTE divide[]={0x33,0xD2,0xB9,0x14,0,0,0,0xF7,0xF1,0x52,0xE8};
+    const BYTE restore[]={0x59,0x58,0x88,0x08,0x5D,0xC3};
+    for(size_t i=0;i+48<=size;++i) {
+        BYTE* p=text+i;
+        if(p[0]!=0x55 || p[1]!=0x8B || p[2]!=0xEC || p[3]!=0x80 || p[4]!=0x3D ||
+            p[9] || p[10]!=0x74 || p[11]!=0x22 || p[12]!=0xB8 || p[17]!=0x50 ||
+            p[18]!=0xFF || p[19]!=0x30 || p[20]!=0xC6 || p[21] || p[22]!=0x2C ||
+            p[23]!=0x0F || p[24]!=0xB6 || p[25]!=0x41 || p[26]!=2 ||
+            memcmp(p+27,divide,sizeof(divide)) || memcmp(p+42,restore,sizeof(restore))) continue;
+        nativeAuto=p; ++matches;
+    }
+    if(matches!=1) return false;
+    BYTE* nativeSave=reinterpret_cast<BYTE*>(CallTarget(nativeAuto+37));
+    const BYTE savePrefix[]={0x55,0x8B,0xEC,0x80,0x3D};
+    const BYTE coreArgument[]={0xFF,0x75,0x08,0xE8};
+    const BYTE saveReturn[]={0x5D,0xC2,0x04,0x00};
+    if(!inside(nativeSave,0x60) || memcmp(nativeSave,savePrefix,sizeof(savePrefix)) ||
+        memcmp(nativeSave+0x2D,coreArgument,sizeof(coreArgument)) ||
+        memcmp(nativeSave+0x47,saveReturn,sizeof(saveReturn))) return false;
+    BYTE* start=nullptr; matches=0;
+    const BYTE startPrefix[]={0x83,0x7D,0x08,0,0x75,0x08,0x8B,0x4D};
+    for(size_t i=0;i+14<=size;++i) {
+        BYTE* p=text+i;
+        if(memcmp(p,startPrefix,sizeof(startPrefix)) || static_cast<int8_t>(p[8])>=0 ||
+            p[9]!=0xE8 || CallTarget(p+9)!=reinterpret_cast<uintptr_t>(nativeAuto)) continue;
+        start=p+9; ++matches;
+    }
+    if(matches!=1) return false;
+    BYTE* end=nullptr; matches=0;
+    for(size_t i=0;i+0x3F<=size;++i) {
+        BYTE* p=text+i;
+        const BYTE endPrefix[]={0x83,0x7D,0xF4,0,0x74,0x34,0x6A,0x14,0xE8};
+        if(memcmp(p,endPrefix,sizeof(endPrefix)) || CallTarget(p+8)!=reinterpret_cast<uintptr_t>(nativeSave) ||
+            p+8<=start || p+8-start>0x800 || p[0x35]!=0xE9) continue;
+        bool padding=true; for(size_t j=13;j<0x35;++j) if(p[j]!=0x90) padding=false;
+        if(!padding || p[0x3A]!=0xE8) continue;
+        end=p+8; ++matches;
+    }
+    if(matches!=1) return false;
+    uint32_t enable=0,campaign=0;
+    memcpy(&enable,nativeAuto+5,4); memcpy(&campaign,nativeAuto+13,4);
+    if(enable<virtualBase || enable-virtualBase>=nt->OptionalHeader.SizeOfImage ||
+        campaign<virtualBase || campaign-virtualBase>=nt->OptionalHeader.SizeOfImage) return false;
+    result=SaveLayout(); result.callSite=start; result.endCallSite=end;
+    result.nativeAuto=reinterpret_cast<NativeAutoFn>(nativeAuto);
+    result.nativeSave=reinterpret_cast<NativeSaveFn>(nativeSave);
+    result.nativeAutoEnable=base+(enable-virtualBase); result.endObserverIsSave=true;
+    result.endGameFrameOffset=static_cast<int8_t>(start[-1]); result.campaignByte=base+(campaign-virtualBase);
+    memcpy(result.originalCall,start,5); memcpy(result.originalEndCall,end,5);
+    return ResolveNativeSaveBypass(base,virtualBase,nt->OptionalHeader.SizeOfImage,nativeSave,result);
+}
+
 // Persistence has its own verified graph. Automatic turn boundaries are
 // optional and can fail without disabling ordinary save/load transactions.
 bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
+    // The engine family does not imply an EXS writer. Only a symmetric,
+    // fully recognized save/load extension graph may require EXS.
+    result.extensionCapability = NativeExtensionCapability::Unsupported;
     const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return false;
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
@@ -524,10 +607,16 @@ bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
     if (matches != 1) return false;
     BYTE* filename = reinterpret_cast<BYTE*>(CallTarget(writer+17));
     const BYTE fp[] = {0x55,0x8B,0xEC,0x8B,0x45,0x0C,0x3C,0x14,0x74,0x0F,0x0F,0xB6,0x0D};
-    if (!inside(filename, 47) || memcmp(filename, fp, sizeof(fp))) return false;
-    uint32_t campaign = 0; memcpy(&campaign, filename+13, 4);
+    const bool engine64 = CompiledEngineProfile() == EngineProfileId::Ccz64;
+    const BYTE fp64[]={0x55,0x8B,0xEC,0x83,0xEC,0x14,0x8B,0x45,0x0C,0x3C,0x14,0x74,0x0F,0x0F,0xB6,0x0D};
+    const BYTE slots64[]={0x6B,0xC9,0x14,0x03,0xC1,0x40,0xEB,0x02,0x33,0xC0,0x6A,3,0x6A,0x30,0x50};
+    if (engine64 ? (!inside(filename,0x57) || memcmp(filename,fp64,sizeof(fp64)) ||
+        memcmp(filename+20,slots64,sizeof(slots64)) || memcmp(filename+0x54,"\xC2\x08\x00",3)) :
+        (!inside(filename,47) || memcmp(filename,fp,sizeof(fp)))) return false;
+    uint32_t campaign = 0; memcpy(&campaign, filename+(engine64?16:13), 4);
     if (campaign < virtualBase || campaign-virtualBase >= nt->OptionalHeader.SizeOfImage) return false;
     BYTE* core = nullptr; BYTE* commit = nullptr; matches = 0;
+    bool saveHasExtension = false;
     const BYTE success[] = {0x83,0xC4,0x04,0x6A,0x01,0x6A,0,0x68};
     for (size_t i = 8; i + 0x33 < size; ++i) {
         BYTE* p = text+i;
@@ -540,12 +629,21 @@ bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
             linked = inside(cave, 45) && cave[0] == 0xE8 && CallTarget(cave) == reinterpret_cast<uintptr_t>(writer) &&
                 cave[39] == 0xE9 && JumpTarget(cave+39) == reinterpret_cast<uintptr_t>(p);
             if (linked) {
-                if (cave[30]!=0xFF || cave[31]!=0x15) return false;
-                uint32_t slot=0; memcpy(&slot,cave+32,4);
+                const BYTE saveDecision[]={0x83,0x7D,0x08,0x14,0x75,0x04,0x33,0xC9,0xEB,0x0E,0x0F,0xB6,0x0D};
+                const BYTE saveSlot[]={0x6B,0xC9,0x14,0x03,0x4D,0x08,0x41,0x51,0xFF,0x15};
+                const BYTE callerCleanup[]={0x83,0xC4,0x04};
+                uint32_t slot=0, extensionCampaign=0;
+                if (memcmp(cave+5,saveDecision,sizeof(saveDecision)) ||
+                    memcmp(cave+22,saveSlot,sizeof(saveSlot)) ||
+                    memcmp(cave+36,callerCleanup,sizeof(callerCleanup))) return false;
+                memcpy(&extensionCampaign,cave+18,4);
+                if (extensionCampaign!=campaign) return false;
+                memcpy(&slot,cave+32,4);
                 if (slot<virtualBase || slot-virtualBase>nt->OptionalHeader.SizeOfImage-4) return false;
                 result.extensionSaveSite=cave+30;
                 result.extensionSaveSlot=reinterpret_cast<uintptr_t>(base+(slot-virtualBase));
                 memcpy(result.originalExtensionSave,cave+30,6);
+                saveHasExtension=true;
             }
         }
         if (!linked || before[-3] != 0xFF || before[-2] != 0x75 || before[-1] != 8) continue;
@@ -557,20 +655,40 @@ bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
     }
     if (matches != 1 || !core || !commit) return false;
     BYTE* load = nullptr; matches = 0;
-    for (size_t i=0; i+0x140<=size; ++i) {
+    bool loadHasExtension = false;
+    for (size_t i=0; i+(engine64?0x160u:0x140u)<=size; ++i) {
         BYTE* p=text+i;
         const BYTE lp[]={0x55,0x8B,0xEC,0x6A,0,0x6A,0};
-        if (memcmp(p,lp,sizeof(lp))) continue;
+        const BYTE nativePath[]={0x83,0xEC,0x10,0xFF,0x75,0x08,0x8D,0x45,0xE4,0x50,0xE8};
+        if (memcmp(p,lp,sizeof(lp)) || memcmp(p+13,nativePath,sizeof(nativePath))) continue;
         bool linked = p[7] == 0xFF && p[8] == 0x35 && p[23] == 0xE8 &&
             CallTarget(p+23) == reinterpret_cast<uintptr_t>(filename);
         if (p[7] == 0xE9) {
             BYTE* cave=reinterpret_cast<BYTE*>(JumpTarget(p+7));
-            linked=inside(cave,45) && cave[0]==0xFF && cave[1]==0x35 && cave[6]==0x0F &&
-                cave[31]==0xFF && cave[32]==0x15 && cave[40]==0xE9 && JumpTarget(cave+40)==reinterpret_cast<uintptr_t>(p+13);
+            const BYTE loadDecision[]={0x80,0x7D,0x08,0x14,0x75,0x04,0x6A,0,0xEB,0x08,
+                0x6B,0xC9,0x14,0x03,0x4D,0x08,0x41,0x51,0xFF,0x15};
+            const BYTE callerCleanup[]={0x83,0xC4,0x04};
+            linked=inside(cave,45) && cave[0]==0xFF && cave[1]==0x35 &&
+                cave[6]==0x0F && cave[7]==0xB6 && cave[8]==0x0D &&
+                !memcmp(cave+13,loadDecision,sizeof(loadDecision)) &&
+                !memcmp(cave+37,callerCleanup,sizeof(callerCleanup)) && p[12]==0x90 &&
+                cave[40]==0xE9 && JumpTarget(cave+40)==reinterpret_cast<uintptr_t>(p+13);
+            if (linked) {
+                uint32_t extensionCampaign=0, slot=0;
+                memcpy(&extensionCampaign,cave+9,4); memcpy(&slot,cave+33,4);
+                if (extensionCampaign!=campaign || slot<virtualBase ||
+                    slot-virtualBase>nt->OptionalHeader.SizeOfImage-4 ||
+                    !result.extensionSaveSlot ||
+                    reinterpret_cast<uintptr_t>(base+(slot-virtualBase))+4!=result.extensionSaveSlot)
+                    return false;
+                result.extensionLoadSite=cave+31;
+                loadHasExtension=true;
+            }
         }
         if (linked) { load=p; ++matches; }
     }
     if (matches!=1) return false;
+    if (saveHasExtension!=loadHasExtension) return false;
     // Observe the actual generated E5S filename in both engine versions.
     // The 6.6 extension-load cave runs earlier and cannot supply that path.
     if (load[23]!=0xE8 || CallTarget(load+23)!=reinterpret_cast<uintptr_t>(filename)) return false;
@@ -579,10 +697,21 @@ bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
     result.loadContinuation=0;
     memcpy(result.originalLoadObserve,load+23,5);
     result.saveResultSite=FindUniqueResultEpilogue(core,0xC0);
-    result.loadResultSite=FindUniqueResultEpilogue(load,0x140);
+    result.loadResultSite=FindUniqueResultEpilogue(load,engine64?0x160:0x140);
     if (!result.saveResultSite || !result.loadResultSite) return false;
     result.commitSite=commit; result.postWrite=CallTarget(commit+2); result.commitFailure=reinterpret_cast<uintptr_t>(commit+32);
     result.loadStartSite=load; result.nativeFilename=reinterpret_cast<NativeFilenameFn>(filename);
+    if (engine64 && result.nativeSave &&
+        (CallTarget(reinterpret_cast<BYTE*>(result.nativeSave)+0x30) != reinterpret_cast<uintptr_t>(core) ||
+            result.campaignByte != base+(campaign-virtualBase))) {
+        // An unproven optional autosaver must not inherit ordinary save/load
+        // evidence: its callee and campaign selector must describe this graph.
+        result.callSite=nullptr; result.endCallSite=nullptr;
+        result.nativeAuto=nullptr; result.nativeEndAuto=nullptr; result.nativeSave=nullptr;
+        result.nativeAutoEnable=nullptr; result.nativeEndAutoEnable=nullptr;
+        result.endObserverIsSave=false; result.endGameFrameOffset=0;
+        for (unsigned i=0;i<2;++i) { result.nativeBypassSites[i]=nullptr; result.nativeBypassPatched[i]=0; }
+    }
     result.saveFilenameSite=writer+17; result.campaignByte=base+(campaign-virtualBase);
     const size_t offsets[]={0x55,0x6D,0x85,0x9C,0xA7};
     const BYTE nativePrefixWrite[]={0x68,0,0,3,0};
@@ -598,12 +727,19 @@ bool ResolveCoreLayout(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
     memcpy(result.originalSaveFilename,result.saveFilenameSite,5);
     memcpy(result.originalCommit,commit,7); memcpy(result.originalLoadStart,load,7);
     memcpy(result.originalSaveResult,result.saveResultSite,6); memcpy(result.originalLoadResult,result.loadResultSite,6);
+    result.extensionCapability=saveHasExtension ? NativeExtensionCapability::Verified :
+        NativeExtensionCapability::None;
     return true;
 }
 bool ResolveSaveLayoutInImage(BYTE* base, uintptr_t virtualBase, SaveLayout& result) {
     SaveLayout boundaries;
-    bool hasBoundaries = CompiledEngineProfile() == EngineProfileId::Ccz65 ?
-        ResolveSaveLayout65InImage(base,virtualBase,boundaries) : ResolveSaveLayout66InImage(base,virtualBase,boundaries);
+    bool hasBoundaries = false;
+    switch (CompiledEngineProfile()) {
+    case EngineProfileId::Ccz64: hasBoundaries = ResolveSaveLayout64InImage(base, virtualBase, boundaries); break;
+    case EngineProfileId::Ccz65: hasBoundaries = ResolveSaveLayout65InImage(base, virtualBase, boundaries); break;
+    case EngineProfileId::Ccz66: hasBoundaries = ResolveSaveLayout66InImage(base, virtualBase, boundaries); break;
+    default: return false;
+    }
     result = hasBoundaries ? boundaries : SaveLayout();
     return ResolveCoreLayout(base,virtualBase,result);
 }
@@ -698,8 +834,13 @@ void PersistBattleStats(int rawSlot) {
     EnsureFolder(PatchPrivatePath(gSaveRoot, CompiledEngineProfile()));
     EnsureFolder(PatchPrivatePath(gSaveRoot, CompiledEngineProfile()) + L"\\save-index");
     std::wstring error;
-    SaveBattleStatsSidecar(SaveBaseForSlot(slot) + L".E5S", StatsPathForSlot(slot),
-        state, error);
+    const std::wstring savePath = SaveBaseForSlot(slot) + L".E5S";
+    const std::wstring sidecarPath = StatsPathForSlot(slot);
+    const uint64_t operation = BeginStatsOperation(L"save-sidecar-legacy", sidecarPath);
+    const bool saved = SaveBattleStatsSidecar(savePath, sidecarPath, state, error);
+    SetStatsLastSave(saved, sidecarPath, error);
+    RecordStatsDiagnostic(operation, saved ? L"sidecar-success" : L"sidecar-failure",
+        sidecarPath, &state, error);
 }
 
 void StatsFailureNoThrow(const wchar_t* message) {
@@ -737,10 +878,13 @@ void __cdecl FinishLoadSlot(int succeeded) {
     const LoadContext context=std::move(gLoadContexts.back());
     gLoadContexts.pop_back();
     const int slot=context.slot;
+    const uint64_t operation = BeginStatsOperation(L"load", context.path);
     try { if (succeeded && slot >= 0 && !context.path.empty()) {
         BattleStatsPersistedState state;
         std::wstring error;
         const auto result = ReadBattleStatsEmbedded(context.path,state,error);
+        RecordStatsDiagnostic(operation, L"embedded-read", context.path,
+            result == BattleStatsReadResult::Loaded ? &state : nullptr, error);
         bool loaded = result == BattleStatsReadResult::Loaded;
         if (result == BattleStatsReadResult::Missing) {
             loaded=LoadBattleStatsSidecar(context.path,StatsPathForSlot(slot),state,error);
@@ -759,20 +903,30 @@ void __cdecl FinishLoadSlot(int succeeded) {
                 L"该存档没有历史统计，从此次载入后开始记录。" : error;
         }
         if (!RestoreBattleStatsState(state,GetTickCount64())) {
+            ResetBattleStatsForLoadedScenario(L"load-state-invalid",CurrentScenarioOrdinal());
             state=BattleStatsPersistedState(); state.historyIncomplete=true;
             state.scenarioOrdinal=CurrentScenarioOrdinal();
             state.active=state.scenarioOrdinal>=0 && (state.scenarioOrdinal&1)!=0;
             state.status=L"存档统计内容无效，从此次载入后重新记录。";
             RestoreBattleStatsState(state,GetTickCount64());
         }
+        SetStatsLastLoad(loaded, context.path, loaded ? L"统计状态已恢复" : state.status);
+        RecordStatsDiagnostic(operation, loaded ? L"load-success" : L"load-missing-or-corrupt",
+            context.path, &state, loaded ? L"" : state.status);
     } else if (succeeded) {
-        ResetBattleStats();
+        ResetBattleStatsForLoadedScenario(L"load-path-unknown",CurrentScenarioOrdinal());
         StatsFailureNoThrow(L"无法确认本次读取的存档路径，从此次载入后重新记录。");
+        SetStatsLastLoad(false, context.path, L"无法确认本次读取的存档路径");
+        RecordStatsDiagnostic(operation, L"load-path-missing", context.path, nullptr,
+            L"无法确认本次读取的存档路径");
     } } catch (...) {
         // A native load already replaced the game state. Never keep another
         // save's ledger if allocating or decoding its replacement failed.
-        ResetBattleStats();
+        ResetBattleStatsForLoadedScenario(L"load-restore-failed",CurrentScenarioOrdinal());
         StatsFailureNoThrow(L"无法完成存档统计恢复，历史记录不完整。");
+        SetStatsLastLoad(false, context.path, L"统计恢复异常");
+        RecordStatsDiagnostic(operation, L"load-exception", context.path, nullptr,
+            L"统计恢复异常");
     }
     EndScenarioLoad(succeeded!=0);
     SetBattleStatsLoading(!gLoadContexts.empty());
@@ -790,7 +944,14 @@ void __cdecl FinishSaveSlot(int rawSlot) {
         gPrivateSaveSucceeded = true;
         return;
     }
+#ifdef XA66_TEST
+    // Keep the legacy writer available only to migration tests. Production
+    // saves always use the embedded schema-3 transaction above; schema-1
+    // sidecars remain a read-only migration source.
     PersistBattleStats(rawSlot);
+#else
+    (void)rawSlot;
+#endif
 }
 
 void __cdecl FinishNativeSaveResult(int succeeded,int rawSlot) {
@@ -883,7 +1044,9 @@ void SaveFilename65Impl(char* output, int rawSlot) {
         return;
     }
     if (output && rawSlot == kPrivateSaveSlot65 && gPrivateSaveActive) {
-        memcpy(output, kPrivateSaveFilename65, sizeof(kPrivateSaveFilename65));
+        const char* name = CompiledEngineProfile() == EngineProfileId::Ccz64 ?
+            kPrivateSaveFilename64 : kPrivateSaveFilename65;
+        memcpy(output, name, strlen(name) + 1);
         return;
     }
     gSaveLayout.nativeFilename(output, rawSlot);
@@ -980,11 +1143,14 @@ void SavePrivate(void* game, bool atStart) {
     }
     const int slots = Bound(gFeatureSettings.autoSaveSlots, 1, 100);
     const int rotating = turn % slots;
-    const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz65;
-    const int nativeSlot = engine65 ? kPrivateSaveSlot65 : (atStart ? 800 : 900) + rotating;
-    const int physicalSlot = engine65 ? 0 : EffectiveSaveSlot(nativeSlot);
+    const bool engine65Family = CompiledEngineProfile() == EngineProfileId::Ccz65 ||
+        CompiledEngineProfile() == EngineProfileId::Ccz64;
+    const int nativeSlot = engine65Family ? kPrivateSaveSlot65 : (atStart ? 800 : 900) + rotating;
+    const int physicalSlot = engine65Family ? 0 : EffectiveSaveSlot(nativeSlot);
     if (physicalSlot < 0) { InterlockedExchange(&gSaving, FALSE); return; }
-    const std::wstring sourceBase = engine65 ? gSaveRoot + L"\\SV\\XA65" : SaveBaseForSlot(physicalSlot);
+    const std::wstring sourceBase = engine65Family ?
+        (gSaveRoot + (CompiledEngineProfile() == EngineProfileId::Ccz64 ? L"\\SV\\XA64" : L"\\SV\\XA65")) :
+        SaveBaseForSlot(physicalSlot);
     // Remove this transaction's staging files first.  A failed native save
     // must never relabel the previous rotation entry as a fresh save.
     for (const wchar_t* extension : {L".E5S", L".EXS"}) {

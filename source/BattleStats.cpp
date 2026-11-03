@@ -1,8 +1,12 @@
 #include "BattleStats.h"
+#include "StatsDiagnostics.h"
 
 #include "BattleRuntime.h"
 #include "Guide.h"
 #include "EngineProfile.h"
+#ifndef XA66_TEST
+#include "AnimationRuntime.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -13,6 +17,15 @@
 #include <vector>
 
 namespace {
+// AnimationRuntime owns the verified return-slot bridge in production.
+// Test-only model builds intentionally keep the optional bridge absent.
+bool ResolveNativeAnimationReturn(uintptr_t slot, uintptr_t observed, uintptr_t& native) {
+#if defined(XA66_TEST)
+    (void)slot; (void)observed; (void)native; return false;
+#else
+    return ::ResolveNativeAnimationReturn(slot, observed, native);
+#endif
+}
 
 constexpr size_t kUnitStride = 0x30;
 constexpr size_t kUnitCount = 250;
@@ -80,6 +93,33 @@ struct PeImage {
     }
 };
 
+enum DodgeRole : unsigned { DodgeFinal = 0, DodgePhysicalImmune, DodgePhysicalValid,
+    DodgeStrategyValid, DodgeStrategyImmune, DodgeStrategyPerson, DodgeStrategyForcedZero, DodgeRoleCount };
+struct DodgeCall { uintptr_t site = 0, target = 0; DodgeRole role = DodgeFinal; };
+struct DodgeLayout {
+    uintptr_t base = 0, finalHit = 0, physicalCalcReturn = 0;
+    std::vector<DodgeCall> calls;
+    std::vector<std::pair<uintptr_t, int>> strategyCalcs;
+    std::array<uintptr_t, 3> strategyDirect = {};
+    std::array<uintptr_t, 2> strategyActions = {};
+    bool available = false;
+};
+
+enum ReceivedRole : unsigned { ReceivedPhysical=0, ReceivedDamage, ReceivedMixed,
+    ReceivedState, ReceivedSpecial, ReceivedAll, ReceivedRandom, ReceivedScatter, ReceivedRoleCount };
+struct ReceivedCall {
+    uintptr_t site=0,target=0;
+    ReceivedRole role=ReceivedPhysical;
+    bool entry=false;
+    int contextLocal=0,indexLocal=0;
+};
+struct ReceivedLayout {
+    uintptr_t base=0;
+    std::vector<ReceivedCall> calls;
+    std::array<uintptr_t,2> physicalActions={},strategyActions={};
+    bool physical=false,strategy=false;
+};
+
 struct ResolvedLayout {
     uintptr_t hpSetter = 0;
     uintptr_t unitBase = 0;
@@ -96,6 +136,8 @@ struct ResolvedLayout {
     uint32_t criticalOffset = 0;
     uint32_t comboOffset = 0;
     bool physicalEvents = false;
+    DodgeLayout dodge;
+    ReceivedLayout received;
 };
 
 struct CodePatch {
@@ -105,6 +147,10 @@ struct CodePatch {
     std::array<BYTE, 16> patched = {};
     void* thunk = nullptr;
     bool installed = false;
+    DWORD protection = 0;
+    bool protectionKnown = false, protectionPending = false, cachePending = false;
+    bool attempted = false, currentKnown = false;
+    std::array<BYTE,16> current = {};
 };
 
 struct RuntimeLayout {
@@ -112,22 +158,24 @@ struct RuntimeLayout {
     uintptr_t unitBase = 0;
     uintptr_t strategyBase = 0;
     unsigned strategyCount = 0;
-    std::array<BYTE*, kSettlementCallCount> callSites = {};
-    std::array<std::array<BYTE, 5>, kSettlementCallCount> original = {};
-    std::array<std::array<BYTE, 5>, kSettlementCallCount> patched = {};
-    std::array<void*, kSettlementCallCount> thunks = {};
-    std::array<bool, kSettlementCallCount> installed = {};
+    std::array<CodePatch,kSettlementCallCount> settlements;
     CodePatch physicalResult;
     CodePatch criticalCommit;
+    DodgeLayout dodge;
+    ReceivedLayout received;
+    std::vector<CodePatch> dodgePatches;
+    std::vector<CodePatch> receivedPatches;
     uintptr_t attackBlockCommit = 0;
     uintptr_t spellBlockCommit = 0;
     uint32_t criticalOffset = 0;
     uint32_t comboOffset = 0;
+    bool recoveryPending = false;
 };
 
 struct PhysicalActionState {
     uintptr_t context = 0;
     unsigned long long serial = 0;
+    uint64_t generation = 0;
     int actorSlot = -1;
     std::vector<unsigned> criticalKeys;
     std::vector<unsigned> comboOrdinals;
@@ -170,6 +218,8 @@ bool gCriticalAvailable = false;
 bool gComboAvailable = false;
 bool gAttackBlockAvailable = false;
 bool gSpellBlockAvailable = false;
+bool gPhysicalReceivedAvailable = false;
+bool gStrategyReceivedAvailable = false;
 bool gActive = false;
 bool gLoading = false;
 ULONGLONG gStarted = 0;
@@ -185,8 +235,17 @@ std::wstring gStatus;
 bool gRecordExported = false;
 volatile LONG gRecording = FALSE;
 volatile LONG gEventRecording = FALSE;
+volatile LONG gNativeHitActive = 0;
+volatile LONG gStatsDetaching = TRUE;
+#ifdef XA66_TEST
+int gStatsFailForward=-1,gStatsFailRestore=-1,gStatsForwardWrites=0,gStatsRestoreWrites=0;
+unsigned gStatsForwardFailure=0,gStatsRestoreFailure=0;
+#endif
 PhysicalActionState gPhysicalAction;
 unsigned long long gNextActionSerial = 0;
+uint64_t gDodgeGeneration = 0;
+std::array<uintptr_t,DodgeRoleCount> gDodgeFallbackTargets = {};
+std::vector<ReceivedCall> gReceivedFallbackCalls;
 
 uintptr_t CallTarget(const PeImage& image, const BYTE* instruction) {
     if (!instruction || instruction[0] != 0xE8) return 0;
@@ -258,7 +317,7 @@ bool ResolvePhysicalEvents(const PeImage& image, const BYTE* text, size_t textSi
             if (call[-4] == 0x55 && call[-3] == 0x8B && call[-2] == 0xEC && call[-1] == 0x51 &&
                 ((CompiledEngineProfile() == EngineProfileId::Ccz66 &&
                   call[5] == 0x8B && call[6] == 0x4D && call[7] == 0xFC) ||
-                 (CompiledEngineProfile() == EngineProfileId::Ccz65 &&
+                 ((CompiledEngineProfile() == EngineProfileId::Ccz65 || CompiledEngineProfile() == EngineProfileId::Ccz64) &&
                   call[5] == 0xFF && call[6] == 0x75 && call[7] == 0xFC)) &&
                 call[8] == 0xE8)
                 resultCalls.push_back(call);
@@ -362,7 +421,7 @@ bool ResolveStrategyTable(const PeImage& image, const BYTE* text, size_t textSiz
             if (image.InImage(dispatchTable, p[5]) &&
                 image.InImage(jumpTable, sizeof(uint32_t))) counts.push_back(p[5]);
         }
-        if (CompiledEngineProfile() == EngineProfileId::Ccz65) {
+        if (CompiledEngineProfile() == EngineProfileId::Ccz65 || CompiledEngineProfile() == EngineProfileId::Ccz64) {
             // 6.5 enumerates strategy IDs in a bounded local-byte loop.  Its
             // table accessor is the same as 6.6, but there is no 6.6 dispatch
             // table.  Prove the bound by linking that loop's local to this
@@ -393,6 +452,104 @@ bool ResolveStrategyTable(const PeImage& image, const BYTE* text, size_t textSiz
     return true;
 }
 
+#include "BattleStatsReceivedLayout.inl"
+
+bool ResolveDodgeLayout(const PeImage& image, DodgeLayout& output) {
+    output = DodgeLayout();
+    const bool v64 = CompiledEngineProfile() == EngineProfileId::Ccz64;
+    const bool v66 = CompiledEngineProfile() == EngineProfileId::Ccz66;
+    const uintptr_t delta = image.virtualBase - image.nt->OptionalHeader.ImageBase;
+    auto address = [delta](uintptr_t value) { return value + delta; };
+    auto call = [&](uintptr_t site, uintptr_t target, DodgeRole role, bool observe = true) {
+        const BYTE* code = image.At(address(site), 5);
+        if (!code || code[0] != 0xE8 || CallTarget(image, code) != address(target)) return false;
+        if (observe) output.calls.push_back({address(site), address(target), role});
+        return true;
+    };
+    auto bytes = [&](uintptr_t site, std::initializer_list<BYTE> expected) {
+        const BYTE* code = image.At(address(site), expected.size());
+        return code && !memcmp(code, expected.begin(), expected.size());
+    };
+    const uintptr_t final = v64 ? 0x43B4BA : 0x43B4B6;
+    const bool extended66 = v66 && CallTarget(image,image.At(address(0x43B4CA),5)) == address(0x43B600);
+    if (extended66 && (!bytes(0x43B600,{0x55,0x8B,0xEC,0x33,0xC0,0x50,0x51,0x83,0xEC,0x08}) ||
+        !call(0x43B62D,0x4E4000,DodgeFinal,false) || !bytes(0x43B632,{0x85,0xC0,0x75,0x1D}) ||
+        !bytes(0x43B4DA,{0x85,0xC0,0x74,0x56,0x83,0xF8,0x19}))) return false;
+    // Verify the ABI and the native final-return path. Never observe an inner
+    // RNG result: 6.4 applies an additional forced-result override afterwards.
+    if (!(v64 ? bytes(final,{0x55,0x8B,0xEC,0x83,0xEC,0x08}) :
+        bytes(final,{0x55,0x8B,0xEC,0x51,0x6A,0x01})) ||
+        !call(v64 ? 0x405E70 : 0x405E6D,v66 ? 0x43BC5A : 0x43BC62,DodgeFinal,false) ||
+        !call(0x452802,0x405DE1,DodgeFinal,false) ||
+        !bytes(0x405DE1,{0x55,0x8B,0xEC,0x83,0xEC}) ||
+        !bytes(0x425627,{0x55,0x8B,0xEC,0x51,0xFF,0x75,0x0C,0xFF,0x75,0x08}) ||
+        !call(0x43BD1F,final,DodgeFinal) ||
+        !call(v66 ? 0x43C08F : 0x43C084,final,DodgeFinal)) return false;
+    output.strategyDirect = {address(v66 ? 0x42327A : 0x42327B),
+        address(v66 ? 0x4235D7 : 0x4235D5),address(v66 ? 0x423ADC : 0x423ADF)};
+    for (uintptr_t site : output.strategyDirect)
+        if (!call(site-delta,final,DodgeFinal)) return false;
+    // The fourth direct call belongs to recovery. Verify it, but leave it
+    // unpatched so healing and friendly support cannot become dodge events.
+    if (!call(v66 ? 0x424770 : 0x424778,final,DodgeFinal,false)) return false;
+    const uintptr_t calc = v66 ? 0x43C01D : 0x43C022;
+    const std::pair<uintptr_t,int> v65Calcs[] = {{0x4231A4,8},{0x4235FE,4},
+        {0x42435F,12},{v64 ? 0x42448Au : 0x424485u,8},{0x424637,4}};
+    const std::pair<uintptr_t,int> v66Calcs[] = {{0x423622,4},{0x42433E,12},
+        {0x424467,8},{0x424636,4}};
+    auto addCalc = [&](std::pair<uintptr_t,int> entry) {
+        if (!call(entry.first,calc,DodgeFinal,false)) return false;
+        output.strategyCalcs.push_back({address(entry.first+5),entry.second});
+        return true;
+    };
+    if (v66) { for (const auto& entry : v66Calcs) if (!addCalc(entry)) return false; }
+    else { for (const auto& entry : v65Calcs) if (!addCalc(entry)) return false; }
+    output.strategyActions = {address(v66 ? 0x4179DF : 0x4179DD),
+        address(v64 ? 0x405BC8 : 0x41C0FE)};
+    for (uintptr_t site : output.strategyActions)
+        if (!call(site-5-delta,0x425627,DodgeFinal,false)) return false;
+    if (!call(0x43B63C,v66 ? 0x4E4060 : 0x47EF3D,DodgePhysicalValid) ||
+        !call(0x43B79F,0x42044D,DodgeStrategyValid)) return false;
+    if (!v64 && !call(v66 ? (extended66 ? 0x43B61E : 0x43B62D) : 0x43B625,0x43BA9D,DodgePhysicalImmune))
+        return false;
+    if (!v64 && !call(v66 ? 0x43B7E7 : 0x43B8E9,0x42F86A,DodgeStrategyImmune))
+        return false;
+    if (v64 && !call(0x43B8D5,0x406610,DodgeStrategyPerson)) return false;
+    // A native strategy rule can reject a target after the general
+    // applicability check. Observe its zero-rate commit rather than infer a
+    // dodge from the final false return or repeat any of its native queries.
+    if (!bytes(0x43B968,{0x88,0x45,0xF0,0xEB,0x17})) return false;
+    output.calls.push_back({address(0x43B968),0,DodgeStrategyForcedZero});
+    output.base = address(0x400000);
+    output.finalHit = address(final);
+    output.physicalCalcReturn = address(v64 ? 0x405E75 : 0x405E72);
+    if (!call(v64 ? 0x43B4CE : 0x43B4CA,v66 ? (extended66 ? 0x43B600 : 0x43B617) : (v64 ? 0x43B60B : 0x43B600),DodgeFinal,false) ||
+        !call(0x43B4D5,v66 ? 0x43B730 : 0x43B6F3,DodgeFinal,false) ||
+        !bytes(v64 ? 0x4322A0 : (v66 && !extended66 ? 0x43B529 : 0x43B534),
+            v64 ? std::initializer_list<BYTE>{0x89,0xEC,0x5D,0xC2,0x0C,0x00} :
+                  std::initializer_list<BYTE>{0x8B,0xE5,0x5D,0xC2,0x0C,0x00})) return false;
+    if (v64) {
+        const BYTE* jump = image.At(address(0x43B506),5);
+        int32_t displacement = 0;
+        if (!jump || jump[0] != 0xE9) return false;
+        memcpy(&displacement,jump+1,4);
+        if (address(0x43B50B)+displacement != address(0x43225A)) return false;
+    }
+    if (!bytes(v66 ? 0x424454 : (v64 ? 0x424477 : 0x424472),
+        v66 ? std::initializer_list<BYTE>{0xB0,0x36,0xEB,0x02,0xB0,0x2E,0x6A,0x00} :
+              std::initializer_list<BYTE>{0xB0,0x26,0xEB,0x02,0xB0,0x21,0x6A,0x00})) return false;
+    // An added final-hit caller is an unreviewed execution path. Disable this
+    // capability as a whole until it has an explicit semantic classification.
+    const BYTE* text = nullptr; size_t textSize = 0;
+    if (!image.ExecutableRange(text,textSize)) return false;
+    unsigned finalCalls = 0;
+    for (size_t index=0;index+5<=textSize;++index)
+        if (text[index] == 0xE8 && CallTarget(image,text+index) == output.finalHit) ++finalCalls;
+    if (finalCalls != 6) return false;
+    output.available = true;
+    return true;
+}
+
 bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout& result) {
     PeImage image;
     if (!image.Open(imageBytes, virtualBase)) return false;
@@ -414,6 +571,23 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
                 damageSites.push_back(image.Address(p + 7));
                 if (!hpSetter) hpSetter = target;
                 else if (hpSetter != target) return false;
+            }
+        }
+        if (CompiledEngineProfile()==EngineProfileId::Ccz64 && i+47<=textSize) {
+            // Xisui records the first victim's damage in a global total before
+            // passing (HP - result[index]) to the same clamping setter.
+            const BYTE before[]={0x8B,0x4D,0xE0,0xE8};
+            const BYTE results[]={0x8B,0x4D,0xF8,0x8B,0x55,0xF4,0x8B,0x94,0x8A,0x84,0,0,0,0x85,0xC9,0x75,6,0x01,0x15};
+            const BYTE subtract[]={0x2B,0xC2,0x50,0x8B,0x4D,0xE0,0xE8};
+            uint32_t total=0; memcpy(&total,p+27,4);
+            if (!memcmp(p,before,sizeof(before)) && !memcmp(p+8,results,sizeof(results)) &&
+                !memcmp(p+31,subtract,sizeof(subtract)) && image.InImage(total,4) &&
+                ValidateHpSetter(image,CallTarget(image,p+37)) &&
+                p[42]==0x8B && p[43]==0x4D && p[44]==0xE0 && p[45]==0xE8) {
+                const uintptr_t target=CallTarget(image,p+37);
+                damageSites.push_back(image.Address(p+37));
+                if (!hpSetter) hpSetter=target;
+                else if(hpSetter!=target) return false;
             }
         }
         if (p[0] == 0x8B && p[1] == 0x4D && p[2] == 0xFC &&
@@ -461,8 +635,10 @@ bool ResolveLayout(const BYTE* imageBytes, uintptr_t virtualBase, ResolvedLayout
         result.callSites[3] = recoverySites[1];
     }
     ResolvePhysicalEvents(image, text, textSize, result);
+    ResolveDodgeLayout(image, result.dodge);
+    ResolveReceivedLayout(image,result.received);
     return std::any_of(result.callSites.begin(), result.callSites.end(),
-        [](uintptr_t site) { return site != 0; }) || result.physicalEvents;
+        [](uintptr_t site) { return site != 0; }) || result.physicalEvents || result.dodge.available;
 }
 
 bool ReadBytes(uintptr_t address, void* output, size_t size) {
@@ -477,15 +653,44 @@ bool ReadBytes(uintptr_t address, void* output, size_t size) {
     return okay;
 }
 
-bool WriteCode(BYTE* address, const BYTE* bytes, size_t size) {
-    DWORD protection = 0;
-    if (!address || !bytes || !size ||
-        !VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &protection)) return false;
-    memcpy(address, bytes, size);
-    FlushInstructionCache(GetCurrentProcess(), address, size);
-    DWORD ignored = 0;
-    VirtualProtect(address, size, protection, &ignored);
+bool PreparePatchMemory(CodePatch& patch) {
+    MEMORY_BASIC_INFORMATION memory={};
+    if (!patch.site || !patch.length || patch.length>patch.current.size() ||
+        !VirtualQuery(patch.site,&memory,sizeof(memory)) || memory.State!=MEM_COMMIT ||
+        !ReadBytes(reinterpret_cast<uintptr_t>(patch.site),patch.current.data(),patch.length)) return false;
+    patch.protection=memory.Protect;
+    patch.protectionKnown=patch.currentKnown=true;
     return true;
+}
+
+bool WriteCode(CodePatch& patch, const BYTE* bytes, bool restoring=false) {
+    unsigned failure=0;
+#ifdef XA66_TEST
+    int& writes=restoring ? gStatsRestoreWrites : gStatsForwardWrites;
+    if (writes++==(restoring ? gStatsFailRestore : gStatsFailForward))
+        failure=restoring ? gStatsRestoreFailure : gStatsForwardFailure;
+#else
+    (void)restoring;
+#endif
+    DWORD protection=0;
+    if (!patch.protectionKnown || failure==1 ||
+        !VirtualProtect(patch.site,patch.length,PAGE_EXECUTE_READWRITE,&protection)) return false;
+    patch.attempted=true;
+    patch.protectionPending=true;
+    bool copied=false;
+    __try { memcpy(patch.site,bytes,patch.length);copied=true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) {}
+    DWORD ignored=0;
+    const bool protectedAgain=failure!=2 &&
+        VirtualProtect(patch.site,patch.length,patch.protection,&ignored)!=FALSE;
+    patch.protectionPending=!protectedAgain;
+    const bool flushed=failure!=3 &&
+        FlushInstructionCache(GetCurrentProcess(),patch.site,patch.length)!=FALSE;
+    patch.cachePending=!flushed;
+    patch.currentKnown=ReadBytes(reinterpret_cast<uintptr_t>(patch.site),patch.current.data(),patch.length);
+    patch.installed=patch.currentKnown && !memcmp(patch.current.data(),patch.patched.data(),patch.length);
+    return copied && protectedAgain && flushed && patch.currentKnown &&
+        !memcmp(patch.current.data(),bytes,patch.length);
 }
 
 void* ReachableTarget(BYTE* instruction, uintptr_t target, void*& allocation) {
@@ -511,7 +716,10 @@ void* ReachableTarget(BYTE* instruction, uintptr_t target, void*& allocation) {
             memcpy(thunk + 1, &absolute, sizeof(absolute));
             thunk[5] = 0xFF;
             thunk[6] = 0xE0;
-            FlushInstructionCache(GetCurrentProcess(), thunk, 7);
+            if (!FlushInstructionCache(GetCurrentProcess(),thunk,7)) {
+                VirtualFree(thunk,0,MEM_RELEASE);
+                return nullptr;
+            }
             allocation = thunk;
             return thunk;
         }
@@ -528,6 +736,7 @@ bool PrepareCallPatch(const PeImage& image, uintptr_t address, uintptr_t expecte
     patch.site = site;
     patch.length = 5;
     memcpy(patch.original.data(), site, patch.length);
+    if (!PreparePatchMemory(patch)) return false;
     void* target = ReachableTarget(site, bridge, patch.thunk);
     if (!target) return false;
     patch.patched[0] = 0xE8;
@@ -547,6 +756,7 @@ bool PrepareCriticalPatch(uintptr_t address, uint32_t offset, uintptr_t bridge,
     patch.site = site;
     patch.length = sizeof(expected);
     memcpy(patch.original.data(), site, patch.length);
+    if (!PreparePatchMemory(patch)) return false;
     std::fill(patch.patched.begin(), patch.patched.end(), static_cast<BYTE>(0x90));
     void* target = ReachableTarget(site, bridge, patch.thunk);
     if (!target) return false;
@@ -559,7 +769,7 @@ bool PrepareCriticalPatch(uintptr_t address, uint32_t offset, uintptr_t bridge,
 bool InstallCodePatch(CodePatch& patch) {
     if (!patch.site || !patch.length || patch.length > patch.original.size() ||
         memcmp(patch.site, patch.original.data(), patch.length) ||
-        !WriteCode(patch.site, patch.patched.data(), patch.length)) return false;
+        !WriteCode(patch,patch.patched.data())) return false;
     patch.installed = true;
     return true;
 }
@@ -567,11 +777,15 @@ bool InstallCodePatch(CodePatch& patch) {
 bool RestoreCodePatch(CodePatch& patch) {
     if (!patch.site) return true;
     bool restored = true;
-    if (patch.installed) {
-        if (!memcmp(patch.site, patch.patched.data(), patch.length))
-            restored = WriteCode(patch.site, patch.original.data(), patch.length);
-        else if (memcmp(patch.site, patch.original.data(), patch.length))
-            restored = false;
+    if (patch.attempted || patch.protectionPending || patch.cachePending) {
+        std::array<BYTE,16> actual={};
+        if (!ReadBytes(reinterpret_cast<uintptr_t>(patch.site),actual.data(),patch.length) ||
+            (memcmp(actual.data(),patch.original.data(),patch.length) &&
+                (!patch.currentKnown || memcmp(actual.data(),patch.current.data(),patch.length)))) return false;
+        restored=WriteCode(patch,patch.original.data(),true);
+        if (restored) {
+            patch.installed=patch.attempted=false;
+        }
     }
     if (patch.thunk && restored) {
         VirtualFree(patch.thunk, 0, MEM_RELEASE);
@@ -617,6 +831,8 @@ uint32_t AvailableMetricsUnlocked() {
     if (gComboAvailable) mask |= BattleStatsCombo;
     if (gAttackBlockAvailable) mask |= BattleStatsAttackBlock;
     if (gSpellBlockAvailable) mask |= BattleStatsSpellBlock;
+    if (gPhysicalReceivedAvailable) mask |= BattleStatsPhysicalReceived;
+    if (gStrategyReceivedAvailable) mask |= BattleStatsStrategyReceived;
     return mask;
 }
 
@@ -643,6 +859,7 @@ BattleUnitTotals& TotalsForPersonUnlocked(std::map<int, BattleUnitTotals>& ledge
 
 void AddMetricUnlocked(int slot, long long BattleUnitTotals::* metric,
     long long amount, uint32_t known) {
+    if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     int personId = -1;
     if (amount <= 0 || !UnitPersonId(slot, personId)) return;
     BattleUnitTotals* local = &TotalsForPersonUnlocked(gTotals, personId, slot);
@@ -656,6 +873,7 @@ void AddMetricUnlocked(int slot, long long BattleUnitTotals::* metric,
 }
 
 void AddDefeatUnlocked(int slot) {
+    if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     int personId = -1;
     if (!UnitPersonId(slot, personId)) return;
     BattleUnitTotals* local = &TotalsForPersonUnlocked(gTotals, personId, slot);
@@ -706,6 +924,32 @@ bool ResolveSettlementActor(int kind, uintptr_t callerFrame,
     }
 }
 
+std::wstring CsvRecordField(const std::wstring& value) {
+    if (value.find_first_of(L",\"\r\n") == std::wstring::npos) return value;
+    std::wstring escaped = L"\"";
+    for (const wchar_t character : value) {
+        if (character == L'\"') escaped += L'\"';
+        escaped += character;
+    }
+    escaped += L'\"';
+    return escaped;
+}
+
+bool WriteUtf16Record(const std::wstring& path, const std::wstring& output) {
+    if (output.size() > MAXDWORD / sizeof(wchar_t)) return false;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const wchar_t bom = 0xFEFF;
+    DWORD written = 0;
+    const DWORD size = static_cast<DWORD>(output.size() * sizeof(wchar_t));
+    bool okay = WriteFile(file, &bom, sizeof(bom), &written, nullptr) && written == sizeof(bom);
+    okay = okay && WriteFile(file, output.data(), size, &written, nullptr) && written == size && FlushFileBuffers(file);
+    okay = CloseHandle(file) != FALSE && okay;
+    if (!okay) DeleteFileW(path.c_str());
+    return okay;
+}
+
 void ExportCurrentRecordUnlocked() {
     if (gLoading || gRecordExported || gTotals.empty() || gRoot.empty()) return;
     const std::wstring privateRoot = PatchPrivatePath(gRoot, CompiledEngineProfile());
@@ -716,41 +960,72 @@ void ExportCurrentRecordUnlocked() {
     SYSTEMTIME time = {};
     GetLocalTime(&time);
     wchar_t name[96] = {};
-    swprintf_s(name, L"\\%04u%02u%02u-%02u%02u%02u-%03u.txt", time.wYear, time.wMonth,
+    swprintf_s(name, L"\\%04u%02u%02u-%02u%02u%02u-%03u", time.wYear, time.wMonth,
         time.wDay, time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
     std::wstring output = L"战斗记录\r\n剧本：" + gScenario + L"\r\n持续时间：" +
-        std::to_wstring(gElapsed / 1000) + L" 秒\r\n\r\n";
+        std::to_wstring(gElapsed / 1000) + L" 秒\r\n历史不完整：" +
+        (gHistoryIncomplete ? L"是" : L"否") + L"\r\n\r\n";
+    std::wstring csv = L"剧本,战役编号,战场实例,人物编号,单位,造成伤害,承受伤害,回复量,暴击次数,连击次数,攻击闪避,策略闪避,击退敌军,物理受击,策略受击,历史不完整\r\n";
     const uint32_t metrics = gKnownMetrics | AvailableMetricsUnlocked();
     for (const auto& pair : gTotals) {
         const auto& unit = pair.second;
-        output += (unit.label.empty() ? L"我方角色 " + std::to_wstring(unit.personId) : unit.label) + L"\r\n";
-        auto metric = [&](uint32_t bit, const wchar_t* label, long long value) {
-            if (metrics & bit) output += std::wstring(L"  ") + label + L"：" + std::to_wstring(value) + L"\r\n";
+        const std::wstring label = unit.label.empty() ? L"我方角色 " + std::to_wstring(unit.personId) : unit.label;
+        output += label + L"\r\n";
+        csv += CsvRecordField(gScenario) + L"," + std::to_wstring(gCampaignId) + L"," +
+            std::to_wstring(gBattleInstance) + L"," + std::to_wstring(unit.personId) + L"," + CsvRecordField(label);
+        auto metric = [&](uint32_t bit, const wchar_t* heading, long long value, bool available = true) {
+            const bool known = available && (metrics & bit) != 0;
+            const std::wstring text = known ? std::to_wstring(value) : L"--";
+            if (known || bit == BattleStatsPhysicalReceived || bit == BattleStatsStrategyReceived)
+                output += std::wstring(L"  ") + heading + L"：" + text + L"\r\n";
+            csv += L"," + text;
         };
         metric(BattleStatsDamageDealt, L"造成伤害", unit.damageDealt);
         metric(BattleStatsDamageReceived, L"承受伤害", unit.damageReceived);
         metric(BattleStatsRecovery, L"回复量", unit.recoveryDone);
         metric(BattleStatsCritical, L"暴击次数", unit.criticalCount);
         metric(BattleStatsCombo, L"连击次数", unit.comboExtraHitCount);
-        metric(BattleStatsAttackBlock, L"攻击格挡", unit.attackBlockCount);
-        metric(BattleStatsSpellBlock, L"法术格挡", unit.spellBlockCount);
+        metric(BattleStatsAttackBlock, L"攻击闪避", unit.attackBlockCount);
+        metric(BattleStatsSpellBlock, L"策略闪避", unit.spellBlockCount);
+        metric(BattleStatsDefeatedEnemies, L"击退敌军", unit.defeatedEnemies);
+        metric(BattleStatsPhysicalReceived, L"物理受击", unit.physicalReceivedCount, gPhysicalReceivedAvailable);
+        metric(BattleStatsStrategyReceived, L"策略受击", unit.strategyReceivedCount, gStrategyReceivedAvailable);
+        csv += gHistoryIncomplete ? L",是\r\n" : L",否\r\n";
     }
-    HANDLE file = CreateFileW((folder + name).c_str(), GENERIC_WRITE, 0, nullptr,
-        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    const wchar_t bom = 0xFEFF;
-    DWORD written = 0;
-    const DWORD size = static_cast<DWORD>(output.size() * sizeof(wchar_t));
-    bool okay = WriteFile(file, &bom, sizeof(bom), &written, nullptr) && written == sizeof(bom);
-    okay = okay && WriteFile(file, output.data(), size, &written, nullptr) && written == size && FlushFileBuffers(file);
-    okay = CloseHandle(file) != FALSE && okay;
-    if (okay) gRecordExported = true;
+    const std::wstring textPath = folder + name + L".txt";
+    if (!WriteUtf16Record(textPath, output)) return;
+    if (!WriteUtf16Record(folder + name + L".csv", csv)) {
+        DeleteFileW(textPath.c_str());
+        return;
+    }
+    gRecordExported = true;
 }
 
-void ClearTotalsUnlocked() {
+bool gAwaitingSceneReady = false;
+
+void TraceLedgerUnlocked(const wchar_t* stage, const wchar_t* reason = L"") noexcept {
+    try {
+        BattleStatsPersistedState state;
+        state.scenarioOrdinal = gScenarioOrdinal;
+        state.campaignId = gCampaignId;
+        state.battleInstance = gBattleInstance;
+        state.knownMetrics = gKnownMetrics;
+        state.historyIncomplete = gHistoryIncomplete;
+        state.active = gActive;
+        state.elapsedMilliseconds = ElapsedUnlocked(GetTickCount64());
+        state.scenario = gScenario;
+        for (const auto& pair : gTotals) state.units.push_back(pair.second);
+        for (const auto& pair : gCampaignTotals) state.campaignUnits.push_back(pair.second);
+        RecordStatsDiagnostic(0, stage, L"", &state, reason);
+    } catch (...) {}
+}
+
+void ClearTotalsUnlocked(const wchar_t* reason = L"model-initialization") {
+    TraceLedgerUnlocked(L"reset_before", reason);
     gTotals.clear();
     gCampaignTotals.clear();
     gLabels.clear();
+    ++gDodgeGeneration;
     gPhysicalAction = PhysicalActionState();
     gNextActionSerial = 0;
     gActive = false;
@@ -765,9 +1040,12 @@ void ClearTotalsUnlocked() {
     gHistoryIncomplete = false;
     gStatus.clear();
     gRecordExported = false;
+    gAwaitingSceneReady = false;
+    TraceLedgerUnlocked(L"reset_after", reason);
 }
 
 void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int oldHp, int finalHp) {
+    if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     if (InterlockedCompareExchange(&gRecording, TRUE, FALSE) != FALSE) return;
     ScopedRecording recording(&gRecording);
     int targetSlot = -1;
@@ -822,6 +1100,7 @@ bool ReadPhysicalEvent(uintptr_t context, uint32_t comboOffset, bool requireTarg
 }
 
 void RecordPhysicalResultStart(uintptr_t context) {
+    if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     if (InterlockedCompareExchange(&gEventRecording, TRUE, FALSE) != FALSE) return;
     ScopedRecording recording(&gEventRecording);
     int actorSlot = -1;
@@ -836,6 +1115,7 @@ void RecordPhysicalResultStart(uintptr_t context) {
                 gPhysicalAction = PhysicalActionState();
                 gPhysicalAction.context = context;
                 gPhysicalAction.serial = ++gNextActionSerial;
+                gPhysicalAction.generation = gDodgeGeneration;
                 gPhysicalAction.actorSlot = actorSlot;
             } else if (gComboAvailable && gPhysicalAction.context == context &&
                 gPhysicalAction.actorSlot == actorSlot &&
@@ -852,6 +1132,7 @@ void RecordPhysicalResultStart(uintptr_t context) {
 }
 
 void RecordCriticalCommit(uintptr_t context) {
+    if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     if (InterlockedCompareExchange(&gEventRecording, TRUE, FALSE) != FALSE) return;
     ScopedRecording recording(&gEventRecording);
     int actorSlot = -1;
@@ -903,6 +1184,244 @@ void RecordBlockResult(BlockKind kind, int attackerSlot, int targetSlot) {
     }
 }
 
+
+// Layout of PUSHFD/PUSHAD at the CALL bridge. The native function receives
+// its original ECX and stack arguments exactly once. Its complete register
+// and EFLAGS result is copied back before returning to the game.
+struct NativeHitSnapshot {
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax, flags;
+    uintptr_t returnAddress;
+    uint32_t args[4];
+};
+static_assert(offsetof(NativeHitSnapshot, args) == 40, "x86 snapshot ABI");
+struct HitObservation {
+    HitObservation* previous = nullptr;
+    uintptr_t attacker = 0, target = 0, nativeCallerFrame = 0;
+    BYTE strategyId = 0;
+    int actorSlot = -1, targetSlot = -1, personId = -1;
+    uint64_t generation = 0;
+    bool strategy = false, eligible = false, excluded = false, applicabilitySeen = false;
+};
+__declspec(thread) HitObservation* gHitObservation = nullptr;
+extern "C" void __cdecl BattleStatsInvokeNative(NativeHitSnapshot*, uintptr_t, unsigned);
+
+bool FrameWord(uintptr_t frame, int offset, uintptr_t& value) {
+    return frame && !(frame & 3) && ReadBytes(frame + offset, &value, sizeof(value));
+}
+#include "BattleStatsReceivedObservers.inl"
+
+bool ContextMatches(uintptr_t context, const NativeHitSnapshot& snapshot, bool strategy,
+    bool randomSubstrategy) {
+    uintptr_t actor = 0;
+    BYTE actorSlot = 0xFF, targetSlot = 0xFF, strategyId = 0xFF;
+    int actualActor = -1, actualTarget = -1;
+    if (!context || !UnitSlotFromPointer(snapshot.ecx, actualActor) ||
+        !UnitSlotFromPointer(snapshot.args[0], actualTarget) ||
+        !ReadBytes(context + (strategy ? 8 : 12), &actor, sizeof(actor)) || actor != snapshot.ecx ||
+        !ReadBytes(context + (strategy ? 1 : 0), &actorSlot, 1) || actorSlot != actualActor ||
+        !ReadBytes(context + (strategy ? 12 : 1), &targetSlot, 1) || targetSlot != actualTarget)
+        return false;
+    if (!strategy) return snapshot.args[1] == 1;
+    if (snapshot.args[1] != 2 || !ReadBytes(context, &strategyId, 1)) return false;
+    const bool v66 = CompiledEngineProfile() == EngineProfileId::Ccz66;
+    const BYTE actualStrategy = static_cast<BYTE>(snapshot.args[2]);
+    return actualStrategy == strategyId || (randomSubstrategy &&
+        (actualStrategy == (v66 ? 0x2E : 0x21) || actualStrategy == (v66 ? 0x36 : 0x26)));
+}
+
+bool IsRealHitContext(const NativeHitSnapshot& snapshot, bool& strategy) {
+    const DodgeLayout& layout = gLayout.dodge;
+    if (!layout.available) return false;
+    const uintptr_t base = layout.base;
+    const auto at = [base](uintptr_t preferred) { return base + preferred - 0x400000; };
+    uintptr_t frame = snapshot.ebp, caller = 0, parent = 0, context = 0;
+    const uintptr_t site = snapshot.returnAddress - 5;
+    strategy = site != at(0x43BD1F);
+    if (!strategy) {
+        return snapshot.args[1] == 1 && FrameWord(frame,4,caller) && caller == layout.physicalCalcReturn &&
+            FrameWord(frame,0,parent) && parent > frame && parent-frame < 0x10000 &&
+            FrameWord(parent,4,caller) && caller == at(0x452807) &&
+            FrameWord(parent,-12,context) && ContextMatches(context,snapshot,false,false);
+    }
+    bool random = false;
+    const bool calc = site == at(CompiledEngineProfile() == EngineProfileId::Ccz66 ?
+        0x43C08F : 0x43C084);
+    if (calc) {
+        if (!FrameWord(frame,4,caller) || !FrameWord(frame,0,parent) ||
+            parent <= frame || parent-frame >= 0x10000) return false;
+        const auto found = std::find_if(layout.strategyCalcs.begin(),layout.strategyCalcs.end(),
+            [caller](const std::pair<uintptr_t,int>& entry) { return entry.first == caller; });
+        if (found == layout.strategyCalcs.end() || !FrameWord(parent,-found->second,context)) return false;
+        const uintptr_t randomReturn = at(CompiledEngineProfile() == EngineProfileId::Ccz66 ?
+            0x42446C : (CompiledEngineProfile() == EngineProfileId::Ccz64 ? 0x42448F : 0x42448A));
+        random = caller == randomReturn;
+        frame = parent;
+    } else {
+        const auto found = std::find(layout.strategyDirect.begin(),layout.strategyDirect.end(),site);
+        if (found == layout.strategyDirect.end()) return false;
+        const int local = found == layout.strategyDirect.begin() ? 8 : 4;
+        if (!FrameWord(frame,-local,context)) return false;
+    }
+    if (!ContextMatches(context,snapshot,true,random)) return false;
+    // Start at the game's saved EBP, never at one of our C++ frames. Require
+    // the same context to belong to an actual native execution entry. An AI
+    // forecast re-entered from a message pump cannot satisfy the immediate
+    // calculation caller and this context identity together.
+    for (unsigned depth = 0; depth < 12; ++depth) {
+        if (!FrameWord(frame,4,caller)) return false;
+        // The animation observer owns an actual native entry's return slot
+        // while its scope is live. Recover only that exact TLS-owned slot;
+        // the original native caller and context must still pass below.
+        uintptr_t nativeCaller = 0;
+        if (ResolveNativeAnimationReturn(frame + sizeof(uintptr_t),caller,nativeCaller))
+            caller = nativeCaller;
+        if (std::find(layout.strategyActions.begin(),layout.strategyActions.end(),caller) !=
+            layout.strategyActions.end()) {
+            uintptr_t actionContext = 0;
+            return FrameWord(frame,-4,actionContext) && actionContext == context;
+        }
+        if (!FrameWord(frame,0,parent) || parent <= frame || parent-frame >= 0x10000) return false;
+        frame = parent;
+    }
+    return false;
+}
+
+void BeginHitObservation(NativeHitSnapshot& snapshot, HitObservation& observation) {
+    observation.previous = gHitObservation;
+    observation.attacker = snapshot.ecx;
+    observation.target = snapshot.args[0];
+    observation.nativeCallerFrame = snapshot.ebp;
+    observation.strategyId = static_cast<BYTE>(snapshot.args[2]);
+    int actorCamp = -1, targetCamp = -1;
+    observation.eligible = IsRealHitContext(snapshot,observation.strategy) &&
+        UnitSlotFromPointer(observation.attacker,observation.actorSlot) &&
+        UnitSlotFromPointer(observation.target,observation.targetSlot) &&
+        UnitCamp(observation.actorSlot,actorCamp) && actorCamp >= 2 &&
+        UnitCamp(observation.targetSlot,targetCamp) && targetCamp == 0 &&
+        UnitPersonId(observation.targetSlot,observation.personId);
+    {
+        ScopedStatsLock lock(false);
+        observation.generation = gDodgeGeneration;
+        observation.eligible = observation.eligible && gActive && !gLoading &&
+            (observation.strategy ? gSpellBlockAvailable : gAttackBlockAvailable);
+    }
+    gHitObservation = &observation;
+}
+void CommitHitObservation(const NativeHitSnapshot& snapshot, const HitObservation& observation) {
+    if (snapshot.eax != 0 || !observation.eligible || observation.excluded ||
+        !observation.applicabilitySeen) return;
+    try {
+        ScopedStatsLock lock;
+        int personId = -1, actorCamp = -1, targetCamp = -1;
+        if (!gActive || gLoading || observation.generation != gDodgeGeneration ||
+            !UnitPersonId(observation.targetSlot,personId) || personId != observation.personId ||
+            !UnitCamp(observation.actorSlot,actorCamp) || actorCamp < 2 ||
+            !UnitCamp(observation.targetSlot,targetCamp) || targetCamp != 0) return;
+        AddMetricUnlocked(observation.targetSlot, observation.strategy ?
+            &BattleUnitTotals::spellBlockCount : &BattleUnitTotals::attackBlockCount,
+            1, observation.strategy ? BattleStatsSpellBlock : BattleStatsAttackBlock);
+    } catch (...) {} // Accounting must never unwind through a game CALL.
+}
+void ObserveHitGate(DodgeRole role, const NativeHitSnapshot& snapshot,
+    uintptr_t originalEcx, const uint32_t* originalArgs) {
+    HitObservation* observation = gHitObservation;
+    if (!observation || !observation->eligible) return;
+    // Only gates directly inside this native final judgment are evidence.
+    // A forecast re-entering the rate function while a custom callback pumps
+    // messages must not contaminate an outer real judgment's exclusions.
+    uintptr_t finalFrame = 0, callerFrame = 0, rateReturn = 0;
+    const uintptr_t expectedReturn = gLayout.dodge.base +
+        (observation->strategy ? 0x3B4DA :
+            (CompiledEngineProfile() == EngineProfileId::Ccz64 ? 0x3B4D3 : 0x3B4CF));
+    if (!FrameWord(snapshot.ebp,0,finalFrame) || !FrameWord(finalFrame,0,callerFrame) ||
+        callerFrame != observation->nativeCallerFrame ||
+        !FrameWord(snapshot.ebp,4,rateReturn) || rateReturn != expectedReturn) return;
+    const bool result = snapshot.eax != 0;
+    switch (role) {
+    case DodgePhysicalImmune:
+        if (!observation->strategy && originalArgs[0] == observation->target && !result)
+            observation->excluded = true;
+        break;
+    case DodgePhysicalValid:
+        if (!observation->strategy && originalEcx == observation->attacker &&
+            originalArgs[0] == observation->target) {
+            observation->applicabilitySeen = true;
+            if (!result) observation->excluded = true;
+        }
+        break;
+    case DodgeStrategyValid:
+        if (observation->strategy && static_cast<BYTE>(originalArgs[0]) == observation->strategyId &&
+            static_cast<BYTE>(originalArgs[1]) == observation->actorSlot &&
+            static_cast<BYTE>(originalArgs[2]) == observation->targetSlot) {
+            observation->applicabilitySeen = true;
+            if (!result) observation->excluded = true;
+        }
+        break;
+    case DodgeStrategyImmune:
+        if (observation->strategy && originalEcx == observation->target && result) {
+            uintptr_t bypass = 0;
+            // 6.6 bypasses this immunity for strategies whose already computed
+            // native 423CB3 property is nonzero. Do not call it a second time.
+            if (CompiledEngineProfile() != EngineProfileId::Ccz66 ||
+                !FrameWord(snapshot.ebp,-0x3C,bypass) || bypass == 0)
+                observation->excluded = true;
+        }
+        break;
+    case DodgeStrategyPerson:
+        if (observation->strategy && (snapshot.eax & 0xFF) == 0xFF)
+            observation->excluded = true;
+        break;
+    case DodgeStrategyForcedZero:
+        if (observation->strategy && (snapshot.eax & 0xFF) == 0) observation->excluded = true;
+        break;
+    default: break;
+    }
+}
+
+extern "C" void __cdecl BattleStatsDispatchHit(NativeHitSnapshot* snapshot, unsigned rawRole) {
+    InterlockedIncrement(&gNativeHitActive);
+    __try {
+    const DodgeRole role = static_cast<DodgeRole>(rawRole);
+    const bool detaching=InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE;
+    if (role == DodgeStrategyForcedZero) {
+        if (!detaching) ObserveHitGate(role,*snapshot,snapshot->ecx,snapshot->args);
+        return;
+    }
+    uintptr_t target=rawRole<DodgeRoleCount ? gDodgeFallbackTargets[rawRole] : 0;
+    if (!detaching) {
+        const DodgeLayout& layout=gLayout.dodge;
+        const uintptr_t site=snapshot->returnAddress-5;
+        const auto found=std::find_if(layout.calls.begin(),layout.calls.end(),
+            [site,role](const DodgeCall& call) { return call.site==site && call.role==role; });
+        if (found!=layout.calls.end()) target=found->target;
+    }
+    if (!target) return;
+    const unsigned argumentCount = role == DodgeStrategyValid ? 4 :
+        (role == DodgeStrategyImmune || role == DodgeStrategyPerson ? 0 : (role == DodgeFinal ? 3 : 1));
+    if (detaching) {
+        BattleStatsInvokeNative(snapshot,target,argumentCount);
+        return;
+    }
+    if (role != DodgeFinal) {
+        const uintptr_t ecx = snapshot->ecx;
+        uint32_t args[4]; memcpy(args,snapshot->args,sizeof(args));
+        BattleStatsInvokeNative(snapshot,target,argumentCount);
+        ObserveHitGate(role,*snapshot,ecx,args);
+        return;
+    }
+    HitObservation observation;
+    BeginHitObservation(*snapshot,observation);
+    __try {
+        BattleStatsInvokeNative(snapshot,target,argumentCount);
+        CommitHitObservation(*snapshot,observation);
+    } __finally {
+        gHitObservation = observation.previous;
+    }
+    } __finally {
+        InterlockedDecrement(&gNativeHitActive);
+    }
+}
+
 } // namespace
 
 extern "C" uintptr_t gBattleStatsOriginalSetHp = 0;
@@ -935,6 +1454,7 @@ extern "C" __declspec(naked) void BattleStatsHpBridgeCommon() {
         // new HP value as if it were the unit pointer.
         pushad
         pushfd
+        lock inc dword ptr [gNativeHitActive]
         sub esp, 8
 
         // After PUSHAD/PUSHFD/SUB, saved ECX is at +36 and the original
@@ -961,6 +1481,7 @@ extern "C" __declspec(naked) void BattleStatsHpBridgeCommon() {
         add esp, 20
 
         add esp, 8
+        lock dec dword ptr [gNativeHitActive]
         popfd
         popad
         add esp, 4
@@ -1000,18 +1521,28 @@ extern "C" __declspec(naked) void BattleStatsPhysicalResultBridge() {
     __asm {
         pushfd
         pushad
-        push ecx
+        lock inc dword ptr [gNativeHitActive]
+        mov eax,esp
+        push eax
+        call BattleStatsObservePhysicalEntry
+        add esp,4
+        push dword ptr [esp+24]
         call BattleStatsRecordPhysicalResult
-        add esp, 4
+        add esp,4
+        mov eax, dword ptr [gBattleStatsOriginalPhysicalResult]
+        mov dword ptr [esp+12],eax
+        lock dec dword ptr [gNativeHitActive]
         popad
         popfd
-        jmp dword ptr [gBattleStatsOriginalPhysicalResult]
+        push dword ptr [esp-24]
+        ret
     }
 }
 
 extern "C" __declspec(naked) void BattleStatsCriticalBridge() {
     __asm {
         pushfd
+        lock inc dword ptr [gNativeHitActive]
         add dword ptr [esp + 4], 5
         push edx
         mov edx, dword ptr [gBattleStatsCriticalOffset]
@@ -1022,20 +1553,202 @@ extern "C" __declspec(naked) void BattleStatsCriticalBridge() {
         call BattleStatsRecordCritical
         add esp, 4
         popad
+        lock dec dword ptr [gNativeHitActive]
         popfd
         ret
     }
 }
 
-void InitializeBattleStats(const wchar_t* gameRoot) {
-    ShutdownBattleStats();
-    gRoot = gameRoot ? gameRoot : L"";
-    ResetBattleStats();
-    HMODULE module = GetModuleHandleW(nullptr);
-    ResolvedLayout resolved;
-    if (!module || !ResolveLayout(reinterpret_cast<const BYTE*>(module),
-        reinterpret_cast<uintptr_t>(module), resolved)) return;
 
+extern "C" __declspec(naked) void __cdecl BattleStatsInvokeNative(NativeHitSnapshot*, uintptr_t, unsigned) {
+    __asm {
+        push ebp
+        mov ebp,esp
+        push ebx
+        push esi
+        push edi
+        push dword ptr [ebp+12]
+        push ebp
+        push dword ptr [ebp+8]
+        mov esi,dword ptr [ebp+8]
+        mov ecx,dword ptr [ebp+16]
+        test ecx,ecx
+        jz argumentsReady
+    argumentLoop:
+        push dword ptr [esi+ecx*4+36]
+        loop argumentLoop
+    argumentsReady:
+        // Remember argc in an otherwise unused private word underneath the
+        // copied arguments, then select the matching indirect CALL encoding.
+        cmp dword ptr [ebp+16],4
+        je callFour
+        cmp dword ptr [ebp+16],3
+        je callThree
+        cmp dword ptr [ebp+16],1
+        je callOne
+        push dword ptr [esi+32]
+        popfd
+        mov edi,[esi]
+        mov ebx,[esi+16]
+        mov edx,[esi+20]
+        mov ecx,[esi+24]
+        mov eax,[esi+28]
+        mov ebp,[esi+8]
+        mov esi,[esi+4]
+        call dword ptr [esp+8]
+        jmp captureResult
+    callOne:
+        push dword ptr [esi+32]
+        popfd
+        mov edi,[esi]
+        mov ebx,[esi+16]
+        mov edx,[esi+20]
+        mov ecx,[esi+24]
+        mov eax,[esi+28]
+        mov ebp,[esi+8]
+        mov esi,[esi+4]
+        call dword ptr [esp+12]
+        jmp captureResult
+    callThree:
+        push dword ptr [esi+32]
+        popfd
+        mov edi,[esi]
+        mov ebx,[esi+16]
+        mov edx,[esi+20]
+        mov ecx,[esi+24]
+        mov eax,[esi+28]
+        mov ebp,[esi+8]
+        mov esi,[esi+4]
+        call dword ptr [esp+20]
+        jmp captureResult
+    callFour:
+        push dword ptr [esi+32]
+        popfd
+        mov edi,[esi]
+        mov ebx,[esi+16]
+        mov edx,[esi+20]
+        mov ecx,[esi+24]
+        mov eax,[esi+28]
+        mov ebp,[esi+8]
+        mov esi,[esi+4]
+        call dword ptr [esp+24]
+    captureResult:
+        pushfd
+        pushad
+        mov ebp,[esp+40]
+        mov edi,[esp+36]
+        mov esi,esp
+        mov ecx,9
+        cld
+        rep movsd
+        lea esp,[ebp-12]
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+    }
+}
+#define HIT_BRIDGE(name,role,cleanup) \
+extern "C" __declspec(naked) void name() { __asm { pushfd } __asm { pushad } \
+    __asm { mov eax,esp } __asm { push role } __asm { push eax } \
+    __asm { call BattleStatsDispatchHit } __asm { add esp,8 } __asm { popad } \
+    __asm { popfd } __asm { ret cleanup } }
+HIT_BRIDGE(BattleStatsFinalHitBridge,DodgeFinal,12)
+HIT_BRIDGE(BattleStatsPhysicalImmuneBridge,DodgePhysicalImmune,4)
+HIT_BRIDGE(BattleStatsPhysicalValidBridge,DodgePhysicalValid,4)
+HIT_BRIDGE(BattleStatsStrategyValidBridge,DodgeStrategyValid,16)
+HIT_BRIDGE(BattleStatsStrategyImmuneBridge,DodgeStrategyImmune,0)
+HIT_BRIDGE(BattleStatsStrategyPersonBridge,DodgeStrategyPerson,0)
+#undef HIT_BRIDGE
+extern "C" __declspec(naked) void BattleStatsStrategyForcedZeroBridge() {
+    __asm {
+        pushfd
+        pushad
+        mov eax,esp
+        push DodgeStrategyForcedZero
+        push eax
+        call BattleStatsDispatchHit
+        add esp,8
+        popad
+        popfd
+        mov byte ptr [ebp-10h],al
+        pushfd
+        add dword ptr [esp+4],17h
+        popfd
+        ret
+    }
+}
+
+#include "BattleStatsReceivedBridges.inl"
+
+bool PrepareDodgeObservers(const PeImage& image, const DodgeLayout& resolved, RuntimeLayout& pending) {
+    pending.dodge = resolved;
+    pending.dodgePatches.reserve(resolved.calls.size());
+    const uintptr_t dodgeBridges[] = {
+        reinterpret_cast<uintptr_t>(&BattleStatsFinalHitBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsPhysicalImmuneBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsPhysicalValidBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsStrategyValidBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsStrategyImmuneBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsStrategyPersonBridge),
+        reinterpret_cast<uintptr_t>(&BattleStatsStrategyForcedZeroBridge)};
+    if (pending.dodge.available) {
+        for (const DodgeCall& call : pending.dodge.calls) {
+            CodePatch patch;
+            bool prepared = false;
+            if (call.role == DodgeStrategyForcedZero) {
+                patch.site = reinterpret_cast<BYTE*>(call.site); patch.length = 5;
+                memcpy(patch.original.data(),patch.site,5);
+                void* target = PreparePatchMemory(patch) ?
+                    ReachableTarget(patch.site,dodgeBridges[call.role],patch.thunk) : nullptr;
+                if (target) {
+                    patch.patched[0] = 0xE8;
+                    const int32_t displacement = static_cast<int32_t>(reinterpret_cast<BYTE*>(target)-(patch.site+5));
+                    memcpy(patch.patched.data()+1,&displacement,4);
+                    prepared = true;
+                }
+            } else {
+                prepared = PrepareCallPatch(image,call.site,call.target,dodgeBridges[call.role],patch);
+                gDodgeFallbackTargets[call.role] = call.target;
+            }
+            if (!prepared) {
+                pending.dodge.available = false;
+                break;
+            }
+            pending.dodgePatches.push_back(patch);
+        }
+    }
+
+    return pending.dodge.available;
+}
+
+bool InstallDodgeObservers(RuntimeLayout& pending) {
+    bool dodgeComplete = pending.dodge.available;
+    if (dodgeComplete) {
+        for (CodePatch& patch : pending.dodgePatches)
+            if (!InstallCodePatch(patch)) { dodgeComplete = false; break; }
+    }
+    return dodgeComplete;
+}
+
+bool RestoreRuntimeLayout(RuntimeLayout& layout) {
+    bool restored=true;
+    for (auto patch=layout.receivedPatches.rbegin();patch!=layout.receivedPatches.rend();++patch)
+        restored=RestoreCodePatch(*patch) && restored;
+    restored=RestoreCodePatch(layout.criticalCommit) && restored;
+    for (auto patch=layout.dodgePatches.rbegin();patch!=layout.dodgePatches.rend();++patch)
+        restored=RestoreCodePatch(*patch) && restored;
+    restored=RestoreCodePatch(layout.physicalResult) && restored;
+    for (auto patch=layout.settlements.rbegin();patch!=layout.settlements.rend();++patch)
+        restored=RestoreCodePatch(*patch) && restored;
+    layout.recoveryPending=!restored;
+    return restored;
+}
+
+static void InstallResolvedBattleStats(const PeImage& image, const ResolvedLayout& resolved) {
+    if (gLayout.recoveryPending) return;
+    InterlockedExchange(&gStatsDetaching,TRUE);
     RuntimeLayout pending;
     pending.hpSetter = resolved.hpSetter;
     pending.unitBase = resolved.unitBase;
@@ -1049,53 +1762,80 @@ void InitializeBattleStats(const wchar_t* gameRoot) {
         reinterpret_cast<uintptr_t>(&BattleStatsRecoveryBridge),
         reinterpret_cast<uintptr_t>(&BattleStatsRecoveryAnimatedBridge)
     };
-    PeImage image;
-    if (!image.Open(reinterpret_cast<const BYTE*>(module), reinterpret_cast<uintptr_t>(module)))
-        return;
-    for (size_t index = 0; index < pending.callSites.size(); ++index) {
+    for (size_t index = 0; index < pending.settlements.size(); ++index) {
         if (!resolved.callSites[index]) continue;
-        CodePatch patch;
         if (!PrepareCallPatch(image, resolved.callSites[index], resolved.hpSetter,
-            bridges[index], patch)) continue;
-        pending.callSites[index] = patch.site;
-        memcpy(pending.original[index].data(), patch.original.data(), 5);
-        memcpy(pending.patched[index].data(), patch.patched.data(), 5);
-        pending.thunks[index] = patch.thunk;
+            bridges[index],pending.settlements[index])) pending.settlements[index]=CodePatch();
     }
     if (resolved.physicalEvents) {
-        PrepareCallPatch(image, resolved.physicalResultCall, resolved.physicalResult,
-            reinterpret_cast<uintptr_t>(&BattleStatsPhysicalResultBridge), pending.physicalResult);
-        if (pending.physicalResult.site)
-            PrepareCriticalPatch(resolved.criticalCommit, resolved.criticalOffset,
-                reinterpret_cast<uintptr_t>(&BattleStatsCriticalBridge), pending.criticalCommit);
+        if (!PrepareCallPatch(image,resolved.physicalResultCall,resolved.physicalResult,
+            reinterpret_cast<uintptr_t>(&BattleStatsPhysicalResultBridge),pending.physicalResult))
+            pending.physicalResult=CodePatch();
+        if (pending.physicalResult.site && !PrepareCriticalPatch(resolved.criticalCommit,resolved.criticalOffset,
+            reinterpret_cast<uintptr_t>(&BattleStatsCriticalBridge),pending.criticalCommit))
+            pending.criticalCommit=CodePatch();
     }
+
+    PrepareDodgeObservers(image,resolved.dodge,pending);
+    PrepareReceivedObservers(image,resolved.received,pending);
 
     gBattleStatsOriginalSetHp = pending.hpSetter;
     gBattleStatsOriginalPhysicalResult = resolved.physicalResult;
     gBattleStatsCriticalOffset = resolved.criticalOffset;
-    for (size_t index = 0; index < pending.callSites.size(); ++index) {
-        if (!pending.callSites[index]) continue;
-        if (memcmp(pending.callSites[index], pending.original[index].data(), 5) ||
-            !WriteCode(pending.callSites[index], pending.patched[index].data(), 5)) continue;
-        pending.installed[index] = true;
+    bool writeFailed=false;
+    for (CodePatch& patch:pending.settlements) {
+        if (patch.site && !InstallCodePatch(patch)) { writeFailed=true;break; }
     }
-    const bool recoveryComplete = pending.callSites[0] && pending.callSites[1] &&
-        pending.callSites[2] && pending.callSites[3] && pending.installed[0] &&
-        pending.installed[1] && pending.installed[2] && pending.installed[3];
-    InstallCodePatch(pending.physicalResult);
-    if (pending.physicalResult.installed) InstallCodePatch(pending.criticalCommit);
-
+    if (!writeFailed && pending.physicalResult.site) writeFailed=!InstallCodePatch(pending.physicalResult);
+    if (!writeFailed && pending.physicalResult.installed && pending.criticalCommit.site)
+        writeFailed=!InstallCodePatch(pending.criticalCommit);
+    bool dodgeComplete=false;
+    if (!writeFailed && pending.dodge.available) {
+        dodgeComplete=InstallDodgeObservers(pending);
+        writeFailed=!dodgeComplete;
+    }
+    if (!writeFailed) {
+        for (CodePatch& patch:pending.receivedPatches)
+            if (!InstallCodePatch(patch)) { writeFailed=true;break; }
+    }
+    if (writeFailed) {
+        RestoreRuntimeLayout(pending);
+        pending.dodge.available=false;
+        dodgeComplete=false;
+    }
+    const bool recoveryComplete=!writeFailed && std::all_of(pending.settlements.begin(),pending.settlements.end(),
+        [](const CodePatch& patch) { return patch.installed; });
     ScopedStatsLock lock;
-    gLayout = pending;
-    gSettlementAvailable[SettlementPhysicalDamage] = pending.installed[0];
-    gSettlementAvailable[SettlementStrategyDamage] = pending.installed[1];
+    gLayout = std::move(pending);
+    gSettlementAvailable[SettlementPhysicalDamage] = !writeFailed && gLayout.settlements[0].installed;
+    gSettlementAvailable[SettlementStrategyDamage] = !writeFailed && gLayout.settlements[1].installed;
     gSettlementAvailable[kRecoveryCapability] = recoveryComplete;
-    gComboAvailable = pending.physicalResult.installed;
-    gCriticalAvailable = pending.physicalResult.installed && pending.criticalCommit.installed;
-    gHookAvailable = gCriticalAvailable || gComboAvailable ||
+    gAttackBlockAvailable = dodgeComplete;
+    gSpellBlockAvailable = dodgeComplete;
+    gPhysicalReceivedAvailable = !writeFailed && gLayout.received.physical && gLayout.physicalResult.installed;
+    gStrategyReceivedAvailable = !writeFailed && gLayout.received.strategy;
+    gComboAvailable = !writeFailed && gLayout.physicalResult.installed;
+    gCriticalAvailable = !writeFailed && gLayout.physicalResult.installed && gLayout.criticalCommit.installed;
+    gHookAvailable = gCriticalAvailable || gComboAvailable || dodgeComplete ||
+        gPhysicalReceivedAvailable || gStrategyReceivedAvailable ||
         std::any_of(gSettlementAvailable.begin(), gSettlementAvailable.end(),
             [](bool value) { return value; });
+    if (!writeFailed) InterlockedExchange(&gStatsDetaching,FALSE);
     lock.Unlock();
+}
+
+void InitializeBattleStats(const wchar_t* gameRoot) {
+    ShutdownBattleStats();
+    if (gLayout.recoveryPending) return;
+    gRoot = gameRoot ? gameRoot : L"";
+    ResetBattleStats(L"model-initialization");
+    HMODULE module = GetModuleHandleW(nullptr);
+    ResolvedLayout resolved;
+    PeImage image;
+    if (!module || !ResolveLayout(reinterpret_cast<const BYTE*>(module),
+        reinterpret_cast<uintptr_t>(module), resolved) ||
+        !image.Open(reinterpret_cast<const BYTE*>(module),reinterpret_cast<uintptr_t>(module))) return;
+    InstallResolvedBattleStats(image,resolved);
 }
 
 void PollBattleStats(ULONGLONG now) {
@@ -1125,12 +1865,17 @@ void PollBattleStats(ULONGLONG now) {
             }
         }
     }
+    if (gAwaitingSceneReady) {
+        TraceLedgerUnlocked(L"scene_ready");
+        gAwaitingSceneReady = false;
+    }
     lock.Unlock();
 }
 
 void SetBattleStatsLoading(bool loading) {
     ScopedStatsLock lock;
     if (loading != gLoading) {
+        ++gDodgeGeneration;
         const ULONGLONG now = GetTickCount64();
         PauseClockUnlocked(now);
         gLoading = loading;
@@ -1156,7 +1901,7 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
         previousOrdinal != ordinal || !gBattleInstance);
     PauseClockUnlocked(now);
     if (newCampaign || startsInstance || (!isBattle && gActive)) ExportCurrentRecordUnlocked();
-    if (newCampaign) ClearTotalsUnlocked();
+    if (newCampaign) ClearTotalsUnlocked(L"new-game");
     if (!gCampaignId) {
         FILETIME stamp = {};
         GetSystemTimeAsFileTime(&stamp);
@@ -1165,11 +1910,13 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
         if (!gCampaignId) gCampaignId = 1;
     }
     if (startsInstance) {
+        TraceLedgerUnlocked(L"new-battle-before", L"confirmed-scenario-instance");
         gTotals.clear();
         gElapsed = 0;
         gRecordExported = false;
         ++gBattleInstance;
         if (!gBattleInstance) gBattleInstance = 1;
+        ++gDodgeGeneration;
         gPhysicalAction = PhysicalActionState();
         gNextActionSerial = 0;
         wchar_t scenario[32] = {};
@@ -1181,6 +1928,8 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
     gStarted = isBattle ? now : 0;
     gKnownMetrics |= AvailableMetricsUnlocked();
     gLastPoll = 0;
+    TraceLedgerUnlocked(startsInstance ? L"new-battle-after" : L"scenario_installed",
+        newCampaign ? L"new-game" : L"confirmed-scenario-install");
     lock.Unlock();
 }
 
@@ -1191,45 +1940,74 @@ void SetBattleStatsStatus(const std::wstring& status, bool historyIncomplete) {
     lock.Unlock();
 }
 
-void ResetBattleStats() {
+void ResetBattleStats(const wchar_t* reason) {
     ScopedStatsLock lock;
-    ClearTotalsUnlocked();
+    ClearTotalsUnlocked(reason);
     gLastPoll = 0;
     lock.Unlock();
 }
 
-void ShutdownBattleStats() {
-    RuntimeLayout layout;
+void ResetBattleStatsForLoadedScenario(const wchar_t* reason, int ordinal) noexcept {
     ScopedStatsLock lock;
-    layout = gLayout;
-    gLayout = RuntimeLayout();
+    const bool loading=gLoading;
+    ClearTotalsUnlocked(reason);
+    gLoading=loading;
+    gScenarioOrdinal=ordinal>=0 && ordinal<0xFFFF ? ordinal : -1;
+    gActive=gScenarioOrdinal>=0 && (gScenarioOrdinal&1)!=0;
+    gHistoryIncomplete=true;
+    gKnownMetrics=AvailableMetricsUnlocked();
+    FILETIME stamp={};
+    GetSystemTimeAsFileTime(&stamp);
+    gCampaignId=((static_cast<uint64_t>(stamp.dwHighDateTime)<<32)|stamp.dwLowDateTime) ^
+        (static_cast<uint64_t>(GetCurrentProcessId())<<16);
+    if (!gCampaignId) gCampaignId=1;
+    gBattleInstance=gActive ? 1:0;
+    gStarted=gActive && !gLoading ? GetTickCount64() : 0;
+    gLastPoll=0;
+    gAwaitingSceneReady=true;
+    // UI labels are optional. A persistent allocation failure must not
+    // prevent the empty replacement from recording the newly loaded battle.
+    try {
+        gStatus=L"该存档历史统计无法恢复，从此次载入后继续记录。";
+        if (gActive) {
+            wchar_t scenario[32]={};
+            swprintf_s(scenario,L"S_%02d.eex",gScenarioOrdinal>>1);
+            gScenario=scenario;
+        }
+    } catch (...) {}
+    TraceLedgerUnlocked(L"loaded-scenario-fallback",reason);
+    lock.Unlock();
+}
+
+void ShutdownBattleStats() {
+    InterlockedExchange(&gStatsDetaching,TRUE);
+    ScopedStatsLock lock;
     gHookAvailable = false;
     gSettlementAvailable.fill(false);
     gCriticalAvailable = false;
     gComboAvailable = false;
     gAttackBlockAvailable = false;
     gSpellBlockAvailable = false;
-    ClearTotalsUnlocked();
-    lock.Unlock();
-
-    bool allRestored = RestoreCodePatch(layout.criticalCommit);
-    allRestored = RestoreCodePatch(layout.physicalResult) && allRestored;
-    std::array<bool, kSettlementCallCount> restored = {true, true, true, true};
-    for (size_t i = 0; i < layout.callSites.size(); ++i) {
-        if (!layout.callSites[i] || !layout.installed[i]) continue;
-        if (!memcmp(layout.callSites[i], layout.patched[i].data(), 5))
-            restored[i] = WriteCode(layout.callSites[i], layout.original[i].data(), 5);
-        else if (memcmp(layout.callSites[i], layout.original[i].data(), 5))
-            restored[i] = false;
-        allRestored = restored[i] && allRestored;
+    gPhysicalReceivedAvailable = gStrategyReceivedAvailable = false;
+    ClearTotalsUnlocked(L"shutdown");
+    if (InterlockedCompareExchange(&gNativeHitActive,0,0)!=0 ||
+        InterlockedCompareExchange(&gRecording,FALSE,FALSE)!=FALSE ||
+        InterlockedCompareExchange(&gEventRecording,FALSE,FALSE)!=FALSE) {
+        gLayout.recoveryPending=true;
+        lock.Unlock();
+        return;
     }
-    for (size_t i = 0; i < layout.thunks.size(); ++i)
-        if (layout.thunks[i] && restored[i]) VirtualFree(layout.thunks[i], 0, MEM_RELEASE);
+    RuntimeLayout layout=std::move(gLayout);
+    gLayout=RuntimeLayout();
+    lock.Unlock();
+    const bool allRestored=RestoreRuntimeLayout(layout);
+    ScopedStatsLock publish;
     if (allRestored) {
         gBattleStatsOriginalSetHp = 0;
         gBattleStatsOriginalPhysicalResult = 0;
         gBattleStatsCriticalOffset = 0;
-    }
+    } else gLayout=std::move(layout);
+    publish.Unlock();
 }
 
 bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
@@ -1243,6 +2021,8 @@ bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
     snapshot.comboAvailable = gComboAvailable;
     snapshot.attackBlockAvailable = gAttackBlockAvailable;
     snapshot.spellBlockAvailable = gSpellBlockAvailable;
+    snapshot.physicalReceivedAvailable = gPhysicalReceivedAvailable;
+    snapshot.strategyReceivedAvailable = gStrategyReceivedAvailable;
     snapshot.active = gActive;
     snapshot.loading = gLoading;
     snapshot.scenarioOrdinal = gScenarioOrdinal;
@@ -1286,7 +2066,7 @@ bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now) {
 }
 
 bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG now) {
-    if ((state.schemaVersion != 1 && state.schemaVersion != 2) ||
+    if ((state.schemaVersion != 1 && state.schemaVersion != 2 && state.schemaVersion != 3) ||
         state.units.size() > kUnitCount || state.campaignUnits.size() > 0xFFFF ||
         state.scenario.size() > 1024 || state.status.size() > 4096 ||
         state.scenarioOrdinal < -1 || state.scenarioOrdinal >= 0xFFFF) return false;
@@ -1303,7 +2083,8 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
             if (unit.slot < -1 || unit.slot >= static_cast<int>(kUnitCount) ||
                 unit.label.size() > 256 || unit.damageDealt < 0 || unit.damageReceived < 0 ||
                 unit.recoveryDone < 0 || unit.criticalCount < 0 || unit.comboExtraHitCount < 0 ||
-                unit.attackBlockCount < 0 || unit.spellBlockCount < 0 || unit.defeatedEnemies < 0)
+                unit.attackBlockCount < 0 || unit.spellBlockCount < 0 || unit.defeatedEnemies < 0 ||
+                unit.physicalReceivedCount < 0 || unit.strategyReceivedCount < 0)
                 return false;
             if (legacy) {
                 uint16_t personId = 0xFFFF;
@@ -1312,6 +2093,12 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
                         &personId, sizeof(personId)) || personId == 0xFFFF) continue;
                 unit.personId = personId;
             }
+            // Earlier production builds did not know either dodge bit. Never
+            // reinterpret their reserved/unknown block values as dodge history.
+            if (legacy || !(state.knownMetrics & BattleStatsAttackDodge)) unit.attackBlockCount = 0;
+            if (legacy || !(state.knownMetrics & BattleStatsStrategyDodge)) unit.spellBlockCount = 0;
+            if (state.schemaVersion < 3 || !(state.knownMetrics & BattleStatsPhysicalReceived)) unit.physicalReceivedCount=0;
+            if (state.schemaVersion < 3 || !(state.knownMetrics & BattleStatsStrategyReceived)) unit.strategyReceivedCount=0;
             if (unit.personId < 0 || unit.personId >= 0xFFFF || target.count(unit.personId))
                 return false;
             target.emplace(unit.personId, std::move(unit));
@@ -1330,9 +2117,11 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
     // All allocations precede replacement. A failed allocation leaves both
     // live ledgers intact, and every lock releases during stack unwinding.
     ScopedStatsLock lock;
+    TraceLedgerUnlocked(L"model_replace_before");
     gTotals = std::move(restored);
     gCampaignTotals = std::move(campaign);
     gLabels = std::move(labels);
+    ++gDodgeGeneration;
     gPhysicalAction = PhysicalActionState();
     gNextActionSerial = 0;
     gActive = state.active;
@@ -1342,12 +2131,17 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
     gScenarioOrdinal = state.scenarioOrdinal;
     gCampaignId = state.campaignId;
     gBattleInstance = state.battleInstance;
-    gKnownMetrics = state.knownMetrics;
-    gHistoryIncomplete = state.historyIncomplete || legacy;
+    gKnownMetrics = state.knownMetrics & (state.schemaVersion < 3 ? 0xFFu : 0x3FFu);
+    const uint32_t newMetrics = BattleStatsAttackDodge | BattleStatsStrategyDodge |
+        BattleStatsPhysicalReceived | BattleStatsStrategyReceived;
+    gHistoryIncomplete = state.historyIncomplete || legacy || state.schemaVersion < 3 ||
+        (((AvailableMetricsUnlocked() & newMetrics) & ~state.knownMetrics) != 0);
     gStatus = std::move(status);
     gRecordExported = false;
+    gAwaitingSceneReady = true;
     if (legacy) gKnownMetrics |= AvailableMetricsUnlocked();
     gLastPoll = 0;
+    TraceLedgerUnlocked(L"model_replace_after");
     lock.Unlock();
     return true;
 }
@@ -1375,6 +2169,11 @@ bool ResolveBattleStatsImageLayoutForTest(const BYTE* image, uintptr_t virtualBa
     output.physicalResultCall = layout.physicalResultCall;
     output.criticalCommit = layout.criticalCommit;
     output.attackBlockCommit = layout.attackBlockCommit;
+    output.dodgeAvailable = layout.dodge.available;
+    output.finalHit = layout.dodge.finalHit;
+    output.physicalReceivedAvailable=layout.received.physical;
+    output.strategyReceivedAvailable=layout.received.strategy;
+    for (const auto& call:layout.received.calls) output.receivedCalls.push_back(call.site);
     output.spellBlockCommit = layout.spellBlockCommit;
     output.criticalOffset = layout.criticalOffset;
     output.comboOffset = layout.comboOffset;
@@ -1385,6 +2184,7 @@ bool ResolveBattleStatsImageLayoutForTest(const BYTE* image, uintptr_t virtualBa
 void InitializeBattleStatsModelForTest(uintptr_t unitBase,
     uintptr_t strategyBase, unsigned strategyCount) {
     ShutdownBattleStats();
+    if (gLayout.recoveryPending) return;
     ScopedStatsLock lock;
     gLayout = RuntimeLayout();
     gLayout.unitBase = unitBase;
@@ -1395,11 +2195,12 @@ void InitializeBattleStatsModelForTest(uintptr_t unitBase,
     gSettlementAvailable.fill(true);
     gCriticalAvailable = true;
     gComboAvailable = true;
-    // The model receives an explicit confirmed result through its test
-    // entry points. Production remains disabled until a unique 6.6 result
-    // commit is semantically resolved.
+    // Model-only tests can supply confirmed dodge events directly. Production
+    // availability requires the complete final-hit observer graph above.
     gAttackBlockAvailable = true;
     gSpellBlockAvailable = true;
+    gPhysicalReceivedAvailable = gStrategyReceivedAvailable = true;
+    InterlockedExchange(&gStatsDetaching,FALSE);
     ClearTotalsUnlocked();
     lock.Unlock();
 }
@@ -1432,3 +2233,112 @@ void RecordBattleStatsAttackBlockForTest(int attackerSlot, int targetSlot) {
 void RecordBattleStatsSpellBlockForTest(int attackerSlot, int targetSlot) {
     RecordBlockResult(BlockSpell, attackerSlot, targetSlot);
 }
+
+#ifdef XA66_TEST
+bool ConfigureBattleStatsReceivedForTest(const BYTE* bytes, uintptr_t virtualBase) {
+    if (gLayout.recoveryPending) return false;
+    PeImage image; ReceivedLayout layout;
+    if (!image.Open(bytes,virtualBase) || !ResolveReceivedLayout(image,layout)) return false;
+    ScopedStatsLock lock;
+    gLayout.received=std::move(layout);
+    gPhysicalReceivedAvailable=gLayout.received.physical;
+    gStrategyReceivedAvailable=gLayout.received.strategy;
+    InterlockedExchange(&gStatsDetaching,FALSE);
+    lock.Unlock();
+    return gPhysicalReceivedAvailable || gStrategyReceivedAvailable;
+}
+void DispatchBattleStatsReceivedForTest(void* rawSnapshot, unsigned rawRole) {
+    auto* snapshot=static_cast<NativeHitSnapshot*>(rawSnapshot);
+    if (!snapshot) return;
+    for (const auto& call:gLayout.received.calls) if (static_cast<unsigned>(call.role)==rawRole) {
+        snapshot->returnAddress=call.site+5;
+        BattleStatsObserveReceivedSite(snapshot);
+        return;
+    }
+}
+void RecordBattleStatsReceivedForTest(bool strategy, int attackerSlot, int targetSlot) {
+    RecordReceivedAttempt(strategy,attackerSlot,targetSlot,gDodgeGeneration);
+}
+bool ConfigureBattleStatsDodgeForTest(const BYTE* bytes, uintptr_t virtualBase) {
+    if (gLayout.recoveryPending) return false;
+    PeImage image;
+    DodgeLayout layout;
+    if (!image.Open(bytes,virtualBase) || !ResolveDodgeLayout(image,layout)) return false;
+    gLayout.dodge = std::move(layout);
+    gAttackBlockAvailable = gSpellBlockAvailable = true;
+    return true;
+}
+void SetBattleStatsDodgeTargetForTest(unsigned role, uintptr_t target) {
+    if (role<DodgeRoleCount) gDodgeFallbackTargets[role]=target;
+    for (DodgeCall& call : gLayout.dodge.calls)
+        if (call.role == role) call.target = target;
+}
+void DispatchBattleStatsDodgeForTest(void* snapshot, unsigned role) {
+    BattleStatsDispatchHit(static_cast<NativeHitSnapshot*>(snapshot),role);
+}
+bool BattleStatsDodgeObservationActiveForTest() { return gHitObservation != nullptr; }
+bool InstallBattleStatsDodgeHooksForTest(BYTE* mapped, unsigned sabotage,
+    std::vector<uintptr_t>& sites) {
+    if (gLayout.recoveryPending) return false;
+    InterlockedExchange(&gStatsDetaching,TRUE);
+    PeImage image; DodgeLayout resolved; RuntimeLayout pending;
+    pending.unitBase = gLayout.unitBase;
+    if (!image.Open(mapped,reinterpret_cast<uintptr_t>(mapped)) || !ResolveDodgeLayout(image,resolved)) return false;
+    if (!PrepareDodgeObservers(image,resolved,pending)) return false;
+    sites.clear();
+    for (const CodePatch& patch : pending.dodgePatches) sites.push_back(reinterpret_cast<uintptr_t>(patch.site));
+    if (sabotage < pending.dodgePatches.size()) pending.dodgePatches[sabotage].site[0] = 0xCC;
+    const bool installed = InstallDodgeObservers(pending);
+    if (!installed) {
+        RestoreRuntimeLayout(pending);
+        pending.dodge.available=false;
+    }
+    gLayout = std::move(pending);
+    gAttackBlockAvailable = gSpellBlockAvailable = installed;
+    if (installed) InterlockedExchange(&gStatsDetaching,FALSE);
+    return installed;
+}
+bool InstallAllBattleStatsHooksForTest(BYTE* mapped, uintptr_t virtualBase,
+    std::vector<uintptr_t>& sites) {
+    if (gLayout.recoveryPending) return false;
+    ResolvedLayout resolved;
+    PeImage runtime;
+    const uintptr_t mappedBase=reinterpret_cast<uintptr_t>(mapped);
+    if (!ResolveLayout(mapped,virtualBase,resolved) || !runtime.Open(mapped,mappedBase)) return false;
+    const auto relocate=[mappedBase,virtualBase](uintptr_t& value) {
+        if (value) value=mappedBase+value-virtualBase;
+    };
+    relocate(resolved.hpSetter);relocate(resolved.unitBase);relocate(resolved.strategyBase);
+    for (uintptr_t& site:resolved.callSites) relocate(site);
+    relocate(resolved.physicalResult);relocate(resolved.physicalResultCall);relocate(resolved.criticalCommit);
+    relocate(resolved.attackBlockCommit);relocate(resolved.spellBlockCommit);
+    relocate(resolved.dodge.base);relocate(resolved.dodge.finalHit);relocate(resolved.dodge.physicalCalcReturn);
+    for (DodgeCall& call:resolved.dodge.calls) { relocate(call.site);relocate(call.target); }
+    for (auto& calc:resolved.dodge.strategyCalcs) relocate(calc.first);
+    for (uintptr_t& site:resolved.dodge.strategyDirect) relocate(site);
+    for (uintptr_t& site:resolved.dodge.strategyActions) relocate(site);
+    relocate(resolved.received.base);
+    for (auto& call:resolved.received.calls) { relocate(call.site);relocate(call.target); }
+    for (auto& site:resolved.received.physicalActions) relocate(site);
+    for (auto& site:resolved.received.strategyActions) relocate(site);
+    // Reuse the entire production preparation, installation and capability
+    // publication path; only the offline address translation is test-specific.
+    InstallResolvedBattleStats(runtime,resolved);
+    sites.clear();
+    for (const CodePatch& patch:gLayout.settlements) sites.push_back(reinterpret_cast<uintptr_t>(patch.site));
+    sites.push_back(reinterpret_cast<uintptr_t>(gLayout.physicalResult.site));
+    sites.push_back(reinterpret_cast<uintptr_t>(gLayout.criticalCommit.site));
+    for (const CodePatch& patch:gLayout.dodgePatches) sites.push_back(reinterpret_cast<uintptr_t>(patch.site));
+    for (const CodePatch& patch:gLayout.receivedPatches) sites.push_back(reinterpret_cast<uintptr_t>(patch.site));
+    return std::all_of(gLayout.settlements.begin(),gLayout.settlements.end(),[](const CodePatch& patch) { return patch.installed; }) &&
+        gLayout.physicalResult.installed && gLayout.criticalCommit.installed && gLayout.dodge.available &&
+        gPhysicalReceivedAvailable && gStrategyReceivedAvailable;
+}
+void SetBattleStatsWriteFaultForTest(int forwardIndex,unsigned forwardFailure,
+    int restoreIndex,unsigned restoreFailure) {
+    gStatsFailForward=forwardIndex;gStatsForwardFailure=forwardFailure;
+    gStatsFailRestore=restoreIndex;gStatsRestoreFailure=restoreFailure;
+    gStatsForwardWrites=gStatsRestoreWrites=0;
+}
+bool BattleStatsRecoveryPendingForTest() { return gLayout.recoveryPending; }
+#endif

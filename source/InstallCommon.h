@@ -10,12 +10,28 @@
 
 namespace XiaoAnInstall {
 
-constexpr unsigned kManifestSchema = 1;
-constexpr wchar_t kPackageVersion[] = L"1.1.0";
+constexpr unsigned kManifestSchema = 2;
+constexpr wchar_t kPackageVersion[] = L"1.3.0";
+
+// The proxy is shared by all optional functions.  The mask describes which
+// functions the installer should activate; the audio forwarding core remains
+// present while any bit is selected.
+enum FeatureMask : unsigned {
+    FeatureNone = 0,
+    FeatureAccelerator = 1u << 0,
+    FeatureGuide = 1u << 1,
+    FeatureBattleStats = 1u << 2,
+    FeatureAll = FeatureAccelerator | FeatureGuide | FeatureBattleStats
+};
+
+inline bool IsValidFeatureMask(unsigned mask) {
+    return (mask & ~static_cast<unsigned>(FeatureAll)) == 0;
+}
 
 enum class InstallMode {
     Clean,
-    LegacyAdopted
+    LegacyAdopted,
+    LegacySnapshot
 };
 
 enum class TargetKind {
@@ -44,6 +60,10 @@ struct Manifest {
     std::wstring installId;
     InstallMode mode = InstallMode::Clean;
     std::wstring root;
+    unsigned featureMask = FeatureAll;
+    bool forced = false;
+    std::wstring executableSha256;
+    std::wstring planSha256;
     bool patchDirExisted = false;
     bool privateDirExisted = false;
     FileRecord files[3];
@@ -54,6 +74,7 @@ struct Manifest {
 
 struct PackagePayload {
     EngineProfileId profile = EngineProfileId::Unknown;
+    bool forced = false;
     std::wstring expectedExeSha256;
     std::vector<unsigned char> proxy;
     std::vector<unsigned char> gear;
@@ -78,14 +99,17 @@ bool ValidateGear(const std::wstring& path, std::wstring& error);
 bool ValidateProxyAudioBytes(const std::vector<unsigned char>& bytes, std::wstring& error);
 bool ValidateGearBytes(const std::vector<unsigned char>& bytes, std::wstring& error);
 
-TargetKind DetectTarget(const std::wstring& root, std::wstring& detail);
+TargetKind DetectTarget(const std::wstring& root, std::wstring& detail,
+    EngineProfileId forcedProfile = EngineProfileId::Unknown);
 bool LoadManifest(const std::wstring& root, Manifest& manifest, std::wstring& error);
 bool ValidateUninstall(const std::wstring& root, Manifest& manifest, std::wstring& error,
                        bool requireInstalledProxy = true);
 bool InstallPatch(const std::wstring& root, const PackagePayload& payload,
-                  TargetKind requestedKind, std::wstring& report, std::wstring& error);
+                  TargetKind requestedKind, std::wstring& report, std::wstring& error,
+                  unsigned featureMask = FeatureAll);
 bool RestorePatch(const std::wstring& root, std::wstring& report, std::wstring& error,
-                  bool requireInstalledProxy = true);
+                  bool requireInstalledProxy = true,
+                  unsigned removeFeatures = FeatureAll);
 
 bool ReadResourceBytes(HMODULE module, WORD id, std::vector<unsigned char>& bytes,
                        std::wstring& error);

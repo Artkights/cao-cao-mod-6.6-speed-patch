@@ -871,12 +871,14 @@ int wmain(int argc, wchar_t** argv) {
     const bool resolved = ResolveSaveEnhancerImageForTest(image.data(), base, layout);
     Check(resolved,
         "resolve native save and load result graph");
+    const bool engine64 = CompiledEngineProfile() == EngineProfileId::Ccz64;
     const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz65;
-    Check(layout.nativeAuto == (engine65 ? 0x40CB83u : 0x412AB7u) && layout.nativeSave == 0x412AE5 &&
+    Check(layout.nativeAuto == (engine64 ? 0x412AB5u : engine65 ? 0x40CB83u : 0x412AB7u) &&
+        layout.nativeSave == 0x412AE5 &&
         layout.saveResult == 0x405314, "resolve successful native save completion");
-    Check(layout.loadObserve == 0x4188A4 && layout.loadResult == 0x4189BA &&
+    Check(layout.loadObserve == 0x4188A4 && layout.loadResult == (engine64 ? 0x4189D4u : 0x4189BAu) &&
         layout.loadContinuation == 0 &&
-        layout.campaignByte == (engine65 ? 0x4CE78Fu : 0x500ACFu),
+        layout.campaignByte == (engine64 || engine65 ? 0x4CE78Fu : 0x500ACFu),
         "resolve load slot before mutation and successful load completion");
     Check(layout.commitSite == 0x4052E7 && layout.commitContinuation == 0x4052EE &&
         layout.commitFailure == 0x405307 && layout.nativePostWrite == 0x42B81B &&
@@ -884,8 +886,10 @@ int wmain(int argc, wchar_t** argv) {
         layout.nativeWrite == 0x41923C && layout.nativeClose == 0x4192C5,
         "resolve transaction commit before native success and load entry before any mutation");
 
-    if (!engine65) Check(layout.startCall == 0x44E1A2 && layout.endCall == 0x44E1EC,
+    if (!engine64 && !engine65) Check(layout.startCall == 0x44E1A2 && layout.endCall == 0x44E1EC,
         "resolve separate native 6.6 start and confirmed end-save calls");
+    if (engine64) Check(layout.startCall == 0x44E1A2 && layout.endCall == 0x44E1AF,
+        "resolve the 6.4 native start and end-save calls");
     if (engine65) Check(layout.startCall == 0x44E1A2 && layout.endCall == 0x44E1B9 &&
         layout.nativeEndAuto == 0x40CBB6 && layout.nativeFilename == 0x4288F4 &&
         layout.saveFilenameCall == 0x40532B,
@@ -924,7 +928,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     ValidateBoundaryBridges();
     ValidateNativeDisabledAndEndOwner();
-    if (engine65) ValidatePrivateSaveTransactions65();
+    if (engine64 || engine65) ValidatePrivateSaveTransactions65();
     ValidateSynchronousLoadStatistics();
     ValidateProductionSaveCommitAndResultBridges();
     printf("SaveEnhancerTests: %d failures\n", failures);

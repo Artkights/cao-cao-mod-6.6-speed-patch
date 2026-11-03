@@ -2,6 +2,7 @@
 #include "EngineProfile.h"
 #include "InstallCommon.h"
 #include "ResourceIds.h"
+#include "FeatureSelection.h"
 #include "Guide.h"
 #include "Features.h"
 #include "BattleRuntime.h"
@@ -9,6 +10,7 @@
 #include "FeatureUi.h"
 #include "SaveEnhancer.h"
 #include "BattleStats.h"
+#include "StatsDiagnostics.h"
 #include "ScenarioLifecycle.h"
 #include "SaveTransactions.h"
 #include <stdio.h>
@@ -76,6 +78,7 @@ HMENU gPatchMenu = nullptr;
 bool gCompatible = false;
 bool gInitialized = false;
 bool gReportedError = false;
+unsigned gInstalledFeatures = XiaoAnInstall::FeatureAll;
 Settings gAppliedSettings;
 bool gHasAppliedSettings = false;
 int gConfigLines[74] = {};
@@ -98,6 +101,39 @@ volatile LONG gStartupAccepted = FALSE;
 DWORD gStartupThread = 0;
 using LoaderCalloutFn = BOOLEAN (NTAPI*)();
 LoaderCalloutFn gWithinLoaderCallout = nullptr;
+
+bool HasFeature(unsigned feature) {
+    return (gInstalledFeatures & feature) != 0;
+}
+
+// A missing state file identifies an older installation and retains its
+// historic all-functions behavior.  A malformed present file disables all
+// optional hooks rather than silently re-enabling a removed function.
+bool LoadInstalledFeatures(const wchar_t* root, EngineProfileId profile) {
+    const std::wstring path = PatchPrivatePath(root, profile) + L"\\feature-state.ini";
+    if (!XiaoAnInstall::FileExists(path)) {
+        gInstalledFeatures = XiaoAnInstall::FeatureAll;
+        return true;
+    }
+    const int version = GetPrivateProfileIntW(L"Install", L"SchemaVersion", -1, path.c_str());
+    const int mask = GetPrivateProfileIntW(L"Install", L"FeatureMask", -1, path.c_str());
+    if (version != 1 || mask <= 0 || !XiaoAnInstall::IsValidFeatureMask(static_cast<unsigned>(mask))) {
+        gInstalledFeatures = XiaoAnInstall::FeatureNone;
+        return false;
+    }
+    gInstalledFeatures = static_cast<unsigned>(mask);
+    return true;
+}
+
+bool ForcedEngineSelected(const wchar_t* root, EngineProfileId compiledProfile) {
+    const std::wstring path = PatchPrivatePath(root, compiledProfile) + L"\\feature-state.ini";
+    wchar_t mode[32] = {};
+    GetPrivateProfileStringW(L"Install", L"EngineMode", L"", mode,
+        static_cast<DWORD>(_countof(mode)), path.c_str());
+    if (_wcsicmp(mode, L"Forced")) return false;
+    const int profile = GetPrivateProfileIntW(L"Install", L"EngineProfile", 0, path.c_str());
+    return profile == static_cast<int>(compiledProfile);
+}
 
 void CompleteStartup() {
     InterlockedExchange(&gStartupFinished, TRUE);
@@ -182,6 +218,11 @@ void BeginUninstall(HWND owner) {
                     L"加速补丁", MB_ICONERROR);
         return;
     }
+    FeatureSelection selection;
+    selection.mask = selection.available = manifest.featureMask;
+    selection.uninstall = true;
+    if (DialogBoxParamW(gInstance, MAKEINTRESOURCEW(IDD_FEATURE_SELECT), owner,
+        FeatureSelectionProcedure, reinterpret_cast<LPARAM>(&selection)) != IDOK) return;
     std::vector<unsigned char> workerBytes;
     std::wstring workerHash;
     if (!XiaoAnInstall::ReadResourceBytes(gInstance, IDR_UNINSTALL_WORKER, workerBytes, error) ||
@@ -191,7 +232,7 @@ void BeginUninstall(HWND owner) {
         return;
     }
     if (MessageBoxW(owner,
-        L"确认卸载加速补丁吗？\r\n\r\n游戏将关闭，未保存进度会丢失。游戏退出后，卸载助手会恢复安装前的原始文件。",
+        L"确认卸载所选功能吗？\r\n\r\n游戏将关闭，未保存进度会丢失。其余功能在下次启动游戏时继续生效；最后一个功能卸载后恢复原文件。",
         L"卸载加速补丁", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
 
     wchar_t temporaryRoot[32768] = {};
@@ -230,7 +271,8 @@ void BeginUninstall(HWND owner) {
         return;
     }
     std::wstring command = Quote(workerPath) + L" /root " + Quote(gDirectory) + L" /handle " +
-        std::to_wstring(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(inheritedProcess)));
+        std::to_wstring(static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(inheritedProcess))) +
+        L" /features " + std::to_wstring(selection.mask);
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(0);
     STARTUPINFOW startup = {sizeof(startup)};
@@ -338,6 +380,7 @@ bool MatchesKey(WORD hotkey, UINT key, BYTE modifiers) {
 }
 
 int ResolveKeyCommand(UINT key, BYTE modifiers) {
+    if (!HasFeature(XiaoAnInstall::FeatureAccelerator)) return -1;
     if (key == VK_TAB && !(modifiers & (HOTKEYF_CONTROL | HOTKEYF_ALT))) return CommandOpenConfig;
     if (!gCompatible) return -1;
     for (int i = 0; i < 5; ++i) {
@@ -361,7 +404,8 @@ bool ReleaseKey(UINT key) {
 }
 
 bool CaptureKeyDown(UINT key, BYTE modifiers, bool nativeFallback) {
-    if (InterlockedCompareExchange(&gUninstalling, FALSE, FALSE) || !GameForeground() || EditingShortcut())
+    if (!HasFeature(XiaoAnInstall::FeatureAccelerator) ||
+        InterlockedCompareExchange(&gUninstalling, FALSE, FALSE) || !GameForeground() || EditingShortcut())
         return false;
     const int command = ResolveKeyCommand(key, modifiers);
     const bool capture = command >= 0 || key == 'Z';
@@ -405,7 +449,7 @@ void StopKeyboardHook() {
 }
 
 void ExecuteAcceleratorCommand(AcceleratorCommand command) {
-    if (InterlockedCompareExchange(&gUninstalling, FALSE, FALSE)) return;
+    if (!HasFeature(XiaoAnInstall::FeatureAccelerator) || InterlockedCompareExchange(&gUninstalling, FALSE, FALSE)) return;
     if (command == CommandOpenConfig) {
         if (!gDialog) OpenConfig(gMainWindow);
         return;
@@ -447,16 +491,16 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     if (message == WM_COMMAND && HIWORD(wParam) == 0) {
-        if (LOWORD(wParam) == kConfigure) { OpenConfig(window); return 0; }
-        if (LOWORD(wParam) == kSave) {
+        if (LOWORD(wParam) == kConfigure && HasFeature(XiaoAnInstall::FeatureAccelerator)) { OpenConfig(window); return 0; }
+        if (LOWORD(wParam) == kSave && HasFeature(XiaoAnInstall::FeatureAccelerator)) {
             if (!SaveSettings()) MessageBoxW(window, L"无法保存加速配置。", L"加速补丁", MB_ICONERROR);
             return 0;
         }
-        if (LOWORD(wParam) == kFeatures) { OpenFeatureSettings(window, gDirectory); return 0; }
-        if (LOWORD(wParam) == kSaveBrowser) { OpenSaveBrowser(window, gDirectory); return 0; }
+        if (LOWORD(wParam) == kFeatures && (HasFeature(XiaoAnInstall::FeatureAccelerator) || HasFeature(XiaoAnInstall::FeatureBattleStats))) { OpenFeatureSettings(window, gDirectory); return 0; }
+        if (LOWORD(wParam) == kSaveBrowser && HasFeature(XiaoAnInstall::FeatureBattleStats)) { OpenSaveBrowser(window, gDirectory); return 0; }
         if (LOWORD(wParam) == kUninstall) { BeginUninstall(window); return 0; }
-        if (LOWORD(wParam) == kGuide) { OpenGuide(window, gDirectory); return 0; }
-        if (LOWORD(wParam) == kBattleInfo) { OpenBattleInfo(window); return 0; }
+        if (LOWORD(wParam) == kGuide && HasFeature(XiaoAnInstall::FeatureGuide)) { OpenGuide(window, gDirectory); return 0; }
+        if (LOWORD(wParam) == kBattleInfo && HasFeature(XiaoAnInstall::FeatureBattleStats)) { OpenBattleInfo(window); return 0; }
     }
     if (message == WM_MOUSEWHEEL) WheelCommand(wParam);
     if (message == WM_NCDESTROY) {
@@ -490,12 +534,16 @@ void AttachWindow(HWND window) {
     if (window == gMainWindow && parent == gParentMenu && IsMenu(gPatchMenu)) return;
     HMENU popup = CreatePopupMenu();
     if (!popup) return;
-    if (!AppendMenuW(popup, MF_STRING, kConfigure, L"配置补丁") ||
-        !AppendMenuW(popup, MF_STRING, kSave, L"保存配置") ||
-        !AppendMenuW(popup, MF_STRING, kFeatures, L"功能设置") ||
-        !AppendMenuW(popup, MF_STRING, kSaveBrowser, L"存档浏览") ||
-        !AppendMenuW(popup, MF_SEPARATOR, 0, nullptr) ||
-        !AppendMenuW(popup, MF_STRING, kUninstall, L"卸载补丁")) {
+    const bool accelerator = HasFeature(XiaoAnInstall::FeatureAccelerator);
+    const bool stats = HasFeature(XiaoAnInstall::FeatureBattleStats);
+    bool menuOk = true;
+    if (accelerator) menuOk = AppendMenuW(popup, MF_STRING, kConfigure, L"配置补丁") &&
+        AppendMenuW(popup, MF_STRING, kSave, L"保存配置");
+    if (menuOk && (accelerator || stats)) menuOk = AppendMenuW(popup, MF_STRING, kFeatures, L"功能设置") != FALSE;
+    if (menuOk && stats) menuOk = AppendMenuW(popup, MF_STRING, kSaveBrowser, L"存档浏览") != FALSE;
+    if (menuOk && (accelerator || stats)) menuOk = AppendMenuW(popup, MF_SEPARATOR, 0, nullptr) != FALSE;
+    if (menuOk) menuOk = AppendMenuW(popup, MF_STRING, kUninstall, L"卸载补丁") != FALSE;
+    if (!menuOk) {
         DestroyMenu(popup);
         return;
     }
@@ -504,21 +552,24 @@ void AttachWindow(HWND window) {
         DestroyMenu(popup);
         return;
     }
-    if (!AppendMenuW(parent, MF_STRING, kGuide, L"简易攻略")) {
-        RemoveMenu(parent, originalMenuCount, MF_BYPOSITION);
-        DestroyMenu(popup);
-        return;
+    int added = 1;
+    if (HasFeature(XiaoAnInstall::FeatureGuide)) {
+        menuOk = AppendMenuW(parent, MF_STRING, kGuide, L"简易攻略") != FALSE;
+        if (menuOk) ++added;
     }
-    if (!AppendMenuW(parent, MF_STRING, kBattleInfo, L"战斗统计")) {
-        RemoveMenu(parent, originalMenuCount + 1, MF_BYPOSITION);
-        RemoveMenu(parent, originalMenuCount, MF_BYPOSITION);
+    if (menuOk && stats) {
+        menuOk = AppendMenuW(parent, MF_STRING, kBattleInfo, L"战斗统计") != FALSE;
+        if (menuOk) ++added;
+    }
+    if (!menuOk) {
+        for (int position = added - 1; position >= 0; --position)
+            RemoveMenu(parent, originalMenuCount + position, MF_BYPOSITION);
         DestroyMenu(popup);
         return;
     }
     if (!SetWindowSubclass(window, MainProc, kSubclass, 0)) {
-        RemoveMenu(parent, originalMenuCount + 2, MF_BYPOSITION);
-        RemoveMenu(parent, originalMenuCount + 1, MF_BYPOSITION);
-        RemoveMenu(parent, originalMenuCount, MF_BYPOSITION);
+        for (int position = added - 1; position >= 0; --position)
+            RemoveMenu(parent, originalMenuCount + position, MF_BYPOSITION);
         DestroyMenu(popup);
         DrawMenuBar(window);
         return;
@@ -527,7 +578,7 @@ void AttachWindow(HWND window) {
     gParentMenu = parent;
     gPatchMenu = popup;
     DrawMenuBar(window);
-    if (!gInitialized) {
+    if (!gInitialized && accelerator) {
         gInitialized = true;
         LoadSettings();
         // The loaded configuration is the safe baseline.  A first failed
@@ -598,9 +649,12 @@ LRESULT WINAPI PatchedDispatch(const MSG* message) {
         AttachWindow(message->hwnd);
         if (gMainWindow) {
             const ULONGLONG now = GetTickCount64();
-            PollSaveEnhancer();
-            PollBattleStats(now);
+            if (HasFeature(XiaoAnInstall::FeatureBattleStats)) {
+                PollSaveEnhancer();
+                PollBattleStats(now);
+            }
             if (!InterlockedCompareExchange(&gUninstalling, FALSE, FALSE) &&
+                HasFeature(XiaoAnInstall::FeatureAccelerator) &&
                 gCompatible && gAddProcess && now - gLastModuleCheck > 1000) {
                 gLastModuleCheck = now;
                 gAddProcess(GetCurrentProcess());
@@ -758,7 +812,38 @@ DWORD InitializeWorker() {
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
     EngineDetection detection;
     std::wstring profileError;
-    if (!DetectEngineProfileImage(image, nt->OptionalHeader.SizeOfImage, gGameBase, detection, profileError) ||
+    XiaoAnInstall::Manifest installedManifest;
+    const bool hasManifest = XiaoAnInstall::FileExists(XiaoAnInstall::ManifestPath(gDirectory, CompiledEngineProfile()));
+    if (hasManifest) {
+        std::wstring executableHash, planHash;
+        const std::wstring privateRoot = PatchPrivatePath(gDirectory, CompiledEngineProfile());
+        if (!XiaoAnInstall::LoadManifest(gDirectory, installedManifest, profileError) ||
+            installedManifest.profile != CompiledEngineProfile() ||
+            (!installedManifest.executableSha256.empty() &&
+                (!XiaoAnInstall::Sha256File(std::wstring(gDirectory) + L"\\Ekd5.exe", executableHash, profileError) ||
+                 _wcsicmp(executableHash.c_str(), installedManifest.executableSha256.c_str()))) ||
+            (!installedManifest.planSha256.empty() &&
+                (!XiaoAnInstall::Sha256File(privateRoot + L"\\engine-plan.txt", planHash, profileError) ||
+                 _wcsicmp(planHash.c_str(), installedManifest.planSha256.c_str())))) {
+            RejectScenarioCapture();
+            CompleteStartup();
+            MessageBoxW(nullptr, L"补丁清单、主程序或注入计划发生变化，已停止可选功能。请运行安装器重新检测。",
+                L"加速补丁", MB_ICONERROR);
+            return 0;
+        }
+    }
+    const bool forceSelected = ForcedEngineSelected(gDirectory, CompiledEngineProfile());
+    if (hasManifest && forceSelected != installedManifest.forced) {
+        RejectScenarioCapture();
+        CompleteStartup();
+        MessageBoxW(nullptr, L"功能状态与清单的强制模式不一致，已停止注入。", L"加速补丁", MB_ICONERROR);
+        return 0;
+    }
+    const bool detected = forceSelected ?
+        DetectForcedEngineProfileImage(image, nt->OptionalHeader.SizeOfImage, gGameBase,
+            CompiledEngineProfile(), detection, profileError) :
+        DetectEngineProfileImage(image, nt->OptionalHeader.SizeOfImage, gGameBase, detection, profileError);
+    if (!detected ||
         detection.profile != CompiledEngineProfile()) {
         RejectScenarioCapture();
         if (profileError.empty()) profileError = L"补丁载荷与当前游戏版本不一致，请使用加速补丁安装器重新检测。";
@@ -767,22 +852,50 @@ DWORD InitializeWorker() {
         return 0;
     }
     swprintf_s(gConfigPath, L"%s\\pl_06.ini", PatchPrivatePath(gDirectory, detection.profile).c_str());
-    CompleteScenarioCapture(true);
+    if (!LoadInstalledFeatures(gDirectory, detection.profile) ||
+        (hasManifest && gInstalledFeatures != installedManifest.featureMask)) {
+        RejectScenarioCapture();
+        InterlockedExchange(&gStartupAccepted, TRUE);
+        CompleteStartup();
+        MessageBoxW(nullptr, L"补丁功能状态文件损坏，已停用所有可选功能。请运行安装器修复。",
+            L"加速补丁", MB_ICONERROR);
+        return 0;
+    }
+    CompleteScenarioCapture(HasFeature(XiaoAnInstall::FeatureGuide) ||
+        HasFeature(XiaoAnInstall::FeatureBattleStats));
     InterlockedExchange(&gStartupAccepted, TRUE);
     LoadFeatureSettings(gDirectory);
-    InitializeBattleRuntime(gDirectory);
-    InitializeBattleStats(gDirectory);
-    std::wstring recoveryError;
-    if (!RecoverSaveTransactions(gDirectory,recoveryError)) SetBattleStatsStatus(recoveryError,true);
-    if (!InitializeScenarioLifecycle()) SetBattleStatsStatus(L"战场切换监听不可用，无法确认本场统计的开始和结束。",true);
-    if (!InitializeSaveEnhancer(gDirectory)) SetBattleStatsStatus(L"存档统计监听不可用，请检查补丁与游戏版本。",true);
-    SetNativeToggleHandler(&NativeSuperCommand);
-    gCompatible = InitializeEngine();
+    if (HasFeature(XiaoAnInstall::FeatureGuide) || HasFeature(XiaoAnInstall::FeatureBattleStats))
+        InitializeBattleRuntime(gDirectory);
+    if (HasFeature(XiaoAnInstall::FeatureBattleStats)) {
+        // Diagnostics are deliberately initialized before any model or save
+        // hooks.  Logging failures are isolated inside StatsDiagnostics and
+        // must never prevent the statistics module from starting.
+        InitializeStatsDiagnostics(gDirectory);
+        InitializeBattleStats(gDirectory);
+        std::wstring recoveryError;
+        if (!RecoverSaveTransactions(gDirectory,recoveryError)) {
+            SetBattleStatsStatus(recoveryError,true);
+            SetStatsPersistenceCapability(false, false, recoveryError);
+        }
+        if (!InitializeScenarioLifecycle()) SetBattleStatsStatus(L"战场切换监听不可用，无法确认本场统计的开始和结束。",true);
+        const bool saveReady = InitializeSaveEnhancer(gDirectory);
+        if (!saveReady) {
+            SetBattleStatsStatus(L"存档统计监听不可用，请检查补丁与游戏版本。",true);
+            SetStatsPersistenceCapability(false, false, L"存档统计监听不可用");
+        } else {
+            SetStatsPersistenceCapability(true, true, L"E5S 原生前缀 + schema 3 统计尾部");
+        }
+    }
+    if (HasFeature(XiaoAnInstall::FeatureAccelerator)) {
+        SetNativeToggleHandler(&NativeSuperCommand);
+        gCompatible = InitializeEngine();
+    }
     // All model, recovery, lifecycle, save and engine hooks are now installed.
     // Release the game before optional DLL loading, UI or keyboard registration,
     // any of which can need the game's message thread to run.
     CompleteStartup();
-    if (gCompatible) {
+    if (HasFeature(XiaoAnInstall::FeatureAccelerator) && gCompatible) {
         wchar_t path[32768];
         swprintf_s(path, L"%s\\GearNtKe.dll", gDirectory);
         gGearModule = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -798,6 +911,7 @@ DWORD InitializeWorker() {
     // absent and keeps the proxy UI Unicode in those variants as well.
     InstallGameImportHook(reinterpret_cast<void*>(&DispatchMessageW), reinterpret_cast<void*>(&PatchedDispatch));
     InstallGameImportHook(reinterpret_cast<void*>(&TranslateMessage), reinterpret_cast<void*>(&PatchedTranslate));
+    if (!HasFeature(XiaoAnInstall::FeatureAccelerator)) return 0;
     gKeyboardThread = GetCurrentThreadId();
     MSG bootstrap = {};
     PeekMessageW(&bootstrap, nullptr, WM_USER, WM_USER, PM_NOREMOVE);

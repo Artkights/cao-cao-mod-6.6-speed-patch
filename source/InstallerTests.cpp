@@ -19,8 +19,8 @@ bool SameHash(const std::vector<unsigned char>& bytes, const wchar_t* path) {
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 5 && argc != 6) {
-        fprintf(stderr, "Usage: InstallerTests <installer> <proxy66> <gear> <original-audio> [proxy65]\n");
+    if (argc < 5 || argc > 7) {
+        fprintf(stderr, "Usage: InstallerTests <installer> <proxy66> <gear> <original-audio> [proxy65] [proxy64]\n");
         return 2;
     }
     std::wstring error, hash;
@@ -34,7 +34,7 @@ int wmain(int argc, wchar_t** argv) {
     Check(XiaoAnInstall::ValidateOriginalAudio(argv[4], error), "sample original audio has 20 implementations");
 
     HMODULE installer = LoadLibraryExW(argv[1], nullptr, LOAD_LIBRARY_AS_DATAFILE);
-    std::vector<unsigned char> proxy, proxy65, gear, config, features;
+    std::vector<unsigned char> proxy, proxy65, proxy64, gear, config, features;
     Check(installer && XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_PROXY, proxy, error) &&
           XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_GEAR, gear, error) &&
           XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_CONFIG, config, error) &&
@@ -44,6 +44,13 @@ int wmain(int argc, wchar_t** argv) {
           XiaoAnInstall::ValidateProxyAudioBytes(proxy65, error),
           "installer contains a valid 6.5 proxy with the exact 20 forwarders");
     if (argc == 6) Check(SameHash(proxy65, argv[5]), "embedded 6.5 proxy is byte-identical to its final build");
+    if (argc == 7) {
+        Check(SameHash(proxy65, argv[5]), "embedded 6.5 proxy is byte-identical to its final build");
+        Check(installer && XiaoAnInstall::ReadResourceBytes(installer, IDR_INSTALL_PROXY64, proxy64, error) &&
+            XiaoAnInstall::ValidateProxyAudioBytes(proxy64, error),
+            "installer contains a valid 6.4 proxy with the exact 20 forwarders");
+        Check(SameHash(proxy64, argv[6]), "embedded 6.4 proxy is byte-identical to its final build");
+    }
     Check(proxy != proxy65, "6.5 and 6.6 runtime resources are distinct");
     Check(SameHash(proxy, argv[2]), "embedded proxy is byte-identical to the final build");
     Check(SameHash(gear, argv[3]), "embedded gear module is byte-identical to the final build");
@@ -66,7 +73,7 @@ int wmain(int argc, wchar_t** argv) {
           "embedded uninstall worker is an x86 PE32 executable");
     DeleteFileW(workerPath);
     if (proxyModule) FreeLibrary(proxyModule);
-    if (argc == 6) {
+    if (argc >= 6) {
         HMODULE proxy65Module = LoadLibraryExW(argv[5], nullptr, LOAD_LIBRARY_AS_DATAFILE);
         std::vector<unsigned char> worker65;
         Check(proxy65Module && XiaoAnInstall::ReadResourceBytes(proxy65Module, IDR_UNINSTALL_WORKER, worker65, error),

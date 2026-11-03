@@ -1,0 +1,16 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "ResourceIds.h"
+IDD_FEATURE_SELECT DIALOGEX 0, 0, 250, 157
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "选择补丁功能"
+FONT 9, "Microsoft YaHei UI", 400, 0, 134
+BEGIN
+    LTEXT "请选择要安装或卸载的功能：", -1, 12, 10, 220, 14
+    CONTROL "加速（含齿轮模块）", IDC_FEATURE_ACCELERATOR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 34, 210, 16
+    CONTROL "简易攻略", IDC_FEATURE_GUIDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 57, 210, 16
+    CONTROL "战场统计", IDC_FEATURE_BATTLE_STATS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 80, 210, 16
+    LTEXT "所选功能共用核心代理；最后一项卸载后恢复原文件。", -1, 12, 103, 226, 16
+    DEFPUSHBUTTON "确定", IDOK, 108, 126, 60, 20
+    PUSHBUTTON "取消", IDCANCEL, 176, 126, 60, 20
+END

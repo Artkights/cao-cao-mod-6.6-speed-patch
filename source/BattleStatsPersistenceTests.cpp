@@ -106,7 +106,9 @@ bool SameUnit(const BattleUnitTotals& left, const BattleUnitTotals& right) {
         left.damageDealt == right.damageDealt && left.damageReceived == right.damageReceived &&
         left.recoveryDone == right.recoveryDone && left.criticalCount == right.criticalCount &&
         left.comboExtraHitCount == right.comboExtraHitCount && left.attackBlockCount == right.attackBlockCount &&
-        left.spellBlockCount == right.spellBlockCount && left.defeatedEnemies == right.defeatedEnemies;
+        left.spellBlockCount == right.spellBlockCount && left.defeatedEnemies == right.defeatedEnemies &&
+        left.physicalReceivedCount == right.physicalReceivedCount &&
+        left.strategyReceivedCount == right.strategyReceivedCount;
 }
 
 bool SameState(const BattleStatsPersistedState& left, const BattleStatsPersistedState& right) {
@@ -241,10 +243,10 @@ void ValidateEmbedded(const std::wstring& folder) {
     const auto sample = SampleState();
     const size_t firstRow = strlen(kNativePayload) + sizeof(TestHeader) +
         (sample.scenario.size() + sample.status.size()) * sizeof(wchar_t);
-    // A schema-2 row has the persisted person ID followed by the 68-byte
-    // schema-1 totals header. Recompute the hash so this exercises structural
+    // A schema-3 row has the persisted person ID, totals header and received
+    // counters. Recompute the hash so this exercises structural
     // duplicate validation, rather than stopping at integrity verification.
-    constexpr size_t rowBytes = 72;
+    constexpr size_t rowBytes = 88;
     const size_t secondRow = firstRow + rowBytes + sample.units[0].label.size() * sizeof(wchar_t);
     memcpy(damaged.data() + secondRow, damaged.data() + firstRow, sizeof(int32_t));
     Check(RefreshPayloadHash(damaged) && WriteBytes(changed, damaged) &&
@@ -294,8 +296,8 @@ void ValidateEmbedded(const std::wstring& folder) {
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject overlong labels");
     invalid = SampleState(); invalid.status.assign(4097, L'x');
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject overlong status text");
-    invalid = SampleState(); invalid.knownMetrics = 0x100;
-    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-2 metric bits");
+    invalid = SampleState(); invalid.knownMetrics = 0x400;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-3 metric bits");
     invalid = SampleState(); invalid.units.assign(251, SampleUnit(0, 0));
     Check(!WriteBattleStatsEmbedded(changed, invalid, error) && ReadBytes(changed) == unchanged,
         "limit current battles to 250 people while allowing larger global histories");

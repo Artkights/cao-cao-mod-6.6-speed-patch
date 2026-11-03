@@ -111,12 +111,21 @@ bool Resolve(BYTE* bytes, uintptr_t virtualBase, ScenarioLifecycleImageLayout& o
     BYTE* menu = nullptr;
     size_t calls = 0;
     const BYTE progressTail[] = {0x66,0x83,0x41,6,1,0x8B,0x4D,8};
+    // 6.4 calls a tiny thiscall increment helper at this point; 6.5/6.6
+    // inline the same WORD[owner+6] increment. Prove the entire helper body.
+    const BYTE incrementBody[] = {0x55,0x8B,0xEC,0x66,0xFF,0x41,6,0x5D,0xC3};
+    const BYTE loadCaller[] = {0x8B,0x4D,8};
     const BYTE menuChoice[] = {0x8B,0x45,0xFC,0x85,0xC0,0x74,0x27,0x3C,1,0x75,0x15,0x6A,0,0xE8};
     for (size_t offset = 16; offset + 10 <= image.textSize; ++offset) {
         BYTE* call = image.text + offset;
         if (CallTarget(image, call) != install) continue;
         ++calls;
-        if (call[-13] == 0xB9 && !memcmp(call - 8, progressTail, sizeof(progressTail)) &&
+        BYTE* increment = CallTarget(image, call - 8);
+        const bool advancesOrdinal = !memcmp(call - 8, progressTail, sizeof(progressTail)) ||
+            (image.InText(increment, sizeof(incrementBody)) &&
+                !memcmp(increment, incrementBody, sizeof(incrementBody)) &&
+                !memcmp(call - 3, loadCaller, sizeof(loadCaller)));
+        if (call[-13] == 0xB9 && advancesOrdinal &&
             image.Address(Dword(call - 12), 8) == ordinal - 6) {
             if (progress) return false;
             progress = call;
