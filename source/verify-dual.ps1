@@ -1,4 +1,4 @@
-param([string]$OutputDirectory, [string]$GameRoot64, [string]$GameRoot65, [string]$GameRoot66, [string]$BuildDirectory)
+﻿param([string]$OutputDirectory, [string]$GameRoot64, [string]$GameRoot65, [string]$GameRoot66, [string]$BuildDirectory)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = $PSScriptRoot
 # The repository is kept beside the three local game fixtures under the

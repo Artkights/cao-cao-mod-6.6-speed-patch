@@ -1,4 +1,4 @@
-param([switch]$Tests, [switch]$Publish, [string[]]$TestNames = @(), [string]$BuildDirectory)
+﻿param([switch]$Tests, [switch]$Publish, [string[]]$TestNames = @(), [string]$BuildDirectory)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = $PSScriptRoot
 $buildRoot = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $sourceRoot 'build' }
