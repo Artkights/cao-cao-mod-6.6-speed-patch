@@ -4,9 +4,12 @@
 #include "UiIds.h"
 #include "ResourceIds.h"
 #include "FeatureSelection.rc"
+#define XIAOAN_VERSION_DLL
+#include "Version.rc"
 
 IDI_DORO_WHITE ICON "Doro-white.ico"
 IDR_UNINSTALL_WORKER RCDATA "UninstallWorker.exe"
+IDR_TABLE_CONTROLS RT_MANIFEST "TableControls.manifest"
 
 IDD_SPEED DIALOGEX 0, 0, 408, 289
 STYLE DS_SETFONT | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU

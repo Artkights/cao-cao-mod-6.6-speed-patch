@@ -2,7 +2,17 @@
 
 #include "Patch.h"
 
+enum class NativeExtensionCapability : unsigned char {
+    Unsupported,
+    None,
+    Verified
+};
+
 struct SaveEnhancerImageLayout {
+    NativeExtensionCapability extensionCapability = NativeExtensionCapability::Unsupported;
+    bool hasAutomaticBoundaries = false;
+    uintptr_t extensionSaveSite = 0;
+    uintptr_t extensionLoadSite = 0;
     uintptr_t nativeAuto = 0;
     uintptr_t nativeSave = 0;
     uintptr_t nativeEndAuto = 0;
@@ -26,6 +36,9 @@ struct SaveEnhancerImageLayout {
 };
 
 bool InitializeSaveEnhancer(const wchar_t* gameRoot);
+// A failed recovery keeps the verified native guards installed. Every guarded
+// operation retries recovery before allowing the game to touch the save group.
+void SetSaveRecoveryReady(bool ready, const wchar_t* detail = L"") noexcept;
 void PollSaveEnhancer();
 void RestoreSaveEnhancer();
 bool OpenSaveBrowser(HWND owner, const wchar_t* gameRoot);
@@ -54,3 +67,4 @@ uintptr_t ConfigureSaveCommitBridgeForTest(uintptr_t post, uintptr_t continuatio
 uintptr_t SaveResultBridgeForTest();
 void SetSaveTransactionalHooksForTest(bool enabled);
 void SetSaveFailureDialogForTest(bool enabled);
+void SetSaveExtensionCapabilityForTest(NativeExtensionCapability capability);

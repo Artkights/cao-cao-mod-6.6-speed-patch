@@ -284,10 +284,11 @@ static_assert(sizeof(wchar_t) == 2, "Statistics strings use UTF-16 code units");
 constexpr std::array<char, 8> kPayloadMagic = {'X','A','S','T','A','T','2','P'};
 constexpr std::array<char, 8> kFooterMagic = {'X','A','S','T','A','T','2','F'};
 constexpr std::array<char, 8> kFooterEnd = {'X','A','S','T','A','T','E','N'};
-// The stable envelope markers are retained so schema-2 damage/truncation
-// detection also applies to schema 3. The schema field defines the row format.
-constexpr uint32_t kEmbeddedSchema = 3;
+// The stable envelope markers are retained so schema-2/3 damage/truncation
+// detection also applies to schema 4. The schema field defines the row format.
+constexpr uint32_t kEmbeddedSchema = 4;
 constexpr uint32_t kOldEmbeddedSchema = 2;
+constexpr uint32_t kPreviousEmbeddedSchema = 3;
 constexpr uint32_t kPersonCount = 65535; // 0xFFFF is the engine's empty ID.
 constexpr uint32_t kKnownMetricsMask = 0x3FF;
 constexpr uint32_t kOldKnownMetricsMask = 0xFF;
@@ -328,6 +329,21 @@ struct EmbeddedFooter {
     char nativeSha256[64];
     char payloadSha256[64];
     char end[8];
+};
+struct EmbeddedRosterHeader {
+    uint32_t rosterCount;
+    uint32_t currentParticipantCount;
+};
+struct EmbeddedRosterRow {
+    int32_t personId;
+    int32_t joinScenarioOrdinal;
+    int32_t lastCamp;
+    uint32_t joinCommandOrdinal;
+    uint8_t joined;
+    uint8_t tracking;
+    uint8_t changedFaction;
+    uint8_t source;
+    uint32_t labelCharacters;
 };
 #pragma pack(pop)
 
@@ -452,6 +468,99 @@ bool ReadGroup(const std::vector<unsigned char>& bytes, size_t& offset, uint32_t
     return true;
 }
 
+bool AppendRoster(std::vector<unsigned char>& bytes,
+    const std::vector<BattleRosterEntry>& roster,
+    const std::vector<int>& currentParticipants,
+    std::wstring& error) {
+    if (roster.size() > kPersonCount || currentParticipants.size() > kMaxUnits) {
+        error = L"战场统计 roster 人数超过格式限制。";
+        return false;
+    }
+    EmbeddedRosterHeader header = {};
+    header.rosterCount = static_cast<uint32_t>(roster.size());
+    header.currentParticipantCount = static_cast<uint32_t>(currentParticipants.size());
+    AppendValue(bytes, header);
+    std::vector<bool> seen(kPersonCount, false);
+    for (const BattleRosterEntry& entry : roster) {
+        if (entry.personId < 0 || entry.personId >= static_cast<int>(kPersonCount) ||
+            seen[static_cast<size_t>(entry.personId)] ||
+            entry.label.size() > kMaxLabelCharacters ||
+            entry.joinScenarioOrdinal < -1 || entry.joinScenarioOrdinal >= 0xFFFF ||
+            entry.lastCamp < -1 || entry.lastCamp > 255 ||
+            static_cast<unsigned>(entry.source) > static_cast<unsigned>(BattleRosterSource::ExistingCampaignLedger)) {
+            error = L"战场统计 roster 人物状态无效或重复。";
+            return false;
+        }
+        seen[static_cast<size_t>(entry.personId)] = true;
+        EmbeddedRosterRow row = {};
+        row.personId = entry.personId;
+        row.joinScenarioOrdinal = entry.joinScenarioOrdinal;
+        row.lastCamp = entry.lastCamp;
+        row.joinCommandOrdinal = entry.joinCommandOrdinal;
+        row.joined = entry.joined ? 1 : 0;
+        row.tracking = entry.tracking ? 1 : 0;
+        row.changedFaction = entry.changedFaction ? 1 : 0;
+        row.source = static_cast<uint8_t>(entry.source);
+        row.labelCharacters = static_cast<uint32_t>(entry.label.size());
+        AppendValue(bytes, row);
+        AppendWide(bytes, entry.label);
+    }
+    std::vector<bool> participantSeen(kPersonCount, false);
+    for (int personId : currentParticipants) {
+        if (personId < 0 || personId >= static_cast<int>(kPersonCount) ||
+            participantSeen[static_cast<size_t>(personId)]) {
+            error = L"战场统计当前出战人物编号无效或重复。";
+            return false;
+        }
+        participantSeen[static_cast<size_t>(personId)] = true;
+        const int32_t value = personId;
+        AppendValue(bytes, value);
+    }
+    return true;
+}
+
+bool ReadRoster(const std::vector<unsigned char>& bytes, size_t& offset,
+    std::vector<BattleRosterEntry>& roster,
+    std::vector<int>& currentParticipants) {
+    EmbeddedRosterHeader header = {};
+    if (!ReadValue(bytes, offset, header) || header.rosterCount > kPersonCount ||
+        header.currentParticipantCount > kMaxUnits) return false;
+    std::vector<bool> seen(kPersonCount, false);
+    roster.reserve(header.rosterCount);
+    for (uint32_t index = 0; index < header.rosterCount; ++index) {
+        EmbeddedRosterRow row = {};
+        BattleRosterEntry entry;
+        if (!ReadValue(bytes, offset, row) || row.personId < 0 ||
+            row.personId >= static_cast<int32_t>(kPersonCount) ||
+            seen[static_cast<size_t>(row.personId)] || row.joined > 1 || row.tracking > 1 ||
+            row.changedFaction > 1 || row.source > static_cast<uint8_t>(BattleRosterSource::ExistingCampaignLedger) ||
+            row.joinScenarioOrdinal < -1 || row.joinScenarioOrdinal >= 0xFFFF ||
+            row.lastCamp < -1 || row.lastCamp > 255 || row.labelCharacters > kMaxLabelCharacters ||
+            !ReadWide(bytes, offset, row.labelCharacters, entry.label)) return false;
+        seen[static_cast<size_t>(row.personId)] = true;
+        entry.personId = row.personId;
+        entry.joinScenarioOrdinal = row.joinScenarioOrdinal;
+        entry.lastCamp = row.lastCamp;
+        entry.joinCommandOrdinal = row.joinCommandOrdinal;
+        entry.joined = row.joined != 0;
+        entry.tracking = row.tracking != 0;
+        entry.changedFaction = row.changedFaction != 0;
+        entry.source = static_cast<BattleRosterSource>(row.source);
+        roster.push_back(std::move(entry));
+    }
+    std::vector<bool> participantSeen(kPersonCount, false);
+    currentParticipants.reserve(header.currentParticipantCount);
+    for (uint32_t index = 0; index < header.currentParticipantCount; ++index) {
+        int32_t personId = -1;
+        if (!ReadValue(bytes, offset, personId) || personId < 0 ||
+            personId >= static_cast<int32_t>(kPersonCount) ||
+            participantSeen[static_cast<size_t>(personId)]) return false;
+        participantSeen[static_cast<size_t>(personId)] = true;
+        currentParticipants.push_back(personId);
+    }
+    return true;
+}
+
 BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     BattleStatsPersistedState& state, size_t& nativeBytes, std::wstring& error) {
     nativeBytes = bytes.size();
@@ -463,7 +572,8 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
         error = L"存档中的战场统计扩展块被截断或尾部标记已损坏。";
         return BattleStatsReadResult::Corrupt;
     }
-    if (footer.schema != kEmbeddedSchema && footer.schema != kOldEmbeddedSchema) {
+    if (footer.schema != kEmbeddedSchema && footer.schema != kPreviousEmbeddedSchema &&
+        footer.schema != kOldEmbeddedSchema) {
         error = L"存档使用了当前补丁不支持的战场统计版本。";
         return BattleStatsReadResult::Unsupported;
     }
@@ -488,10 +598,11 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     if (!ReadValue(payload, offset, header) ||
         memcmp(header.magic, kPayloadMagic.data(), kPayloadMagic.size()) ||
         header.schema != footer.schema || header.headerBytes != sizeof(header) ||
-        (header.flags & ~3u) || header.unitCount > kMaxUnits || header.campaignUnitCount > kPersonCount ||
+        (header.flags & ~(footer.schema >= kEmbeddedSchema ? 7u : 3u)) ||
+        header.unitCount > kMaxUnits || header.campaignUnitCount > kPersonCount ||
         header.scenarioCharacters > kMaxScenarioCharacters || header.statusCharacters > kMaxStatusCharacters ||
         header.scenarioOrdinal < -1 || header.scenarioOrdinal >= static_cast<int32_t>(kPersonCount) ||
-        (header.knownMetrics & ~(footer.schema == kOldEmbeddedSchema ?
+            (header.knownMetrics & ~(footer.schema == kOldEmbeddedSchema ?
             kOldKnownMetricsMask : kKnownMetricsMask))) {
         error = L"存档中的战场统计版本字段、人物数量或文本长度无效。";
         return BattleStatsReadResult::Corrupt;
@@ -500,6 +611,7 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     decoded.schemaVersion = header.schema;
     decoded.active = (header.flags & 1) != 0;
     decoded.historyIncomplete = (header.flags & 2) != 0 || header.schema < kEmbeddedSchema;
+    decoded.rosterHistoryIncomplete = (header.flags & 4) != 0 || header.schema < kEmbeddedSchema;
     decoded.scenarioOrdinal = header.scenarioOrdinal;
     decoded.knownMetrics = header.knownMetrics;
     decoded.elapsedMilliseconds = header.elapsedMilliseconds;
@@ -508,7 +620,10 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     if (!ReadWide(payload, offset, header.scenarioCharacters, decoded.scenario) ||
         !ReadWide(payload, offset, header.statusCharacters, decoded.status) ||
         !ReadGroup(payload, offset, header.unitCount, header.schema, decoded.units) ||
-        !ReadGroup(payload, offset, header.campaignUnitCount, header.schema, decoded.campaignUnits) || offset != payload.size()) {
+        !ReadGroup(payload, offset, header.campaignUnitCount, header.schema, decoded.campaignUnits) ||
+        (header.schema >= kEmbeddedSchema &&
+            !ReadRoster(payload, offset, decoded.campaignRoster, decoded.currentBattleParticipants)) ||
+        offset != payload.size() || !ValidateBattleStatsRosterState(decoded)) {
         error = L"存档中的战场统计人物数据不完整、重复或包含非法计数。";
         return BattleStatsReadResult::Corrupt;
     }
@@ -564,7 +679,8 @@ bool WriteBattleStatsEmbedded(const std::wstring& savePath,
     if (state.schemaVersion != kEmbeddedSchema || state.units.size() > kMaxUnits ||
         state.campaignUnits.size() > kPersonCount || state.scenario.size() > kMaxScenarioCharacters ||
         state.status.size() > kMaxStatusCharacters || state.scenarioOrdinal < -1 ||
-        state.scenarioOrdinal >= static_cast<int>(kPersonCount) || (state.knownMetrics & ~kKnownMetricsMask)) {
+        state.scenarioOrdinal >= static_cast<int>(kPersonCount) || (state.knownMetrics & ~kKnownMetricsMask) ||
+        !ValidateBattleStatsRosterState(state)) {
         error = L"战场统计状态版本、数量、文本长度或已知指标字段超过格式限制。";
         return false;
     }
@@ -573,7 +689,8 @@ bool WriteBattleStatsEmbedded(const std::wstring& savePath,
     memcpy(header.magic, kPayloadMagic.data(), kPayloadMagic.size());
     header.schema = kEmbeddedSchema;
     header.headerBytes = sizeof(header);
-    header.flags = (state.active ? 1u : 0u) | (state.historyIncomplete ? 2u : 0u);
+    header.flags = (state.active ? 1u : 0u) | (state.historyIncomplete ? 2u : 0u) |
+        (state.rosterHistoryIncomplete ? 4u : 0u);
     header.unitCount = static_cast<uint32_t>(state.units.size());
     header.campaignUnitCount = static_cast<uint32_t>(state.campaignUnits.size());
     header.scenarioCharacters = static_cast<uint32_t>(state.scenario.size());
@@ -586,7 +703,8 @@ bool WriteBattleStatsEmbedded(const std::wstring& savePath,
     AppendValue(payload, header);
     AppendWide(payload, state.scenario);
     AppendWide(payload, state.status);
-    if (!AppendGroup(payload, state.units, error) || !AppendGroup(payload, state.campaignUnits, error)) return false;
+    if (!AppendGroup(payload, state.units, error) || !AppendGroup(payload, state.campaignUnits, error) ||
+        !AppendRoster(payload, state.campaignRoster, state.currentBattleParticipants, error)) return false;
     if (payload.size() > kMaxPayloadBytes) {
         error = L"战场统计扩展超过大小上限。";
         return false;

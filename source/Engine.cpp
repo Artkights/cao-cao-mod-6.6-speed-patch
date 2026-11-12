@@ -1,5 +1,6 @@
 #include "Patch.h"
 #include "EngineLayout.h"
+#include "PeImage.h"
 #include "Features.h"
 #include <mmsystem.h>
 #include <stdint.h>
@@ -82,6 +83,7 @@ RuntimeJournalEntry gPhaseJournal = {};
 RuntimeJournalEntry gNativeStateJournal = {};
 RuntimeJournalEntry gNativeBusyJournal = {};
 bool gInitialized = false;
+size_t gRuntimeImageSize = 0;
 wchar_t gError[256] = {};
 SRWLOCK gPhaseLock = SRWLOCK_INIT;
 struct PhaseState {
@@ -117,6 +119,28 @@ int gWriteCount = 0;
 ULONGLONG (WINAPI* gTestSuperClock)() = nullptr;
 void (WINAPI* gTestSuperSleep)(DWORD) = nullptr;
 bool (__cdecl* gTestSuperPump)() = nullptr;
+// Existing deterministic harnesses keep mapped images in std::vector storage.
+// Production and the strict runtime harness require executable live pages.
+bool gTestSyntheticDataImage = false;
+bool gTestDirectPointers = false;
+struct SyntheticImageCopy {
+    BYTE* bytes = nullptr;
+    ~SyntheticImageCopy() { if (bytes) VirtualFree(bytes, 0, MEM_RELEASE); }
+    bool Capture(const BYTE* source, std::wstring& error) {
+        IMAGE_DOS_HEADER dos = {};
+        IMAGE_NT_HEADERS32 nt = {};
+        const uintptr_t origin = reinterpret_cast<uintptr_t>(source);
+        if (!ReadRuntimeMemory(source, &dos, sizeof(dos), error) ||
+            dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < sizeof(dos) ||
+            dos.e_lfanew > 0x100000 || static_cast<uintptr_t>(dos.e_lfanew) > UINTPTR_MAX - origin ||
+            !ReadRuntimeMemory(reinterpret_cast<const void*>(origin + dos.e_lfanew), &nt, sizeof(nt), error) ||
+            nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+            !nt.OptionalHeader.SizeOfImage || nt.OptionalHeader.SizeOfImage > kMaximumPeAnalysisImage) return false;
+        bytes = static_cast<BYTE*>(VirtualAlloc(nullptr, nt.OptionalHeader.SizeOfImage,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        return bytes && ReadRuntimeMemory(source, bytes, nt.OptionalHeader.SizeOfImage, error);
+    }
+};
 #endif
 
 extern "C" int __cdecl SuperYieldBridge();
@@ -138,12 +162,30 @@ BYTE* At(uintptr_t address) {
 }
 
 bool ReadBytes(uintptr_t address, void* destination, size_t length) {
-    __try {
-        memcpy(destination, At(address), length);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+#ifdef XA66_TEST
+    if (gTestDirectPointers) {
+        std::wstring error;
+        return ReadRuntimeMemory(reinterpret_cast<const void*>(address), destination, length, error);
     }
+#endif
+    if (address < kPreferredBase || !gGameBase) return false;
+    const uintptr_t rva = address - kPreferredBase;
+    if ((gRuntimeImageSize && (rva > gRuntimeImageSize || length > gRuntimeImageSize - rva)) ||
+        rva > UINTPTR_MAX - gGameBase) return false;
+    std::wstring error;
+    return ReadRuntimeMemory(reinterpret_cast<const void*>(gGameBase + rva), destination, length, error);
+}
+
+bool LiveRange(uintptr_t address, size_t length, bool executable) {
+    if (address < kPreferredBase || !gGameBase) return false;
+    const uintptr_t rva = address - kPreferredBase;
+    if ((gRuntimeImageSize && (rva > gRuntimeImageSize || length > gRuntimeImageSize - rva)) ||
+        rva > UINTPTR_MAX - gGameBase) return false;
+#ifdef XA66_TEST
+    executable = executable && !gTestSyntheticDataImage;
+#endif
+    std::wstring error;
+    return ValidateRuntimeMemory(reinterpret_cast<const void*>(gGameBase + rva), length, executable, error);
 }
 
 bool MatchBytes(uintptr_t address, const BYTE* expected, size_t length) {
@@ -222,43 +264,63 @@ void SetSiteMismatch(const wchar_t* prefix, const Site& site, const BYTE* expect
         prefix, static_cast<unsigned>(site.address), expectedText, actualText);
 }
 
+bool WriteProtectedBytes(uintptr_t address, const BYTE* bytes, size_t length, bool executable) {
+    if (!bytes || !length || length > 8 || !LiveRange(address, length, executable)) return false;
+    BYTE* location = At(address);
+    struct Segment { BYTE* address; size_t length; DWORD protection; } segments[2] = {};
+    size_t count = 0, offset = 0;
+    bool prepared = true;
+    while (offset < length && count < ARRAYSIZE(segments)) {
+        MEMORY_BASIC_INFORMATION region = {};
+        const uintptr_t at = reinterpret_cast<uintptr_t>(location + offset);
+        if (!VirtualQuery(location + offset, &region, sizeof(region))) { prepared = false; break; }
+        const uintptr_t origin = reinterpret_cast<uintptr_t>(region.BaseAddress);
+        if (region.RegionSize > UINTPTR_MAX - origin || origin + region.RegionSize <= at) {
+            prepared = false;
+            break;
+        }
+        const size_t available = static_cast<size_t>(origin + region.RegionSize - at);
+        const size_t part = length - offset < available ? length - offset : available;
+        Segment& segment = segments[count];
+        segment.address = location + offset;
+        segment.length = part;
+        const DWORD executeBits = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        const DWORD protection = executable || (region.Protect & executeBits) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+        if (!VirtualProtect(segment.address, part, protection, &segment.protection)) { prepared = false; break; }
+        ++count;
+        offset += part;
+    }
+    prepared = prepared && offset == length;
+    bool written = false;
+    if (prepared) {
+        __try {
+            memcpy(location, bytes, length);
+            written = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            written = false;
+        }
+    }
+    const bool flushed = !written || FlushInstructionCache(GetCurrentProcess(), location, length) != 0;
+    bool restored = true;
+    while (count) {
+        const Segment& segment = segments[--count];
+        DWORD ignored = 0;
+        restored = VirtualProtect(segment.address, segment.length, segment.protection, &ignored) != 0 && restored;
+    }
+    return prepared && written && flushed && restored;
+}
+
 bool WriteSite(const Site& site, const BYTE* bytes, bool rollback = false) {
 #ifdef XA66_TEST
     if (!rollback && gFailWrite >= 0 && gWriteCount++ == gFailWrite) return false;
 #else
     (void)rollback;
 #endif
-    DWORD protection = 0;
-    BYTE* location = At(site.address);
-    if (!VirtualProtect(location, site.length, PAGE_EXECUTE_READWRITE, &protection)) return false;
-    bool written = false;
-    __try {
-        memcpy(location, bytes, site.length);
-        written = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        written = false;
-    }
-    const BOOL flushed = FlushInstructionCache(GetCurrentProcess(), location, site.length);
-    DWORD ignored = 0;
-    const BOOL restored = VirtualProtect(location, site.length, protection, &ignored);
-    return written && flushed && restored;
+    return WriteProtectedBytes(site.address, bytes, site.length, true);
 }
 
 bool WriteMemory(uintptr_t address, const BYTE* bytes, size_t length) {
-    DWORD protection = 0;
-    BYTE* location = At(address);
-    if (!VirtualProtect(location, length, PAGE_READWRITE, &protection)) return false;
-    bool written = false;
-    __try {
-        memcpy(location, bytes, length);
-        written = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        written = false;
-    }
-    FlushInstructionCache(GetCurrentProcess(), location, length);
-    DWORD ignored = 0;
-    const BOOL restored = VirtualProtect(location, length, protection, &ignored);
-    return written && restored;
+    return WriteProtectedBytes(address, bytes, length, false);
 }
 
 bool RestoreSiteJournals() {
@@ -607,8 +669,10 @@ bool NormalizeNativeToggleLayout() {
     return true;
 }
 
-bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
+bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0,
+    bool allowVersionFallback = false, EngineProfileId fallbackProfile = EngineProfileId::Unknown) {
     gInitialized = false;
+    gRuntimeImageSize = 0;
     gPhaseDataAvailable = false;
     gNativeDataAvailable = false;
     for (size_t i = 0; i < kSiteCount; ++i) gSiteJournal[i] = RuntimeJournalEntry();
@@ -622,36 +686,65 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
     }
     if (resolveLayout) {
         EngineLayout layout;
-        const BYTE* image = reinterpret_cast<const BYTE*>(gGameBase);
-        bool forced = false;
-#ifndef XA66_TEST
-        wchar_t modulePath[32768] = {};
-        if (gInstance && GetModuleFileNameW(gInstance, modulePath, static_cast<DWORD>(_countof(modulePath)))) {
-            wchar_t* slash = wcsrchr(modulePath, L'\\');
-            if (slash) {
-                *slash = 0;
-                const std::wstring statePath = PatchPrivatePath(modulePath, CompiledEngineProfile()) +
-                    L"\\feature-state.ini";
-                wchar_t mode[32] = {};
-                GetPrivateProfileStringW(L"Install", L"EngineMode", L"Automatic", mode,
-                    static_cast<DWORD>(_countof(mode)), statePath.c_str());
-                const unsigned selected = GetPrivateProfileIntW(L"Install", L"EngineProfile", 0,
-                    statePath.c_str());
-                forced = !_wcsicmp(mode, L"Forced") && selected == static_cast<unsigned>(CompiledEngineProfile());
+        RuntimeImageView snapshot;
+        std::wstring readError;
+        const BYTE* captureBase = reinterpret_cast<const BYTE*>(gGameBase);
+#ifdef XA66_TEST
+        // The legacy deterministic fixtures use std::vector rather than an
+        // independent module allocation. Copy those bounded test images into
+        // a dedicated allocation before using the production snapshot reader;
+        // the live source and byte journal still refer to the fixture itself.
+        SyntheticImageCopy syntheticImage;
+        if (gTestSyntheticDataImage) {
+            if (!syntheticImage.Capture(captureBase, readError)) {
+                SetError(L"无法捕获测试映像，未修改引擎。" );
+                return false;
             }
+            captureBase = syntheticImage.bytes;
         }
 #endif
-        bool resolved = false;
-        if (forced) {
-            const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
-            const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
-            resolved = ResolveForcedEngineLayout(image, nt->OptionalHeader.SizeOfImage,
-                CompiledEngineProfile(), layout, virtualBase);
-        } else resolved = ResolveEngineLayout(image, layout, virtualBase);
-        if (!resolved) {
-            SetError(L"\u672a\u80fd\u5b9a\u4f4d\u6b64\u57fa\u5e95\u7684\u52a0\u901f\u51fd\u6570\u3002");
+        if (!snapshot.Capture(captureBase, 0, readError)) {
+            SetError(L"无法安全捕获游戏运行时映像，未修改引擎。" );
             return false;
         }
+        const BYTE* image = snapshot.Data();
+        gRuntimeImageSize = snapshot.Size();
+        const uintptr_t operandBase = virtualBase ? virtualBase : gGameBase;
+        EngineAnalysisSource analysisSource = EngineAnalysisSource::Runtime;
+#ifdef XA66_TEST
+        if (gTestSyntheticDataImage) analysisSource = EngineAnalysisSource::Disk;
+#endif
+        bool resolved = ResolveEngineLayout(image, layout, operandBase, analysisSource, gGameBase) &&
+            layout.plan.status == EnginePlanStatus::AutoVerified;
+        if (!resolved && allowVersionFallback) {
+            resolved = ResolveVersionEngineLayout(image, snapshot.Size(),
+                fallbackProfile == EngineProfileId::Unknown ? CompiledEngineProfile() : fallbackProfile,
+                layout, operandBase);
+        }
+        if (!resolved) {
+            SetError(L"未能定位并验证此基底的加速函数。" );
+            return false;
+        }
+        const auto validateSite = [&](const EngineSitePlan& site, bool executable) {
+            if (!site.present) return !site.required;
+            return LiveRange(site.legacyAddress, site.length, executable) &&
+                MatchBytes(site.legacyAddress, site.original, site.length);
+        };
+        bool liveVerified = true;
+        for (const auto& site : layout.plan.sites) liveVerified = validateSite(site, true) && liveVerified;
+        const EngineSitePlan* dataSites[] = {&layout.plan.nativeState, &layout.plan.nativeBusy,
+            &layout.plan.phaseTable, &layout.plan.phaseValue, &layout.plan.speedValue, &layout.plan.timerContext};
+        for (const auto* site : dataSites) liveVerified = validateSite(*site, false) && liveVerified;
+        liveVerified = validateSite(layout.plan.nativeRoute, true) && liveVerified;
+        const uintptr_t dependencies[] = {layout.waitWrapper, layout.nativeStage, layout.deadline, layout.sleep, layout.pump};
+        for (const uintptr_t address : dependencies)
+            if (address && !LiveRange(address, 1, true)) liveVerified = false;
+        if (!liveVerified) {
+            SetError(L"运行时站点页面不可读/不可执行或原始字节已变化，未提交加速钩子。" );
+            return false;
+        }
+        layout.plan.loadedBase = gGameBase;
+        layout.plan.runtimeValidated = true;
 #ifndef XA66_TEST
         if (layout.profile != CompiledEngineProfile()) {
             SetError(L"游戏引擎与补丁版本不匹配，请重新运行加速补丁安装器。");
@@ -668,6 +761,7 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
         gSites[kNativeRouteSite].available = layout.nativeSuper != 0 &&
             (layout.capabilities & CapabilityNativeSuper) != 0;
     }
+    const bool versionSelected = gLayout.plan.status == EnginePlanStatus::VersionSelected;
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     gRealCounter = reinterpret_cast<decltype(gRealCounter)>(GetProcAddress(kernel, "QueryPerformanceCounter"));
     const auto frequency = reinterpret_cast<BOOL (WINAPI*)(LARGE_INTEGER*)>(
@@ -686,7 +780,7 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
         return false;
     }
     if (gSites[SiteWaitCall].available) {
-        if (CallTarget(gSites[SiteWaitCall].address) != gLayout.nativeStage) {
+        if (!versionSelected && CallTarget(gSites[SiteWaitCall].address) != gLayout.nativeStage) {
             SetSiteMismatch(L"公共等待调用目标无效，已停用阶段和超级 S", gSites[SiteWaitCall],
                 gSites[SiteWaitCall].original);
             gSites[SiteWaitCall].available = false;
@@ -694,7 +788,7 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
             gSites[SiteWaitCall].length);
     }
     if (gSites[SiteRWait].available) {
-        if (CallTarget(gSites[SiteRWait].address) != gLayout.waitWrapper) {
+        if (!versionSelected && CallTarget(gSites[SiteRWait].address) != gLayout.waitWrapper) {
             gSites[SiteRWait].available = false;
         } else ReadBytes(gSites[SiteRWait].address, gSites[SiteRWait].original,
             gSites[SiteRWait].length);
@@ -703,16 +797,22 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
         !ReadBytes(gSites[kNativeRouteSite].address, gSites[kNativeRouteSite].original,
             gSites[kNativeRouteSite].length))
         gSites[kNativeRouteSite].available = false;
-    if (gLayout.plan.mode != EngineResolveMode::Forced && !NormalizeNativeToggleLayout()) return false;
-    if (gLayout.plan.mode == EngineResolveMode::Forced) gNativeDataAvailable =
-        gLayout.nativeSuperState != 0 && gLayout.nativeSuperBusy != 0;
+    if (versionSelected) {
+        // A confirmed version template captures the current bytes verbatim.
+        // Do not normalize native toggle bytes or zero the live state before
+        // the restoration journal has a chance to preserve them.
+        BYTE state = 0, busy = 0;
+        gNativeDataAvailable = gLayout.nativeSuperState && gLayout.nativeSuperBusy &&
+            ReadBytes(gLayout.nativeSuperState, &state, 1) &&
+            ReadBytes(gLayout.nativeSuperBusy, &busy, 1);
+    } else if (!NormalizeNativeToggleLayout()) return false;
     for (size_t i = 0; i < kSiteCount; ++i) {
         if (!gSites[i].available) continue;
         if (i == SiteWaitCall || i == SiteRWait || i == kNativeRouteSite) {
             memcpy(gSites[i].current, gSites[i].original, gSites[i].length);
             continue;
         }
-        if (resolveLayout && i == SiteInputModifier) {
+        if (resolveLayout && !versionSelected && i == SiteInputModifier) {
             BYTE modifier = 0;
             if (!ReadBytes(gSites[i].address, &modifier, 1) ||
                 (modifier != VK_SHIFT && modifier != VK_CONTROL)) {
@@ -721,7 +821,7 @@ bool InitializeSites(bool resolveLayout, uintptr_t virtualBase = 0) {
             }
             gSites[i].original[0] = modifier;
         }
-        if (!MatchBytes(gSites[i].address, gSites[i].original, gSites[i].length)) {
+        if (!versionSelected && !MatchBytes(gSites[i].address, gSites[i].original, gSites[i].length)) {
             SetSiteMismatch(L"\u6307\u4ee4\u6821\u9a8c\u5931\u8d25\uff0c\u5df2\u505c\u7528\u8be5\u529f\u80fd", gSites[i], gSites[i].original);
             gSites[i].available = false;
             continue;
@@ -810,9 +910,9 @@ int StageDelay(int value, int& counter) {
     return delay;
 }
 
-bool InitializeEngine() {
+bool InitializeEngine(bool allowVersionFallback) {
     if (gInitialized) return true;
-    return InitializeSites(true);
+    return InitializeSites(true, 0, allowVersionFallback);
 }
 
 int CurrentGamePhase() {
@@ -1018,8 +1118,22 @@ void SetNativeToggleHandler(void (__cdecl* handler)()) {
 }
 
 #ifdef XA66_TEST
-bool EngineTestInitialize() { return InitializeSites(false); }
-bool EngineTestInitializeImage(uintptr_t virtualBase) { return InitializeSites(true, virtualBase); }
+bool EngineTestWriteCode(uintptr_t address, const BYTE* bytes, size_t length) {
+    return WriteProtectedBytes(address, bytes, length, true);
+}
+bool EngineTestInitialize() { gTestSyntheticDataImage = true; return InitializeSites(false); }
+bool EngineTestInitializeImage(uintptr_t virtualBase) {
+    gTestSyntheticDataImage = true;
+    return InitializeSites(true, virtualBase);
+}
+bool EngineTestInitializeRuntimeImage(uintptr_t virtualBase) {
+    gTestSyntheticDataImage = false;
+    return InitializeSites(true, virtualBase);
+}
+bool EngineTestInitializeVersionImage(uintptr_t virtualBase, EngineProfileId profile) {
+    gTestSyntheticDataImage = true;
+    return InitializeSites(true, virtualBase, true, profile);
+}
 bool EngineTestOwnedPhaseState(int phase, int& value, int& counter) {
     if (!gLayout.phaseOwnedByPatch || !gPhaseInstalled || !gPhase.enabled || phase < 0 || phase >= 3) return false;
     value = gPhase.flags[phase] ? gPhase.values[phase] : 50;
@@ -1053,10 +1167,12 @@ int EngineTestTimerABI(bool usesThis, uintptr_t stage, uintptr_t deadline, uintp
     const uintptr_t savedBase = gGameBase;
     const bool savedInstalled = gPhaseInstalled;
     const bool savedAvailable = gPhaseDataAvailable;
+    const bool savedDirectPointers = gTestDirectPointers;
     WORD speed = 0;
     BYTE phase = 0;
     BYTE table[4] = {60,60,60,0};
     gGameBase = kPreferredBase;
+    gTestDirectPointers = true;
     gLayout = EngineLayout();
     gLayout.stageUsesThis = usesThis;
     gLayout.nativeStage = stage;
@@ -1078,6 +1194,7 @@ int EngineTestTimerABI(bool usesThis, uintptr_t stage, uintptr_t deadline, uintp
     gGameBase = savedBase;
     gPhaseInstalled = savedInstalled;
     gPhaseDataAvailable = savedAvailable;
+    gTestDirectPointers = savedDirectPointers;
     return result;
 }
 int EngineTestSuperWaitABI(bool usesThis, uintptr_t stage, uintptr_t context, uintptr_t caller,

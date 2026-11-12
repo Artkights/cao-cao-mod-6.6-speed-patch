@@ -27,6 +27,19 @@ struct TestHeader {
     uint32_t knownMetrics;
     uint64_t elapsedMilliseconds, campaignId, battleInstance;
 };
+struct TestLegacyRow {
+    int32_t personId, slot, defeatedEnemies;
+    int64_t damageDealt, damageReceived, recoveryDone, criticalCount;
+    int64_t comboExtraHitCount, attackBlockCount, spellBlockCount;
+    uint32_t labelCharacters;
+};
+struct TestRosterHeader { uint32_t rosterCount, participantCount; };
+struct TestRosterRow {
+    int32_t personId, joinScenarioOrdinal, lastCamp;
+    uint32_t joinCommandOrdinal;
+    uint8_t joined, tracking, changedFaction, source;
+    uint32_t labelCharacters;
+};
 #pragma pack(pop)
 
 void Check(bool condition, const char* name) {
@@ -98,6 +111,33 @@ BattleStatsPersistedState SampleState() {
     state.units.push_back(SampleUnit(65000, 6));
     state.campaignUnits = state.units;
     state.campaignUnits.push_back(SampleUnit(65534, -1));
+    BattleRosterEntry joined;
+    joined.personId = 7;
+    joined.label = L"刘备 / 人物 7";
+    joined.joined = true;
+    joined.tracking = true;
+    joined.lastCamp = 0;
+    joined.joinScenarioOrdinal = 2;
+    joined.joinCommandOrdinal = 14;
+    joined.source = BattleRosterSource::RuntimeJoin3B;
+    state.campaignRoster.push_back(joined);
+    BattleRosterEntry changed;
+    changed.personId = 65000;
+    changed.label = state.campaignUnits[1].label;
+    changed.joined = true;
+    changed.changedFaction = true;
+    changed.lastCamp = 2;
+    changed.joinScenarioOrdinal = 4;
+    changed.source = BattleRosterSource::LegacyStaticR;
+    state.campaignRoster.push_back(changed);
+    BattleRosterEntry reserve;
+    reserve.personId = 65534;
+    reserve.label = state.campaignUnits[2].label;
+    reserve.joined = reserve.tracking = true;
+    reserve.lastCamp = 0;
+    reserve.source = BattleRosterSource::ExistingCampaignLedger;
+    state.campaignRoster.push_back(reserve);
+    state.currentBattleParticipants = {7, 65000};
     return state;
 }
 
@@ -112,14 +152,28 @@ bool SameUnit(const BattleUnitTotals& left, const BattleUnitTotals& right) {
 }
 
 bool SameState(const BattleStatsPersistedState& left, const BattleStatsPersistedState& right) {
-    return left.schemaVersion == right.schemaVersion && left.active == right.active &&
+    if (!(left.schemaVersion == right.schemaVersion && left.active == right.active &&
         left.elapsedMilliseconds == right.elapsedMilliseconds && left.scenario == right.scenario &&
         left.scenarioOrdinal == right.scenarioOrdinal && left.campaignId == right.campaignId &&
         left.battleInstance == right.battleInstance && left.knownMetrics == right.knownMetrics &&
         left.historyIncomplete == right.historyIncomplete && left.status == right.status &&
         left.units.size() == right.units.size() && left.campaignUnits.size() == right.campaignUnits.size() &&
         std::equal(left.units.begin(), left.units.end(), right.units.begin(), SameUnit) &&
-        std::equal(left.campaignUnits.begin(), left.campaignUnits.end(), right.campaignUnits.begin(), SameUnit);
+        std::equal(left.campaignUnits.begin(), left.campaignUnits.end(), right.campaignUnits.begin(), SameUnit)))
+        return false;
+    if (left.rosterHistoryIncomplete != right.rosterHistoryIncomplete ||
+        left.currentBattleParticipants != right.currentBattleParticipants ||
+        left.campaignRoster.size() != right.campaignRoster.size()) return false;
+    for (size_t i = 0; i < left.campaignRoster.size(); ++i) {
+        const BattleRosterEntry& a = left.campaignRoster[i];
+        const BattleRosterEntry& b = right.campaignRoster[i];
+        if (a.personId != b.personId || a.label != b.label || a.joined != b.joined ||
+            a.tracking != b.tracking || a.changedFaction != b.changedFaction ||
+            a.lastCamp != b.lastCamp || a.joinScenarioOrdinal != b.joinScenarioOrdinal ||
+            a.joinCommandOrdinal != b.joinCommandOrdinal ||
+            a.source != b.source) return false;
+    }
+    return true;
 }
 
 bool ChildPathIsIsolated(const wchar_t* path) {
@@ -163,6 +217,92 @@ bool RefreshPayloadHash(std::vector<unsigned char>& bytes) {
     return true;
 }
 
+template<class T> void AppendFixture(std::vector<unsigned char>& bytes, const T& value) {
+    const auto* first = reinterpret_cast<const unsigned char*>(&value);
+    bytes.insert(bytes.end(), first, first + sizeof(value));
+}
+
+void AppendFixtureText(std::vector<unsigned char>& bytes, const std::wstring& text) {
+    const auto* first = reinterpret_cast<const unsigned char*>(text.data());
+    bytes.insert(bytes.end(), first, first + text.size() * sizeof(wchar_t));
+}
+
+// Build the original schema-2/3 wire formats independently of the schema-4
+// writer: schema 2 has no received counters; neither legacy format has roster.
+bool WriteLegacyFixture(const std::wstring& path, uint32_t schema,
+    const BattleStatsPersistedState& state) {
+    std::vector<unsigned char> payload;
+    TestHeader header = {};
+    memcpy(header.magic, "XASTAT2P", 8);
+    header.schema = schema;
+    header.headerBytes = sizeof(header);
+    header.flags = state.active ? 1u : 0u;
+    header.unitCount = static_cast<uint32_t>(state.units.size());
+    header.campaignUnitCount = static_cast<uint32_t>(state.campaignUnits.size());
+    header.scenarioCharacters = static_cast<uint32_t>(state.scenario.size());
+    header.statusCharacters = static_cast<uint32_t>(state.status.size());
+    header.scenarioOrdinal = state.scenarioOrdinal;
+    header.knownMetrics = schema == 2 ? state.knownMetrics & 0xFFu : state.knownMetrics;
+    header.elapsedMilliseconds = state.elapsedMilliseconds;
+    header.campaignId = state.campaignId;
+    header.battleInstance = state.battleInstance;
+    AppendFixture(payload, header);
+    AppendFixtureText(payload, state.scenario);
+    AppendFixtureText(payload, state.status);
+    for (const auto* group : {&state.units, &state.campaignUnits}) {
+        for (const BattleUnitTotals& unit : *group) {
+            const TestLegacyRow row = {unit.personId, unit.slot, unit.defeatedEnemies,
+                unit.damageDealt, unit.damageReceived, unit.recoveryDone, unit.criticalCount,
+                unit.comboExtraHitCount, unit.attackBlockCount, unit.spellBlockCount,
+                static_cast<uint32_t>(unit.label.size())};
+            AppendFixture(payload, row);
+            if (schema == 3) {
+                AppendFixture(payload, unit.physicalReceivedCount);
+                AppendFixture(payload, unit.strategyReceivedCount);
+            }
+            AppendFixtureText(payload, unit.label);
+        }
+    }
+    std::vector<unsigned char> bytes(kNativePayload, kNativePayload + strlen(kNativePayload));
+    TestFooter footer = {};
+    memcpy(footer.magic, "XASTAT2F", 8);
+    memcpy(footer.end, "XASTATEN", 8);
+    footer.schema = schema;
+    footer.footerBytes = sizeof(footer);
+    footer.nativeBytes = bytes.size();
+    footer.payloadBytes = payload.size();
+    std::wstring hash, error;
+    if (!XiaoAnInstall::Sha256Bytes(bytes, hash, error)) return false;
+    for (size_t i = 0; i < 64; ++i) footer.nativeSha256[i] = static_cast<char>(hash[i]);
+    if (!XiaoAnInstall::Sha256Bytes(payload, hash, error)) return false;
+    for (size_t i = 0; i < 64; ++i) footer.payloadSha256[i] = static_cast<char>(hash[i]);
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    AppendFixture(bytes, footer);
+    return WriteBytes(path, bytes);
+}
+
+void ValidateLegacyEmbedded(const std::wstring& folder) {
+    BattleStatsPersistedState expected = SampleState();
+    expected.knownMetrics = 0x3FF;
+    expected.units[0].physicalReceivedCount = 19;
+    expected.units[0].strategyReceivedCount = 20;
+    for (uint32_t schema : {2u, 3u}) {
+        const std::wstring save = folder + L"\\schema" + std::to_wstring(schema) + L".E5S";
+        BattleStatsPersistedState loaded;
+        std::wstring error;
+        Check(WriteLegacyFixture(save, schema, expected) &&
+            ReadBattleStatsEmbedded(save, loaded, error) == BattleStatsReadResult::Loaded &&
+            loaded.schemaVersion == schema && loaded.historyIncomplete && loaded.rosterHistoryIncomplete &&
+            loaded.campaignRoster.empty() && loaded.currentBattleParticipants.empty() &&
+            loaded.units.size() == expected.units.size() && loaded.campaignUnits.size() == expected.campaignUnits.size() &&
+            loaded.units[0].damageDealt == expected.units[0].damageDealt &&
+            loaded.units[0].physicalReceivedCount == (schema == 2 ? 0 : 19) &&
+            loaded.units[0].strategyReceivedCount == (schema == 2 ? 0 : 20),
+            schema == 2 ? "read an authentic schema-2 fixture and seed new counters at zero" :
+                "read an authentic schema-3 fixture and retain received counts without inventing a roster");
+    }
+}
+
 void ValidateLegacy(const std::wstring& folder) {
     const std::wstring save = folder + L"\\legacy.E5S";
     const std::wstring sidecar = folder + L"\\legacy.stats";
@@ -201,7 +341,7 @@ void ValidateEmbedded(const std::wstring& folder) {
     Check(WriteBattleStatsEmbedded(save, expected, error) && ReadBytes(save).size() == valid.size() &&
         ReadBattleStatsEmbedded(save, loaded, error) == BattleStatsReadResult::Loaded && SameState(expected, loaded),
         "replace a valid embedded block without accumulating stale trailers");
-    expected.status.clear(); expected.units.clear();
+    expected.status.clear(); expected.units.clear(); expected.currentBattleParticipants.clear();
     Check(WriteBattleStatsEmbedded(save, expected, error) && ReadBytes(save).size() < valid.size() &&
         ReadBattleStatsEmbedded(save, loaded, error) == BattleStatsReadResult::Loaded &&
         loaded.units.empty() && loaded.campaignUnits.size() == 3,
@@ -273,12 +413,22 @@ void ValidateEmbedded(const std::wstring& folder) {
     Check(WriteSample(changed, kNativePayload) && WriteBattleStatsEmbedded(changed, BattleStatsPersistedState(), error) &&
         ReadBattleStatsEmbedded(changed, loaded, error) == BattleStatsReadResult::Loaded &&
         SameState(BattleStatsPersistedState(), loaded), "round-trip a valid empty new-campaign statistics block");
-    expected = SampleState(); expected.campaignUnits.clear();
-    for (int id = 0; id < 1025; ++id) expected.campaignUnits.push_back(SampleUnit(id, -1));
+    expected = SampleState(); expected.campaignUnits.clear(); expected.campaignRoster.clear();
+    for (int id = 0; id < 1025; ++id) {
+        expected.campaignUnits.push_back(SampleUnit(id, -1));
+        BattleRosterEntry entry;
+        entry.personId = id;
+        entry.label = expected.campaignUnits.back().label;
+        entry.joined = entry.tracking = true;
+        entry.lastCamp = 0;
+        entry.source = BattleRosterSource::ExistingCampaignLedger;
+        expected.campaignRoster.push_back(entry);
+    }
     Check(WriteSample(changed, kNativePayload) && WriteBattleStatsEmbedded(changed, expected, error) &&
         ReadBattleStatsEmbedded(changed, loaded, error) == BattleStatsReadResult::Loaded && SameState(expected, loaded),
         "persist over 250 and over 1024 global identities independently of battlefield slots");
-    expected.active = false; expected.units.clear(); expected.scenario.clear(); expected.scenarioOrdinal = -1;
+    expected.active = false; expected.units.clear(); expected.currentBattleParticipants.clear();
+    expected.scenario.clear(); expected.scenarioOrdinal = -1;
     Check(WriteBattleStatsEmbedded(changed, expected, error) &&
         ReadBattleStatsEmbedded(changed, loaded, error) == BattleStatsReadResult::Loaded && SameState(expected, loaded),
         "persist global totals in non-battle saves without a current S battlefield");
@@ -297,7 +447,46 @@ void ValidateEmbedded(const std::wstring& folder) {
     invalid = SampleState(); invalid.status.assign(4097, L'x');
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject overlong status text");
     invalid = SampleState(); invalid.knownMetrics = 0x400;
-    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-3 metric bits");
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-4 metric bits");
+    invalid = SampleState(); invalid.campaignRoster.pop_back();
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject campaign totals without a matching roster entry");
+    invalid = SampleState(); invalid.campaignUnits.pop_back();
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject joined roster entries without their global zero or historical row");
+    invalid = SampleState(); invalid.campaignRoster[0].tracking = true;
+    invalid.campaignRoster[0].changedFaction = true;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject a changed-faction roster that still permits tracking");
+    invalid = SampleState(); invalid.campaignRoster[0].joinScenarioOrdinal = 3;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject runtime 3B membership attributed to an S scene");
+    invalid = SampleState(); invalid.campaignRoster[0].joinCommandOrdinal = 0xFFFFFFFFu;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject runtime membership with no successful command source");
+    invalid = SampleState(); invalid.currentBattleParticipants.push_back(7);
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject duplicate current participant identities");
+    invalid = SampleState(); invalid.currentBattleParticipants.pop_back();
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject a current row outside the confirmed participant set");
+    invalid = SampleState(); invalid.active = false;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject R or inactive states retaining a current battlefield");
+    invalid = SampleState(); invalid.campaignRoster[0].label += L"不同";
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject mismatched roster and campaign labels");
+    size_t rosterOffset = strlen(kNativePayload) + sizeof(TestHeader) +
+        (sample.scenario.size() + sample.status.size()) * sizeof(wchar_t);
+    for (const auto* group : {&sample.units, &sample.campaignUnits})
+        for (const auto& unit : *group) rosterOffset += 88 + unit.label.size() * sizeof(wchar_t);
+    damaged = valid;
+    TestRosterRow badRoster = {};
+    memcpy(&badRoster, damaged.data() + rosterOffset + sizeof(TestRosterHeader), sizeof(badRoster));
+    badRoster.source = 255;
+    memcpy(damaged.data() + rosterOffset + sizeof(TestRosterHeader), &badRoster, sizeof(badRoster));
+    Check(RefreshPayloadHash(damaged) && WriteBytes(changed, damaged) &&
+        ReadBattleStatsEmbedded(changed, loaded, error) == BattleStatsReadResult::Corrupt && loaded.campaignRoster.empty(),
+        "reject a checksummed invalid roster source without publishing partial state");
+    damaged = valid;
+    memcpy(&badRoster, damaged.data() + rosterOffset + sizeof(TestRosterHeader), sizeof(badRoster));
+    badRoster.personId = 1234;
+    memcpy(damaged.data() + rosterOffset + sizeof(TestRosterHeader), &badRoster, sizeof(badRoster));
+    Check(RefreshPayloadHash(damaged) && WriteBytes(changed, damaged) &&
+        ReadBattleStatsEmbedded(changed, loaded, error) == BattleStatsReadResult::Corrupt,
+        "reject a checksummed roster-to-ledger identity mismatch");
+    Check(WriteBytes(changed, unchanged), "restore the valid fixture before atomic replacement failure tests");
     invalid = SampleState(); invalid.units.assign(251, SampleUnit(0, 0));
     Check(!WriteBattleStatsEmbedded(changed, invalid, error) && ReadBytes(changed) == unchanged,
         "limit current battles to 250 people while allowing larger global histories");
@@ -326,6 +515,7 @@ int wmain(int argc, wchar_t** argv) {
         std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     if (!CreateDirectoryW(folder.c_str(), nullptr)) return 4;
     ValidateLegacy(folder);
+    ValidateLegacyEmbedded(folder);
     ValidateEmbedded(folder);
     std::error_code cleanupError;
     std::filesystem::remove_all(folder, cleanupError);

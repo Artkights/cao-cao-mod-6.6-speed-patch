@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <initializer_list>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -86,19 +89,56 @@ struct PeImage {
         return false;
     }
 
-    bool ExecutableRange(const BYTE*& begin, size_t& size) const {
-        begin = nullptr;
-        size = 0;
+    std::vector<std::pair<const BYTE*, size_t>> ExecutableRanges() const {
+        std::vector<std::pair<const BYTE*, size_t>> ranges;
+        // When resolving the live image, trust committed page attributes over
+        // the packed file's section flags. VProtect may publish decoded code
+        // in pages whose on-disk section is read-only or whose raw size is a
+        // tiny stub. The flat runtime-RVA tests use section metadata instead.
+        if (runtimeBase == reinterpret_cast<uintptr_t>(bytes)) {
+            const uintptr_t imageEnd = runtimeBase + nt->OptionalHeader.SizeOfImage;
+            uintptr_t cursor = runtimeBase;
+            while (cursor < imageEnd) {
+                MEMORY_BASIC_INFORMATION information = {};
+                if (VirtualQuery(reinterpret_cast<const void*>(cursor), &information,
+                        sizeof(information)) != sizeof(information)) break;
+                const uintptr_t region = reinterpret_cast<uintptr_t>(information.BaseAddress);
+                const uintptr_t rawEnd = region + information.RegionSize;
+                if (rawEnd <= cursor) break;
+                const uintptr_t regionEnd = std::min(rawEnd, imageEnd);
+                const DWORD protection = information.Protect & 0xFFu;
+                const bool executable = information.State == MEM_COMMIT &&
+                    !(information.Protect & PAGE_GUARD) &&
+                    (protection == PAGE_EXECUTE_READ ||
+                     protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY);
+                if (executable) {
+                    if (regionEnd > cursor) {
+                        const BYTE* begin = bytes + (cursor - runtimeBase);
+                        if (!ranges.empty() && ranges.back().first + ranges.back().second == begin)
+                            ranges.back().second += static_cast<size_t>(regionEnd - cursor);
+                        else ranges.push_back({begin, static_cast<size_t>(regionEnd - cursor)});
+                    }
+                }
+                cursor = regionEnd;
+            }
+        }
+        if (!ranges.empty()) return ranges;
         for (unsigned i = 0; i < sectionCount; ++i) {
             if (!(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
             const size_t candidate = std::max(sections[i].Misc.VirtualSize, sections[i].SizeOfRawData);
             if (!candidate || sections[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage ||
                 candidate > nt->OptionalHeader.SizeOfImage - sections[i].VirtualAddress) continue;
-            if (begin) continue;
-            begin = bytes + sections[i].VirtualAddress;
-            size = candidate;
+            ranges.push_back({bytes + sections[i].VirtualAddress, candidate});
         }
-        return begin != nullptr && size != 0;
+        return ranges;
+    }
+
+    bool ExecutableRange(const BYTE*& begin, size_t& size) const {
+        const auto ranges = ExecutableRanges();
+        if (ranges.empty()) { begin = nullptr; size = 0; return false; }
+        begin = ranges.front().first;
+        size = ranges.front().second;
+        return true;
     }
 
     bool InImage(uintptr_t address, size_t size = 1) const {
@@ -107,15 +147,35 @@ struct PeImage {
     }
 };
 
+struct RuntimeCodeSpan {
+    uintptr_t address = 0;
+    std::vector<BYTE> bytes;
+    bool operator==(const RuntimeCodeSpan& other) const { return address == other.address && bytes == other.bytes; }
+};
 struct RuntimeLayout {
     uintptr_t unitBase = 0;
     uintptr_t personPointerSlot = 0;
+    uintptr_t itemBase = 0;
     unsigned capabilities = 0;
+    std::vector<RuntimeCodeSpan> resourceCode;
 };
 
 RuntimeLayout gLayout;
 std::array<std::wstring, 255> gItemNames;
 SRWLOCK gRuntimeLock = SRWLOCK_INIT;
+bool gRuntimeResourceNames = false;
+std::mutex gResourceSnapshotLock;
+uint64_t gProcessGeneration = 1, gResourceGeneration = 1;
+uintptr_t gObservedPersonTable = 0;
+BattleResourceSnapshot gLastResourceSnapshot;
+
+void InvalidateResourceSnapshots() {
+    std::lock_guard<std::mutex> lock(gResourceSnapshotLock);
+    ++gProcessGeneration;
+    ++gResourceGeneration;
+    gObservedPersonTable = 0;
+    gLastResourceSnapshot = BattleResourceSnapshot();
+}
 
 bool ReadFileBytes(const std::wstring& path, std::vector<BYTE>& bytes) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -192,32 +252,174 @@ bool IsReadable(uintptr_t address, size_t size) {
         size <= information.RegionSize - (address - reinterpret_cast<uintptr_t>(information.BaseAddress));
 }
 
+bool IsReadableSpan(uintptr_t address, size_t size) {
+    if (!address || !size || size > UINTPTR_MAX - address) return false;
+    const uintptr_t end = address + size;
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION information = {};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &information,
+                sizeof(information)) != sizeof(information)) return false;
+        const uintptr_t region = reinterpret_cast<uintptr_t>(information.BaseAddress);
+        if (region > address || information.RegionSize > UINTPTR_MAX - region) return false;
+        const uintptr_t next = region + information.RegionSize;
+        if (next <= address || !IsReadable(address,
+                static_cast<size_t>(std::min(next, end) - address))) return false;
+        address = std::min(next, end);
+    }
+    return true;
+}
+
+bool ImageMatches(const PeImage& pe, uintptr_t address, const BYTE* expected,
+    size_t length) {
+    return pe.InImage(address, length) &&
+        !memcmp(pe.bytes + (address - pe.runtimeBase), expected, length);
+}
+
+void AddResourceCode(const PeImage& pe, const BYTE* code, size_t size,
+    std::vector<RuntimeCodeSpan>& evidence) {
+    RuntimeCodeSpan span;
+    span.address = pe.runtimeBase + static_cast<uintptr_t>(code - pe.bytes);
+    span.bytes.assign(code, code + size);
+    evidence.push_back(std::move(span));
+}
+
+bool ResolveItemTable(const PeImage& pe, const BYTE* text, size_t textSize,
+    uintptr_t& itemBase, std::vector<RuntimeCodeSpan>* evidence = nullptr) {
+    itemBase = 0;
+    size_t getters = 0;
+    uintptr_t candidate = 0;
+    std::vector<RuntimeCodeSpan> proof;
+    for (size_t i = 0; i + 14 <= textSize; ++i) {
+        const BYTE* p = text + i;
+        // Native accessor: ECX = id * 25 + table. ID 255 is a sentinel.
+        static const BYTE prefix[] = {0x55,0x8B,0xEC,0x6B,0xC9,0x19,0x81,0xC1};
+        if (memcmp(p, prefix, sizeof(prefix)) || p[12] != 0x5D || p[13] != 0xC3)
+            continue;
+        uint32_t value = 0;
+        memcpy(&value, p + 8, sizeof(value));
+        if (pe.InImage(value, 256u * 25u)) {
+            candidate = value;
+            ++getters;
+            AddResourceCode(pe, p, 14, proof);
+        }
+    }
+    if (getters != 1) return false;
+    size_t loaders = 0;
+    for (size_t i = 0; i + 35 <= textSize; ++i) {
+        const BYTE* p = text + i;
+        if (p[0] != 0x55 || p[1] != 0x8B || p[2] != 0xEC || p[3] != 0x68 ||
+            p[8] != 0x6A || p[9] != 1 || p[10] != 0x68 || p[15] != 0xE8 ||
+            p[20] != 0xB9 || p[25] != 0xBA || p[30] != 0xE8) continue;
+        uint32_t low = 0, high = 0, dataName = 0, starName = 0;
+        memcpy(&low, p + 4, 4); memcpy(&dataName, p + 11, 4);
+        memcpy(&high, p + 21, 4); memcpy(&starName, p + 26, 4);
+        static const BYTE data[] = {'D','A','T','A','.','E','5',0};
+        static const BYTE star[] = {'s','t','a','r','.','e','5',0};
+        if (low != candidate || high != candidate + 104u * 25u ||
+            !ImageMatches(pe, dataName, data, sizeof(data)) ||
+            !ImageMatches(pe, starName, star, sizeof(star))) continue;
+        int32_t dataRelative = 0, starRelative = 0;
+        memcpy(&dataRelative, p + 16, 4); memcpy(&starRelative, p + 31, 4);
+        const uintptr_t loader = pe.runtimeBase + static_cast<uintptr_t>(p - pe.bytes);
+        const uintptr_t dataTarget = loader + 20 + dataRelative;
+        const uintptr_t starTarget = loader + 35 + starRelative;
+        static const BYTE dataOpen[] = {0x55,0x8B,0xEC,0x6A,0xFF};
+        static const BYTE starOpen[] = {0x55,0x8B,0xEC,0x51,0xB9};
+        static const BYTE starLength[] = {0x68,0xD8,0x0E,0,0,0xFF,0x75,0xFC};
+        if (!ImageMatches(pe, dataTarget, dataOpen, sizeof(dataOpen)) ||
+            !ImageMatches(pe, starTarget, starOpen, sizeof(starOpen)) ||
+            !ImageMatches(pe, starTarget + 20, starLength, sizeof(starLength))) continue;
+        ++loaders;
+        AddResourceCode(pe, p, 35, proof);
+        AddResourceCode(pe, pe.bytes + (dataTarget - pe.runtimeBase), 5, proof);
+        AddResourceCode(pe, pe.bytes + (starTarget - pe.runtimeBase), 28, proof);
+    }
+    if (loaders != 1) return false;
+    itemBase = candidate;
+    if (evidence) *evidence = std::move(proof);
+    return true;
+}
+
+bool ResolveDeployment(const PeImage& pe, const BYTE* text, size_t textSize, const BYTE* unitGetter) {
+    const auto match = [text,textSize](const BYTE* at,std::initializer_list<int> pattern) {
+        if (!at || at < text || static_cast<size_t>(at - text) > textSize ||
+            pattern.size() > textSize - static_cast<size_t>(at - text)) return false;
+        size_t index = 0;
+        for (int value : pattern) {
+            if (value >= 0 && at[index] != value) return false;
+            ++index;
+        }
+        return true;
+    };
+    const auto call = [text,textSize](const BYTE* at) -> const BYTE* {
+        if (at < text || static_cast<size_t>(at - text) > textSize ||
+            5 > textSize - static_cast<size_t>(at - text) || *at != 0xE8) return nullptr;
+        int32_t delta = 0; memcpy(&delta,at + 1,4);
+        const int64_t target = static_cast<int64_t>(at - text) + 5 + delta;
+        return target >= 0 && static_cast<uint64_t>(target) < textSize ? text + target : nullptr;
+    };
+    const BYTE* visibility = nullptr;
+    unsigned accessors = 0, loops = 0, coordinateConsumers = 0;
+    for (size_t offset = 0; offset + 9 <= textSize; ++offset) {
+        const BYTE* at = text + offset;
+        if (match(at,{0x55,0x8B,0xEC,0x0F,0xB6,0x41,0x0C,0x5D,0xC3})) {
+            visibility = at; ++accessors;
+        }
+    }
+    if (accessors != 1 || !unitGetter) return false;
+    for (size_t offset = 0; offset + 0x45 <= textSize; ++offset) {
+        const BYTE* at = text + offset;
+        if (match(at,{0x55,0x8B,0xEC,0x6A,0,0x83,0xEC,8,0xEB,3,0xFF,0x45,0xFC,
+                0x33,0xC0,0x8B,0x4D,0xFC,0x80,0xF9,0xFA,0x73,0x68,0xE8}) &&
+            call(at + 0x17) == unitGetter && match(at + 0x1C,{0x89,0x4D,0xF8,0xE8}) &&
+            call(at + 0x1F) == visibility && match(at + 0x24,{0x3C,2,0x75,0xE2})) ++loops;
+        if (call(at) != visibility || !match(at + 5,{0x3C,2,0x75,-1,0x8B,0x4D,0xFC,
+                0x8B,0x55,0xF8,0x80,0xFA,0xFA,0x73,0x0B,0x8B,0x45,0xF4,0x88,4,0x11,
+                0xFF,0x45,0xF8,0xEB,-1,0x8B,0x55,0xFC,0x8A,0x0A,0x80,0xF9,0xFF,0x74,-1,
+                0x83,0x7D,0xF0,0,0x74,-1,0xE8}) || call(at + 0x2F) != unitGetter ||
+            !match(at + 0x34,{0xFF,0x71,7,0xFF,0x71,6,0xB9,-1,-1,-1,-1,0xE8}) ||
+            !call(at + 0x3F)) continue;
+        ++coordinateConsumers;
+    }
+    (void)pe;
+    return loops == 1 && coordinateConsumers == 1;
+}
+
 bool ResolveLayout(const BYTE* image, uintptr_t virtualBase, RuntimeLayout& layout) {
     PeImage pe;
     if (!pe.Open(image, virtualBase)) return false;
-    const BYTE* text = nullptr;
-    size_t textSize = 0;
-    if (!pe.ExecutableRange(text, textSize)) return false;
+    const auto ranges = pe.ExecutableRanges();
+    if (ranges.empty()) return false;
 
     uintptr_t unitBase = 0;
     uintptr_t personSlot = 0;
     size_t unitMatches = 0;
     size_t personMatches = 0;
-    for (size_t i = 0; i + 20 <= textSize; ++i) {
-        const BYTE* p = text + i;
+    const BYTE* unitGetter = nullptr;
+    const BYTE* personGetter = nullptr;
+    std::vector<RuntimeCodeSpan> itemCode;
+    bool deployment = false;
+    uintptr_t itemBase = 0;
+    size_t itemMatches = 0;
+    for (const auto& range : ranges) {
+        const BYTE* text = range.first;
+        const size_t textSize = range.second;
+        for (size_t i = 0; i + 20 <= textSize; ++i) {
+            const BYTE* p = text + i;
         // push ebp; mov ebp,esp; movzx ecx,cl; imul ecx,ecx,30h; add ecx,imm32; pop ebp; ret
-        if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC && p[3] == 0x0F && p[4] == 0xB6 &&
+            if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC && p[3] == 0x0F && p[4] == 0xB6 &&
             p[5] == 0xC9 && p[6] == 0x6B && p[7] == 0xC9 && p[8] == 0x30 &&
             p[9] == 0x81 && p[10] == 0xC1 && p[15] == 0x5D && p[16] == 0xC3) {
             uint32_t value = 0;
             memcpy(&value, p + 11, sizeof(value));
             if (pe.InImage(value, 0x30u * 250u)) {
                 unitBase = value;
+                unitGetter = p;
                 ++unitMatches;
             }
         }
         // push ebp; mov ebp,esp; movzx ecx,word [ebp+8]; imul ecx,48h; add ecx,[slot]
-        if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC && p[3] == 0x0F && p[4] == 0xB7 &&
+            if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC && p[3] == 0x0F && p[4] == 0xB7 &&
             p[5] == 0x4D && p[6] == 0x08 && p[7] == 0x6B && p[8] == 0xC9 && p[9] == 0x48 &&
             p[10] == 0x03 && p[11] == 0x0D && p[16] == 0x5D && p[17] == 0xC2 &&
             p[18] == 0x04 && p[19] == 0x00) {
@@ -225,17 +427,35 @@ bool ResolveLayout(const BYTE* image, uintptr_t virtualBase, RuntimeLayout& layo
             memcpy(&value, p + 12, sizeof(value));
             if (pe.InImage(value, sizeof(uintptr_t))) {
                 personSlot = value;
+                personGetter = p;
                 ++personMatches;
             }
+            }
+        }
+        if (ResolveDeployment(pe, text, textSize, unitGetter)) deployment = true;
+        uintptr_t candidate = 0;
+        std::vector<RuntimeCodeSpan> candidateCode;
+        if (ResolveItemTable(pe, text, textSize, candidate, &candidateCode)) {
+            if (!itemBase) itemBase = candidate;
+            ++itemMatches;
+            if (itemBase != candidate) itemBase = 0;
+            itemCode = std::move(candidateCode);
         }
     }
     if (unitMatches != 1) return false;
     layout = RuntimeLayout();
     layout.unitBase = unitBase;
+    AddResourceCode(pe, unitGetter, 17, layout.resourceCode);
     layout.capabilities = BattleCapabilityUnits | BattleCapabilityStatuses | BattleCapabilityAi;
+    if (deployment) layout.capabilities |= BattleCapabilityDeployment;
     if (personMatches == 1) {
         layout.personPointerSlot = personSlot;
+        AddResourceCode(pe, personGetter, 20, layout.resourceCode);
         layout.capabilities |= BattleCapabilityPeople | BattleCapabilityEquipment;
+    }
+    if (itemMatches == 1 && itemBase) {
+        layout.itemBase = itemBase;
+        layout.resourceCode.insert(layout.resourceCode.end(), itemCode.begin(), itemCode.end());
     }
     return true;
 }
@@ -249,6 +469,69 @@ std::wstring DecodeName(const BYTE* bytes, size_t length) {
     if (result.empty() || result.size() > 32) return {};
     for (wchar_t ch : result) if (ch < 0x20) return {};
     return result;
+}
+
+std::wstring DecodeRuntimeName(const BYTE* bytes, size_t length) {
+    size_t used = 0;
+    while (used < length && bytes[used]) ++used;
+    while (used && bytes[used - 1] == ' ') --used;
+    if (!used) return {};
+    std::wstring name;
+    if (!DecodeWithCodePage(936, MB_ERR_INVALID_CHARS, bytes, used, name) ||
+        name.empty() || name.size() > length) return {};
+    for (wchar_t ch : name)
+        if (ch < 0x20 || ch == 0x7F || ch == 0xFFFD) return {};
+    return name;
+}
+
+bool SnapshotNameTable(uintptr_t table, size_t count, size_t stride, size_t offset,
+    size_t nameBytes, std::vector<std::wstring>& names) {
+    names.assign(count, {});
+    if (!table || count > SIZE_MAX / stride ||
+        !IsReadableSpan(table, count * stride)) return false;
+    const size_t size = count * stride;
+    std::vector<BYTE> first(size), second(size);
+    if (!ReadMemory(table, first.data(), size) || !ReadMemory(table, second.data(), size))
+        return false;
+    bool found = false;
+    for (size_t i = 0; i < count; ++i) {
+        const BYTE* a = first.data() + i * stride + offset;
+        const BYTE* b = second.data() + i * stride + offset;
+        if (memcmp(a, b, nameBytes)) {
+            names.assign(count, {});
+            return false;
+        }
+        if (stride == 0x48 && offset == 8) {
+            uint16_t beforeTag = 0, afterTag = 0;
+            memcpy(&beforeTag, a - offset, sizeof(beforeTag));
+            memcpy(&afterTag, b - offset, sizeof(afterTag));
+            if (beforeTag != 0x1000u + i || afterTag != beforeTag) continue;
+        }
+        names[i] = DecodeRuntimeName(a, nameBytes);
+        found = found || !names[i].empty();
+    }
+    return found;
+}
+
+bool ReadResourceNames(const RuntimeLayout& layout,
+    std::vector<std::wstring>& people, std::vector<std::wstring>& items) {
+    people.clear();
+    items.clear();
+    if (!layout.personPointerSlot && !layout.itemBase) return false;
+    uintptr_t table = 0, after = 0;
+    bool havePeople = false;
+    if (layout.personPointerSlot &&
+        IsReadable(layout.personPointerSlot, sizeof(table)) &&
+        ReadMemory(layout.personPointerSlot, &table, sizeof(table)) &&
+        table >= 0x10000 && (table % alignof(uint32_t)) == 0) {
+        havePeople = SnapshotNameTable(table, 1024, 0x48, 8, 8, people) &&
+            ReadMemory(layout.personPointerSlot, &after, sizeof(after)) && after == table;
+        if (!havePeople) people.clear();
+    }
+    const bool haveItems = layout.itemBase &&
+        SnapshotNameTable(layout.itemBase, 255, 25, 0, 17, items);
+    if (!haveItems) items.clear();
+    return havePeople || haveItems;
 }
 
 bool ReadPerson(uintptr_t table, const std::array<std::wstring, 255>& itemNames,
@@ -281,6 +564,7 @@ bool ReadPerson(uintptr_t table, const std::array<std::wstring, 255>& itemNames,
 }
 
 bool InitializeBattleRuntime(const wchar_t* gameRoot) {
+    ResetBattleRuntime();
     RuntimeLayout layout;
     std::array<std::wstring, 255> itemNames;
     LoadItemNames(gameRoot, itemNames);
@@ -294,11 +578,133 @@ bool InitializeBattleRuntime(const wchar_t* gameRoot) {
     return true;
 }
 
+bool ReadBattlePersonName(uintptr_t peoplePointerSlot, int personId, std::wstring& name) {
+    name.clear();
+    uintptr_t people = 0;
+    BYTE raw[8] = {};
+    if (personId < 0 || personId >= 1024 || !peoplePointerSlot ||
+        !ReadMemory(peoplePointerSlot,&people,sizeof(DWORD)) || !people) return false;
+    const uintptr_t address = people + static_cast<uintptr_t>(personId) * 0x48 + 8;
+    if (!IsReadable(address,sizeof(raw)) || !ReadMemory(address,raw,sizeof(raw))) return false;
+    name = DecodeName(raw,sizeof(raw));
+    return !name.empty();
+}
+
 void ResetBattleRuntime() {
     AcquireSRWLockExclusive(&gRuntimeLock);
     gLayout = RuntimeLayout();
     gItemNames = {};
+    gRuntimeResourceNames = false;
     ReleaseSRWLockExclusive(&gRuntimeLock);
+    InvalidateResourceSnapshots();
+}
+
+void ConfigureBattleRuntimeResourceNames(bool enabled) noexcept {
+    AcquireSRWLockExclusive(&gRuntimeLock);
+    const bool changed = gRuntimeResourceNames != enabled;
+    gRuntimeResourceNames = enabled;
+    ReleaseSRWLockExclusive(&gRuntimeLock);
+    if (changed) InvalidateResourceSnapshots();
+}
+
+bool ReadBattleResourceSnapshot(BattleResourceSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(gResourceSnapshotLock);
+    snapshot = BattleResourceSnapshot();
+    snapshot.profile = CompiledEngineProfile();
+    snapshot.processId = GetCurrentProcessId();
+    FILETIME created = {}, exited = {}, kernel = {}, user = {};
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+        snapshot.processCreatedAt = (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    snapshot.moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    snapshot.capturedAt = GetTickCount64();
+    AcquireSRWLockShared(&gRuntimeLock);
+    const bool enabled = gRuntimeResourceNames;
+    RuntimeLayout layout = gLayout;
+    ReleaseSRWLockShared(&gRuntimeLock);
+    bool codeValid = true;
+    for (const auto& span : layout.resourceCode) {
+        std::vector<BYTE> actual(span.bytes.size());
+        if (!ReadMemory(span.address, actual.data(), actual.size()) || actual != span.bytes) {
+            codeValid = false;
+            break;
+        }
+    }
+    // A delayed unpacker may publish the accessors after startup. Re-resolve
+    // missing/changed code, rather than caching the first failed probe forever.
+    if (enabled && (!layout.capabilities || !layout.personPointerSlot || !layout.itemBase || !codeValid)) {
+        RuntimeLayout refreshed;
+        const bool resolved = ResolveLayout(reinterpret_cast<const BYTE*>(snapshot.moduleBase),
+            snapshot.moduleBase, refreshed);
+        if ((!codeValid || resolved) && (layout.capabilities != refreshed.capabilities ||
+                layout.unitBase != refreshed.unitBase || layout.personPointerSlot != refreshed.personPointerSlot ||
+                layout.itemBase != refreshed.itemBase || layout.resourceCode != refreshed.resourceCode)) {
+            layout = std::move(refreshed);
+            AcquireSRWLockExclusive(&gRuntimeLock);
+            gLayout = layout;
+            ReleaseSRWLockExclusive(&gRuntimeLock);
+            ++gProcessGeneration;
+            ++gResourceGeneration;
+            gLastResourceSnapshot = BattleResourceSnapshot();
+        }
+    }
+    snapshot.runtimeProfileReady = enabled && layout.capabilities != 0;
+    snapshot.peopleLayoutReady = snapshot.runtimeProfileReady && layout.personPointerSlot != 0;
+    snapshot.itemsLayoutReady = snapshot.runtimeProfileReady && layout.itemBase != 0;
+    uintptr_t personTable = 0;
+    if (snapshot.peopleLayoutReady)
+        ReadMemory(layout.personPointerSlot, &personTable, sizeof(personTable));
+    if (enabled) ReadResourceNames(layout, snapshot.people, snapshot.items);
+    snapshot.peopleReady = !snapshot.people.empty();
+    snapshot.itemsReady = !snapshot.items.empty();
+    snapshot.peopleOrigin = snapshot.peopleReady ? BattleResourceOrigin::Runtime : BattleResourceOrigin::Unavailable;
+    snapshot.itemOrigin = snapshot.itemsReady ? BattleResourceOrigin::Runtime : BattleResourceOrigin::Unavailable;
+    if (personTable != gObservedPersonTable ||
+        snapshot.people != gLastResourceSnapshot.people || snapshot.items != gLastResourceSnapshot.items ||
+        snapshot.peopleReady != gLastResourceSnapshot.peopleReady || snapshot.itemsReady != gLastResourceSnapshot.itemsReady ||
+        snapshot.peopleLayoutReady != gLastResourceSnapshot.peopleLayoutReady ||
+        snapshot.itemsLayoutReady != gLastResourceSnapshot.itemsLayoutReady) {
+        ++gResourceGeneration;
+        gObservedPersonTable = personTable;
+    }
+    snapshot.processGeneration = gProcessGeneration;
+    snapshot.resourceGeneration = gResourceGeneration;
+    if (!enabled) snapshot.diagnostic = L"运行时名称能力未启用。";
+    else if (!snapshot.runtimeProfileReady) snapshot.diagnostic = L"运行时资源布局尚未就绪。";
+    else if (!snapshot.peopleReady || !snapshot.itemsReady)
+        snapshot.diagnostic = L"运行时名称部分未就绪：人物=" + std::to_wstring(snapshot.peopleReady) +
+            L"，物品=" + std::to_wstring(snapshot.itemsReady) + L"。";
+    gLastResourceSnapshot = snapshot;
+    return snapshot.peopleReady || snapshot.itemsReady;
+}
+
+bool RefreshBattleResourceSnapshot() {
+    BattleResourceSnapshot snapshot;
+    return ReadBattleResourceSnapshot(snapshot);
+}
+
+bool IsBattleResourceSnapshotCurrent(const BattleResourceSnapshot& snapshot) {
+    BattleResourceSnapshot current;
+    ReadBattleResourceSnapshot(current);
+    return snapshot.processId == current.processId &&
+        snapshot.processCreatedAt == current.processCreatedAt && snapshot.moduleBase == current.moduleBase &&
+        snapshot.profile == current.profile && snapshot.processGeneration == current.processGeneration &&
+        snapshot.resourceGeneration == current.resourceGeneration;
+}
+
+bool ReadBattleResourceNames(std::vector<std::wstring>& people,
+    std::vector<std::wstring>& items) {
+    BattleResourceSnapshot snapshot;
+    const bool ready = ReadBattleResourceSnapshot(snapshot);
+    people = std::move(snapshot.people);
+    items = std::move(snapshot.items);
+    return ready;
+}
+
+bool BattleRuntimeResourceNamesEnabled() noexcept {
+    AcquireSRWLockShared(&gRuntimeLock);
+    const bool enabled = gRuntimeResourceNames;
+    ReleaseSRWLockShared(&gRuntimeLock);
+    return enabled;
 }
 
 unsigned BattleRuntimeCapabilities() {
@@ -314,10 +720,19 @@ bool ReadBattleSnapshot(BattleSnapshot& snapshot) {
     AcquireSRWLockShared(&gRuntimeLock);
     layout = gLayout;
     itemNames = gItemNames;
+    const bool runtimeNames = gRuntimeResourceNames;
     ReleaseSRWLockShared(&gRuntimeLock);
     snapshot = BattleSnapshot();
     if (!(layout.capabilities & BattleCapabilityUnits) ||
         !IsReadable(layout.unitBase, 0x30u * 250u)) return false;
+
+    if (runtimeNames && layout.itemBase) {
+        std::vector<std::wstring> nativeItems;
+        if (SnapshotNameTable(layout.itemBase, 255, 25, 0, 17, nativeItems)) {
+            for (size_t i = 0; i < itemNames.size(); ++i)
+                if (!nativeItems[i].empty()) itemNames[i] = std::move(nativeItems[i]);
+        }
+    }
 
     uintptr_t people = 0;
     bool peopleReady = layout.personPointerSlot && ReadMemory(layout.personPointerSlot, &people, sizeof(people)) &&
@@ -412,6 +827,28 @@ bool ResolveBattleRuntimeImageForTest(const BYTE* image, uintptr_t virtualBase,
     return true;
 }
 
+bool ResolveBattleDeploymentForTest(const BYTE* image, uintptr_t virtualBase) {
+    RuntimeLayout layout;
+    return ResolveLayout(image,virtualBase,layout) && (layout.capabilities & BattleCapabilityDeployment) != 0;
+}
+
+bool ResolveBattleItemTableForTest(const BYTE* image, uintptr_t virtualBase,
+    uintptr_t& itemBase) {
+    itemBase = 0;
+    PeImage pe;
+    if (!pe.Open(image, virtualBase)) return false;
+    const auto ranges = pe.ExecutableRanges();
+    size_t matches = 0;
+    for (const auto& range : ranges) {
+        uintptr_t candidate = 0;
+        if (!ResolveItemTable(pe, range.first, range.second, candidate)) continue;
+        if (!itemBase) itemBase = candidate;
+        ++matches;
+        if (itemBase != candidate) itemBase = 0;
+    }
+    return matches == 1 && itemBase != 0;
+}
+
 bool LoadBattleItemNameForTest(const wchar_t* gameRoot, int itemId, std::wstring& name) {
     name.clear();
     if (itemId < 0 || itemId >= 255) return false;
@@ -420,3 +857,23 @@ bool LoadBattleItemNameForTest(const wchar_t* gameRoot, int itemId, std::wstring
     name = names[static_cast<size_t>(itemId)];
     return !name.empty();
 }
+
+#ifdef XA66_TEST
+void ConfigureBattleResourceLayoutForTest(uintptr_t personPointerSlot, uintptr_t itemBase) {
+    ResetBattleRuntime();
+    AcquireSRWLockExclusive(&gRuntimeLock);
+    gLayout.personPointerSlot = personPointerSlot;
+    gLayout.itemBase = itemBase;
+    gLayout.capabilities = BattleCapabilityUnits;
+    gRuntimeResourceNames = true;
+    ReleaseSRWLockExclusive(&gRuntimeLock);
+}
+
+bool ReadBattleResourceNamesForTest(uintptr_t personPointerSlot, uintptr_t itemBase,
+    std::vector<std::wstring>& people, std::vector<std::wstring>& items) {
+    RuntimeLayout layout;
+    layout.personPointerSlot = personPointerSlot;
+    layout.itemBase = itemBase;
+    return ReadResourceNames(layout, people, items);
+}
+#endif

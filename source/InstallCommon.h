@@ -7,11 +7,12 @@
 #include <string>
 #include <vector>
 #include "EngineProfile.h"
+#include "Version.h"
 
 namespace XiaoAnInstall {
 
 constexpr unsigned kManifestSchema = 2;
-constexpr wchar_t kPackageVersion[] = L"1.3.0";
+constexpr wchar_t kPackageVersion[] = XIAOAN_VERSION_WSTRING;
 
 // The proxy is shared by all optional functions.  The mask describes which
 // functions the installer should activate; the audio forwarding core remains
@@ -53,6 +54,18 @@ struct FileRecord {
     uint64_t writeTime = 0;
 };
 
+// Installation, engine layout and live module readiness are independent.
+// These additive fields do not change installation schema 2 or stats schema 4.
+struct RuntimeStatus {
+    std::wstring container = L"Unknown";
+    std::wstring layout = L"Unknown";
+    std::wstring startup = L"Pending";
+    std::wstring accelerator = L"Pending";
+    std::wstring guide = L"Pending";
+    std::wstring stats = L"Pending";
+    std::wstring detail;
+};
+
 struct Manifest {
     unsigned schemaVersion = kManifestSchema;
     EngineProfileId profile = EngineProfileId::Unknown;
@@ -62,11 +75,22 @@ struct Manifest {
     std::wstring root;
     unsigned featureMask = FeatureAll;
     bool forced = false;
+    // Version-selected installations are explicitly acknowledged fallbacks.
+    // They still use the same transactional backup and ownership checks as
+    // automatic installations; this bit only records the user's choice.
+    bool versionFallback = false;
+    std::wstring engineVariant = L"Standard";
+    std::wstring runtimeValidation = L"NotRequired";
+    RuntimeStatus status;
     std::wstring executableSha256;
     std::wstring planSha256;
     bool patchDirExisted = false;
     bool privateDirExisted = false;
     FileRecord files[3];
+    // Additional originals for a version-selected install. Ekd5.exe is a
+    // copy-only recovery snapshot; private configuration records are restored.
+    std::vector<FileRecord> versionSnapshots;
+    bool restoreVersionConfigs = false;
     std::wstring proxySha256;
     std::wstring gearSha256;
     std::wstring originalCopySha256;
@@ -74,8 +98,11 @@ struct Manifest {
 
 struct PackagePayload {
     EngineProfileId profile = EngineProfileId::Unknown;
-    bool forced = false;
     std::wstring expectedExeSha256;
+    std::wstring engineVariant = L"Standard";
+    std::wstring runtimeValidation = L"NotRequired";
+    RuntimeStatus status;
+    bool versionFallback = false;
     std::vector<unsigned char> proxy;
     std::vector<unsigned char> gear;
     std::vector<unsigned char> defaultConfig;
@@ -98,15 +125,24 @@ bool ValidateProxyAudio(const std::wstring& path, std::wstring& error);
 bool ValidateGear(const std::wstring& path, std::wstring& error);
 bool ValidateProxyAudioBytes(const std::vector<unsigned char>& bytes, std::wstring& error);
 bool ValidateGearBytes(const std::vector<unsigned char>& bytes, std::wstring& error);
+bool ValidateGearPayloadBytes(const std::vector<unsigned char>& bytes, std::wstring& error);
 
 TargetKind DetectTarget(const std::wstring& root, std::wstring& detail,
-    EngineProfileId forcedProfile = EngineProfileId::Unknown);
+                        bool allowVersionFallback = false,
+                        EngineProfileId requestedProfile = EngineProfileId::Unknown,
+                        const EngineDetection* verifiedDetection = nullptr,
+                        EngineDetection* resolvedDetection = nullptr);
 bool LoadManifest(const std::wstring& root, Manifest& manifest, std::wstring& error);
+bool UpdateRuntimeValidation(const std::wstring& root, EngineProfileId profile,
+    const std::wstring& state, std::wstring& error);
+bool UpdateRuntimeStatus(const std::wstring& root, EngineProfileId profile,
+    const RuntimeStatus& status, std::wstring& error);
 bool ValidateUninstall(const std::wstring& root, Manifest& manifest, std::wstring& error,
                        bool requireInstalledProxy = true);
 bool InstallPatch(const std::wstring& root, const PackagePayload& payload,
                   TargetKind requestedKind, std::wstring& report, std::wstring& error,
-                  unsigned featureMask = FeatureAll);
+                  unsigned featureMask = FeatureAll,
+                  const EngineDetection* verifiedDetection = nullptr);
 bool RestorePatch(const std::wstring& root, std::wstring& report, std::wstring& error,
                   bool requireInstalledProxy = true,
                   unsigned removeFeatures = FeatureAll);

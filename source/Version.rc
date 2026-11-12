@@ -1,0 +1,30 @@
+#include "Version.h"
+
+1 VERSIONINFO
+ FILEVERSION XIAOAN_VERSION_NUMBERS
+ PRODUCTVERSION XIAOAN_VERSION_NUMBERS
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+#ifdef XIAOAN_VERSION_DLL
+ FILETYPE VFT_DLL
+#else
+ FILETYPE VFT_APP
+#endif
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription", "曹操传加速补丁 1.4 Release\0"
+            VALUE "FileVersion", XIAOAN_VERSION_STRING "\0"
+            VALUE "ProductName", "曹操传加速补丁\0"
+            VALUE "ProductVersion", XIAOAN_VERSION_STRING "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

@@ -1,8 +1,11 @@
 #include "BattleStats.h"
+#include "BattleRuntime.h"
 #include "EngineProfile.h"
+#include "ScenarioScript.h"
 
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <stdio.h>
 #include <string>
 #include <vector>
@@ -131,6 +134,50 @@ bool SameTotals(const BattleUnitTotals& left, const BattleUnitTotals& right) {
         left.defeatedEnemies == right.defeatedEnemies;
 }
 
+void DeployForTest(const std::vector<BYTE>& units, std::initializer_list<int> slots) {
+    BattleSnapshot snapshot;
+    snapshot.capabilities = BattleCapabilityUnits | BattleCapabilityDeployment;
+    for (int slot : slots) {
+        uint16_t person = 0xFFFF;
+        memcpy(&person, units.data() + slot * kUnitStride, sizeof(person));
+        BattleUnitSnapshot unit;
+        unit.slot = slot;
+        unit.dataId = person;
+        unit.camp = units[slot * kUnitStride + 5];
+        unit.visibility = 2;
+        unit.x = slot % 20;
+        unit.y = slot / 20;
+        snapshot.units.push_back(unit);
+    }
+    ObserveBattleStatsSnapshotForTest(snapshot);
+}
+
+bool WriteJoinScenarioForTest(const std::wstring& path, int personId) {
+    std::vector<BYTE> body;
+    auto word = [](std::vector<BYTE>& bytes, unsigned value) {
+        bytes.push_back(static_cast<BYTE>(value));
+        bytes.push_back(static_cast<BYTE>(value >> 8));
+    };
+    word(body, 0x3B);
+    const unsigned tags[] = {0x02, 0x0E, 0x3E};
+    const int values[] = {personId, 0, 0};
+    for (size_t i = 0; i < 3; ++i) { word(body, tags[i]); word(body, values[i]); }
+    std::vector<BYTE> bytes(10, 0);
+    bytes[0] = 'E'; bytes[1] = 'E'; bytes[2] = 'X';
+    bytes.push_back(14); bytes.insert(bytes.end(), 3, 0);
+    word(bytes, 1); word(bytes, static_cast<unsigned>(body.size() + 4));
+    word(bytes, 0); word(bytes, static_cast<unsigned>(body.size()));
+    bytes.insert(bytes.end(), body.begin(), body.end());
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool okay = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+        written == bytes.size() && FlushFileBuffers(file);
+    const bool closed = CloseHandle(file) != FALSE;
+    return okay && closed;
+}
+
 void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& frame,
     int kind, BYTE strategyId, BYTE actorSlot, BYTE initialTargetSlot,
     uintptr_t initialTarget, BYTE resultTargetSlot, uintptr_t resultTarget,
@@ -154,6 +201,7 @@ void ConfigureRecovery(std::array<BYTE, 0x40>& context, std::array<BYTE, 0x80>& 
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     const bool engine65 = CompiledEngineProfile() == EngineProfileId::Ccz64 || CompiledEngineProfile() == EngineProfileId::Ccz65;
     const uintptr_t recoverySimple = engine65 ? 0x4247E6 : 0x4247DC;
     const uintptr_t recoveryAnimated = engine65 ? 0x4249F1 : 0x4249DA;
@@ -222,7 +270,12 @@ int wmain(int argc, wchar_t** argv) {
     strategies[kPersistentRecoveryStrategy * kStrategyStride + kStrategyTypeOffset] = 43;
     InitializeBattleStatsModelForTest(unitBase,
         reinterpret_cast<uintptr_t>(strategies.data()), kStrategyCount);
-    SetBattleStatsModelActiveForTest(true);
+    SetBattleRosterCapability(true, L"test-verified-3B-bridge");
+    NotifyBattleStatsScenarioInstalled(0, true, false, 1);
+    for (int slot : {actorSlot, friendlyTargetSlot, secondTargetSlot})
+        NotifyBattleRosterJoined(1000 + slot, 0, slot, 1);
+    NotifyBattleStatsScenarioInstalled(1, false, false, 2);
+    DeployForTest(units, {actorSlot, friendlyTargetSlot, secondTargetSlot});
     std::array<BYTE, 0x40> context = {};
     std::array<BYTE, 0x80> frame = {};
 
@@ -396,12 +449,15 @@ int wmain(int argc, wchar_t** argv) {
         timed.elapsedMilliseconds == longElapsed.elapsedMilliseconds + 75,
         "keep accumulated duration when a saved game is opened after an operating system restart");
 
-    NotifyBattleStatsScenarioInstalled(1, true, true, 1000);
+    NotifyBattleStatsScenarioInstalled(0, true, false, 999);
+    NotifyBattleRosterJoined(1000 + actorSlot, 0, 14, 999);
+    NotifyBattleStatsScenarioInstalled(1, false, true, 1000);
     BattleStatsSnapshot fresh;
     ReadBattleStatsSnapshot(fresh);
-    Check(fresh.active && fresh.units.empty() && fresh.campaignUnits.empty() &&
+    Check(fresh.active && fresh.units.empty() && fresh.campaignUnits.size() == 1 &&
         fresh.campaignId && fresh.battleInstance == 1,
-        "new campaign starts both ledgers and a real S instance without visible-unit heuristics");
+        "new campaign starts an empty battlefield and retains the successful R join as a global zero row");
+    DeployForTest(units, {actorSlot});
     RecordBattleStatsSettlementForTest(1, enemyTarget,
         reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
     NotifyBattleStatsScenarioInstalled(1, false, false, 1100);
@@ -415,15 +471,18 @@ int wmain(int argc, wchar_t** argv) {
     Check(fresh.units.empty() && fresh.battleInstance == 2 && fresh.campaignId == campaignIdentity &&
         FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 30,
         "a new instance of the same S clears only current statistics");
+    Check(fresh.currentBattleParticipants.empty(), "new S instance clears all previous participants");
+    DeployForTest(units, {actorSlot});
     RecordBattleStatsSettlementForTest(1, enemyTarget,
         reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
     NotifyBattleStatsScenarioInstalled(2, false, false, 1300);
     RecordBattleStatsSettlementForTest(1, enemyTarget,
         reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
     ReadBattleStatsSnapshot(fresh);
-    Check(!fresh.active && FindPerson(fresh.units, 1000 + actorSlot)->damageDealt == 30 &&
-        FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 60,
-        "R scenes retain the last battlefield and campaign totals while pausing collection");
+    const BattleUnitTotals* rCurrent = FindPerson(fresh.units, 1000 + actorSlot);
+    const BattleUnitTotals* rCampaign = FindPerson(fresh.campaignUnits, 1000 + actorSlot);
+    Check(!fresh.active && !rCurrent && rCampaign && rCampaign->damageDealt == 60,
+        "R scenes clear the current battlefield while retaining campaign totals and pausing collection");
     NotifyBattleStatsScenarioInstalled(3, false, false, 1400);
     ReadBattleStatsSnapshot(fresh);
     Check(fresh.active && fresh.units.empty() && fresh.campaignUnits.size() == 1,
@@ -431,7 +490,8 @@ int wmain(int argc, wchar_t** argv) {
 
     constexpr BYTE movedSlot = 3;
     PutPerson(units.data() + movedSlot * kUnitStride, 1000 + actorSlot);
-    PutPerson(units.data() + actorSlot * kUnitStride, 2222);
+    PutPerson(units.data() + actorSlot * kUnitStride, 902);
+    DeployForTest(units, {movedSlot, actorSlot});
     PutByte(context.data() + 1, movedSlot);
     PutPointer(context.data() + 8, unitBase + movedSlot * kUnitStride);
     RecordBattleStatsSettlementForTest(1, enemyTarget,
@@ -442,8 +502,8 @@ int wmain(int argc, wchar_t** argv) {
         reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
     ReadBattleStatsSnapshot(fresh);
     Check(FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 90 &&
-        FindPerson(fresh.campaignUnits, 2222)->damageDealt == 30 && fresh.units.size() == 2,
-        "person IDs follow characters between slots and keep a reused slot's new character separate");
+        !FindPerson(fresh.campaignUnits, 902) && FindPerson(fresh.units, 902) && fresh.units.size() == 2,
+        "slot reuse keeps current identities separate and never creates an unjoined campaign row");
 
     SetBattleStatsLoading(true);
     RecordBattleStatsSettlementForTest(1, enemyTarget,
@@ -451,25 +511,110 @@ int wmain(int argc, wchar_t** argv) {
     NotifyBattleStatsScenarioInstalled(5, true, true, 1500);
     BattleStatsPersistedState frozen;
     Check(CaptureBattleStatsState(frozen, GetTickCount64()) && frozen.scenarioOrdinal == 3 &&
-        FindPerson(frozen.campaignUnits, 2222)->damageDealt == 30,
+        !FindPerson(frozen.campaignUnits, 902) && FindPerson(frozen.units, 902)->damageDealt == 30,
         "loading freezes both ledgers and ignores scenario reset notifications");
     Check(RestoreBattleStatsState(persisted, GetTickCount64()), "replace ledgers with the loaded save");
     SetBattleStatsLoading(false);
     ReadBattleStatsSnapshot(fresh);
     Check(fresh.campaignUnits.size() == persisted.campaignUnits.size() &&
-        !FindPerson(fresh.campaignUnits, 2222) &&
+        !FindPerson(fresh.campaignUnits, 902) &&
         FindPerson(fresh.campaignUnits, 1000 + actorSlot)->damageDealt == 30,
         "loading an older save rolls campaign totals back instead of merging timelines");
 
     BattleStatsPersistedState legacy = persisted;
     legacy.schemaVersion = 1;
     legacy.campaignUnits.clear();
+    legacy.campaignRoster.clear();
+    legacy.currentBattleParticipants.clear();
     for (auto& unit : legacy.units) unit.personId = -1;
     Check(RestoreBattleStatsState(legacy, 2000), "migrate slot-indexed legacy statistics through current people");
     ReadBattleStatsSnapshot(fresh);
-    Check(fresh.historyIncomplete && FindPerson(fresh.units, 2222) &&
+    Check(fresh.historyIncomplete && FindPerson(fresh.units, 902) &&
         fresh.units.size() == fresh.campaignUnits.size(),
         "legacy migration seeds campaign totals and marks the missing earlier campaign history");
+
+    InitializeBattleStatsModelForTest(unitBase,
+        reinterpret_cast<uintptr_t>(strategies.data()), kStrategyCount);
+    NotifyBattleStatsScenarioInstalled(0, true, false, 3000);
+    NotifyBattleRosterJoined(902, 0, 10, 3000);
+    ReadBattleStatsSnapshot(fresh);
+    Check(!fresh.rosterAvailable && fresh.campaignUnits.empty(),
+        "an unavailable runtime bridge cannot create a campaign membership from an unverified notification");
+    SetBattleRosterCapability(true, L"verified test dispatcher");
+    NotifyBattleRosterJoined(902, 0, 10, 3000);
+    NotifyBattleRosterJoined(902, 0, 11, 3001);
+    NotifyBattleRosterJoined(55, 0, 12, 3002);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.rosterAvailable && fresh.campaignUnits.size() == 2 &&
+        FindPerson(fresh.campaignUnits, 55)->damageDealt == 0 &&
+        fresh.campaignRoster[1].personId == 902 &&
+        fresh.campaignRoster[1].joinCommandOrdinal == 10,
+        "successful 3B joins create zero reserve rows once and retain the first command source");
+    NotifyBattleStatsScenarioInstalled(1, false, false, 3010);
+    BattleSnapshot verifiedDeployment;
+    verifiedDeployment.capabilities = BattleCapabilityUnits | BattleCapabilityDeployment;
+    ObserveBattleStatsSnapshotForTest(verifiedDeployment);
+    PutByte(context.data() + 1, actorSlot);
+    PutPointer(context.data() + 8, actor);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.units.empty() && FindPerson(fresh.campaignUnits, 902)->damageDealt == 30,
+        "an empty deployment set cannot be bypassed by a friendly damage event");
+    units[actorSlot * kUnitStride + 0x0C] = 2;
+    units[actorSlot * kUnitStride + 6] = 3;
+    units[actorSlot * kUnitStride + 7] = 4;
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 902) && FindPerson(fresh.units, 902)->damageDealt == 30,
+        "the first verified S event confirms deployment before the first periodic poll");
+    PutPerson(units.data() + secondTargetSlot * kUnitStride, 55);
+    units[secondTargetSlot * kUnitStride + 0x0C] = 2;
+    units[secondTargetSlot * kUnitStride + 6] = 5;
+    units[secondTargetSlot * kUnitStride + 7] = 6;
+    RecordBattleStatsSettlementForTest(2, secondTarget, 0, 40, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 55) && FindPerson(fresh.units, 55)->recoveryDone == 10 &&
+        FindPerson(fresh.campaignUnits, 55)->recoveryDone == 10,
+        "a real reinforcement is confirmed by its first event without waiting for a poll");
+    NotifyBattleRosterCamp(902, 2, 3020);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 902)->damageDealt == 30 &&
+        FindPerson(fresh.campaignUnits, 902)->damageDealt == 60 &&
+        fresh.campaignRoster[1].changedFaction && !fresh.campaignRoster[1].tracking,
+        "a confirmed faction change freezes both ledgers even when the tactical slot still says friendly");
+    NotifyBattleRosterCamp(902, 0, 3021);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 902)->damageDealt == 30 &&
+        FindPerson(fresh.campaignUnits, 902)->damageDealt == 60,
+        "returning to camp zero cannot silently resume a changed-faction member");
+    NotifyBattleStatsScenarioInstalled(2, false, false, 3030);
+    NotifyBattleRosterJoined(902, 2, 20, 3030);
+    units[actorSlot * kUnitStride + 5] = 2;
+    DeployForTest(units, {actorSlot});
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.campaignRoster[1].tracking && !fresh.campaignRoster[1].changedFaction,
+        "stale S tactical camps in an R scene cannot cancel a successful R rejoin");
+    units[actorSlot * kUnitStride + 5] = 0;
+    NotifyBattleStatsScenarioInstalled(3, false, false, 3040);
+    DeployForTest(units, {actorSlot});
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(FindPerson(fresh.units, 902)->damageDealt == 30 &&
+        FindPerson(fresh.campaignUnits, 902)->damageDealt == 90 &&
+        fresh.campaignRoster[1].joinScenarioOrdinal == 2 &&
+        fresh.campaignRoster[1].joinCommandOrdinal == 20,
+        "only a later successful R 3B rejoin resumes tracking and updates the join source");
+    NotifyBattleRosterCamp(902, 255, 3041);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.campaignRoster[1].lastCamp == 255 && !fresh.campaignRoster[1].tracking,
+        "the full native camp byte including the removal sentinel stops tracking");
 
     ShutdownBattleStats();
     Check(RestoreBattleStatsState(persisted, 3000), "restore historical totals when collection hooks are unavailable");
@@ -478,6 +623,74 @@ int wmain(int argc, wchar_t** argv) {
         fresh.campaignUnits.size() == persisted.campaignUnits.size() &&
         CaptureBattleStatsState(frozen, 3100),
         "historical display and saving do not depend on current collection-hook support");
+
+    wchar_t temporary[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temporary);
+    const std::filesystem::path migrationRoot = std::filesystem::path(temporary) /
+        (L"CczRosterMigration-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(migrationRoot / L"RS");
+    const std::wstring migrationText = migrationRoot.wstring();
+    const std::wstring rPath = (migrationRoot / L"RS" / L"R_00.eex").wstring();
+    Check(WriteJoinScenarioForTest(rPath, 56), "write an isolated R 3B migration fixture");
+    std::vector<int> migrationCandidates;
+    std::wstring migrationDiagnostic;
+    const bool extracted = ExtractScenarioJoinCandidates(rPath, migrationCandidates, migrationDiagnostic);
+    if (!extracted || migrationCandidates != std::vector<int>{56})
+        printf("migration parser: success=%d candidates=%zu diagnostic=%ls\n", extracted,
+            migrationCandidates.size(), migrationDiagnostic.c_str());
+    Check(extracted &&
+        migrationCandidates == std::vector<int>{56}, "the shared EEX parser finds the static 3B migration candidate");
+    InitializeBattleStatsModelForTest(unitBase,
+        reinterpret_cast<uintptr_t>(strategies.data()), kStrategyCount, migrationText.c_str());
+    for (uint32_t schema : {1u, 2u, 3u}) {
+        BattleStatsPersistedState old = persisted;
+        old.schemaVersion = schema;
+        old.scenarioOrdinal = 1;
+        old.campaignRoster.clear();
+        old.currentBattleParticipants.clear();
+        if (schema == 1) old.campaignUnits.clear();
+        Check(RestoreBattleStatsState(old, 5000), "migrate a legacy schema through the corresponding R scenario");
+        ReadBattleStatsSnapshot(fresh);
+        bool inferred = false;
+        for (const auto& entry : fresh.campaignRoster)
+            if (entry.personId == 56) inferred = entry.source == BattleRosterSource::LegacyStaticR &&
+                entry.joinScenarioOrdinal == 0;
+        Check(inferred && FindPerson(fresh.campaignUnits, 56) &&
+            FindPerson(fresh.campaignUnits, 56)->damageDealt == 0 &&
+            fresh.historyIncomplete && fresh.rosterHistoryIncomplete &&
+            fresh.status.find(L"可能包含未执行分支") != std::wstring::npos,
+            "legacy-only R inference creates a zero reserve row and explicitly warns about unexecuted branches");
+        old.active = false;
+        old.scenarioOrdinal = 0;
+        Check(RestoreBattleStatsState(old, 5001), "restore a legacy R-scene save");
+        ReadBattleStatsSnapshot(fresh);
+        Check(fresh.units.empty() && fresh.currentBattleParticipants.empty(),
+            "legacy R migration always clears the current battlefield and participant set");
+        SetBattleRosterCapability(true, L"verified migration test dispatcher");
+        NotifyBattleRosterJoined(56, 0, 40, 5002);
+        ReadBattleStatsSnapshot(fresh);
+        bool upgraded = false;
+        for (const auto& entry : fresh.campaignRoster)
+            if (entry.personId == 56) upgraded = entry.source == BattleRosterSource::RuntimeJoin3B &&
+                entry.joinCommandOrdinal == 40;
+        Check(upgraded, "a real later 3B upgrades legacy inferred membership to verified runtime provenance");
+        SetBattleStatsLoading(true);
+        NotifyBattleRosterJoined(57, 0, 41, 5003);
+        NotifyBattleRosterCamp(56, 255, 5003);
+        NotifyBattleRosterLabel(56, L"加载期间禁止改名");
+        SetBattleStatsLoading(false);
+        ReadBattleStatsSnapshot(fresh);
+        Check(!FindPerson(fresh.campaignUnits, 57) && FindPerson(fresh.campaignUnits, 56) &&
+            FindPerson(fresh.campaignUnits, 56)->label != L"加载期间禁止改名",
+            "loading suppresses membership, camp and label notifications from the previous timeline");
+    }
+    BattleStatsPersistedState newGame;
+    newGame.scenarioOrdinal = 0;
+    Check(RestoreBattleStatsState(newGame, 5010), "restore an empty schema-4 R save beside the same static script");
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.campaignRoster.empty() && fresh.campaignUnits.empty(),
+        "schema-4 saves never infer membership from a statically present unexecuted 3B");
+    std::filesystem::remove_all(migrationRoot);
 
     ShutdownBattleStats();
     printf("BattleStatsTests: %d failures\n", failures);

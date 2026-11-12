@@ -35,12 +35,6 @@ using NativeAutoFn = void (__thiscall*)(void*);
 using NativeSaveFn = void (__thiscall*)(void*, int);
 using NativeFilenameFn = void (__stdcall*)(char*, int);
 
-enum class NativeExtensionCapability : unsigned char {
-    Unsupported,
-    None,
-    Verified
-};
-
 struct SaveLayout {
     NativeExtensionCapability extensionCapability = NativeExtensionCapability::Unsupported;
     BYTE* extensionLoadSite = nullptr;
@@ -116,6 +110,9 @@ SaveLayout gSaveLayout;
 std::wstring gSaveRoot;
 volatile LONG gSaving = FALSE;
 volatile LONG gEnhancerReady = FALSE;
+volatile LONG gRecoveryReady = FALSE;
+std::wstring gRecoveryDetail;
+SRWLOCK gRecoveryDetailLock = SRWLOCK_INIT;
 thread_local bool gPrivateSaveActive = false;
 thread_local bool gPrivateSaveSucceeded = false;
 thread_local int gPrivateSaveRawSlot = -1;
@@ -123,10 +120,17 @@ constexpr int kPrivateSaveSlot65 = 256;
 constexpr char kPrivateSaveFilename65[] = "SV\\XA65.E5S";
 constexpr char kPrivateSaveFilename64[] = "SV\\XA64.E5S";
 volatile LONG gPendingLoadSlot = -1;
-struct LoadContext { int slot; std::wstring path; };
+struct LoadContext { int slot; std::wstring path; uint64_t operation; };
 thread_local std::vector<LoadContext> gLoadContexts;
 thread_local std::wstring gPrivateTargetBase;
 thread_local bool gCommitSucceeded = false;
+thread_local uint64_t gSaveAttemptSequence = 0;
+thread_local uint64_t gActiveSaveAttempt = 0;
+thread_local uint64_t gCommittedSaveAttempt = 0;
+thread_local uint64_t gPrivateSaveAttempt = 0;
+thread_local bool gNativeSaveResultObserved = false;
+thread_local uint64_t gSaveOperation = 0;
+thread_local std::wstring gSaveTarget;
 thread_local unsigned gNativeSaveWriteCount=0;
 bool gTransactionalHooks = false;
 #ifdef XA66_TEST
@@ -140,6 +144,59 @@ HWND gSavePreview = nullptr;
 HBITMAP gPreviewBitmap = nullptr;
 HFONT gSaveFont = nullptr;
 std::vector<SaveEntry> gEntries;
+
+void PublishPersistenceCapability() noexcept {
+    std::wstring recoveryDetail;
+    bool recoveryReady = false;
+    // Startup, native game hooks and UI teardown can publish on different
+    // threads. Copy our own diagnostic before releasing the lock; never pass
+    // a pointer into a string that another thread may replace.
+    AcquireSRWLockShared(&gRecoveryDetailLock);
+    recoveryReady = InterlockedCompareExchange(&gRecoveryReady, FALSE, FALSE) != FALSE;
+    try { recoveryDetail = gRecoveryDetail; } catch (...) {}
+    ReleaseSRWLockShared(&gRecoveryDetailLock);
+    const bool hooks = gTransactionalHooks &&
+        InterlockedCompareExchange(&gEnhancerReady, FALSE, FALSE) != FALSE;
+    const auto recoveryState = ReadSaveRecoveryStatus();
+    const bool recovery = recoveryReady && recoveryState == SaveRecoveryStatus::Ready;
+    const bool extension = gSaveLayout.extensionCapability == NativeExtensionCapability::Verified;
+    if (!recovery) {
+        SetStatsPersistenceCapability(false, extension, recoveryState == SaveRecoveryStatus::CleanupPending ?
+            L"保存组已确认；事务清理待重试，下一次保存或读取会先清理。" :
+            (recoveryDetail.empty() ?
+                L"存档恢复尚未完成；保存和读取将重试恢复，失败时阻止覆盖或载入。" : recoveryDetail.c_str()));
+    } else if (!hooks) {
+        SetStatsPersistenceCapability(false, extension, L"统计保存与恢复钩子尚未通过验证或未安装。");
+    } else {
+        SetStatsPersistenceCapability(true, extension, gSaveLayout.callSite && gSaveLayout.endCallSite ?
+            (extension ? L"已验证 E5S/EXS 成组保存与恢复，回合自动保存可用。" :
+                L"已验证 E5S 内嵌统计保存与恢复，回合自动保存可用。") :
+            (extension ? L"已验证 E5S/EXS 成组保存与恢复；未识别回合自动保存边界。" :
+                L"已验证 E5S 内嵌统计保存与恢复；未识别回合自动保存边界。"));
+    }
+}
+
+void SyncSaveRecoveryStatus(const wchar_t* detail = L"") noexcept {
+    const auto status = ReadSaveRecoveryStatus();
+    SetSaveRecoveryReady(status == SaveRecoveryStatus::Ready,
+        status == SaveRecoveryStatus::CleanupPending ? L"保存组已确认，事务清理待重试。" : detail);
+}
+
+void BeginSaveAttempt() {
+    if (!++gSaveAttemptSequence) ++gSaveAttemptSequence;
+    gActiveSaveAttempt = gSaveAttemptSequence;
+    gCommittedSaveAttempt = 0;
+    gCommitSucceeded = false;
+    gNativeSaveResultObserved = false;
+    gNativeSaveWriteCount = 0;
+    gSaveOperation = 0;
+    gSaveTarget.clear();
+}
+
+void SaveFailureNoThrow(const wchar_t* message) noexcept {
+    SetStatsLastSave(false, gSaveTarget, message);
+    RecordStatsDiagnostic(gSaveOperation, L"save-failed", gSaveTarget, nullptr, message);
+}
 
 bool EnsureFolder(const std::wstring& path) {
     return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
@@ -852,15 +909,21 @@ int __cdecl BeginLoadSlot(int rawSlot) {
     const bool outer=gLoadContexts.empty();
     try {
         if (outer && !BeginSaveGroupRead(gSaveRoot,error)) {
-            StatsFailureNoThrow(error.c_str()); return 0;
+            SyncSaveRecoveryStatus(error.c_str());
+            SetStatsLastLoad(false, L"", error);
+            RecordStatsDiagnostic(0, L"load-blocked", L"", nullptr, error);
+            return 0;
         }
+        if (outer) SyncSaveRecoveryStatus();
         const int slot=EffectiveSaveSlot(rawSlot);
-        gLoadContexts.push_back({slot,slot>=0 ? SaveBaseForSlot(slot)+L".E5S" : L""});
+        const auto path=slot>=0 ? SaveBaseForSlot(slot)+L".E5S" : L"";
+        const auto operation=BeginStatsOperation(L"load",path);
+        gLoadContexts.push_back({slot,path,operation});
         try { BeginScenarioLoad(); }
         catch (...) { gLoadContexts.pop_back(); throw; }
         SetBattleStatsLoading(true);
         return 1;
-    } catch (...) { if (outer) EndSaveGroupRead(); return 0; }
+    } catch (...) { if (outer) EndSaveGroupRead(); SyncSaveRecoveryStatus(); return 0; }
 }
 
 void __cdecl ObserveLoadSlot(int rawSlot) {
@@ -871,6 +934,7 @@ void __cdecl ObserveLoadSlot(int rawSlot) {
     context.slot=EffectiveSaveSlot(rawSlot);
     try { context.path=context.slot>=0 ? SaveBaseForSlot(context.slot)+L".E5S" : L""; }
     catch (...) { context.path.clear(); }
+    RecordStatsDiagnostic(context.operation,L"load-path",context.path);
 }
 
 void __cdecl FinishLoadSlot(int succeeded) {
@@ -878,7 +942,7 @@ void __cdecl FinishLoadSlot(int succeeded) {
     const LoadContext context=std::move(gLoadContexts.back());
     gLoadContexts.pop_back();
     const int slot=context.slot;
-    const uint64_t operation = BeginStatsOperation(L"load", context.path);
+    const uint64_t operation = context.operation;
     try { if (succeeded && slot >= 0 && !context.path.empty()) {
         BattleStatsPersistedState state;
         std::wstring error;
@@ -886,13 +950,17 @@ void __cdecl FinishLoadSlot(int succeeded) {
         RecordStatsDiagnostic(operation, L"embedded-read", context.path,
             result == BattleStatsReadResult::Loaded ? &state : nullptr, error);
         bool loaded = result == BattleStatsReadResult::Loaded;
+        std::wstring migrationError;
         if (result == BattleStatsReadResult::Missing) {
-            loaded=LoadBattleStatsSidecar(context.path,StatsPathForSlot(slot),state,error);
+            const auto indexed=StatsPathForSlot(slot);
+            loaded=LoadBattleStatsSidecar(context.path,indexed,state,error);
+            if (!loaded && GetFileAttributesW(indexed.c_str())!=INVALID_FILE_ATTRIBUTES) migrationError=error;
             if (!loaded) {
                 // A copied private autosave from an old release may still
                 // have its sidecar adjacent to the actual loaded file.
                 auto adjacent=context.path.substr(0,context.path.size()-4)+L".stats";
                 loaded=LoadBattleStatsSidecar(context.path,adjacent,state,error);
+                if (!loaded && GetFileAttributesW(adjacent.c_str())!=INVALID_FILE_ATTRIBUTES) migrationError=error;
             }
         }
         if (!loaded) {
@@ -900,25 +968,29 @@ void __cdecl FinishLoadSlot(int succeeded) {
             state.scenarioOrdinal=CurrentScenarioOrdinal();
             state.active=state.scenarioOrdinal>=0 && (state.scenarioOrdinal&1)!=0;
             state.status=result==BattleStatsReadResult::Missing ?
-                L"该存档没有历史统计，从此次载入后开始记录。" : error;
+                (migrationError.empty() ? L"该存档没有历史统计，从此次载入后开始记录。" : migrationError) : error;
         }
         if (!RestoreBattleStatsState(state,GetTickCount64())) {
+            loaded=false;
             ResetBattleStatsForLoadedScenario(L"load-state-invalid",CurrentScenarioOrdinal());
-            state=BattleStatsPersistedState(); state.historyIncomplete=true;
-            state.scenarioOrdinal=CurrentScenarioOrdinal();
-            state.active=state.scenarioOrdinal>=0 && (state.scenarioOrdinal&1)!=0;
-            state.status=L"存档统计内容无效，从此次载入后重新记录。";
-            RestoreBattleStatsState(state,GetTickCount64());
+            SetStatsLastLoad(false,context.path,L"存档统计内容无效，从此次载入后继续记录。");
+            RecordStatsDiagnostic(operation,L"model-restore-invalid",context.path,nullptr,
+                L"存档统计内容无效，从此次载入后继续记录。");
+        } else {
+            SetStatsLastLoad(loaded, context.path, loaded ? L"统计状态已恢复" : state.status);
+            RecordStatsDiagnostic(operation, loaded ? L"load-success" : L"load-missing-or-corrupt",
+                context.path, &state, loaded ? L"" : state.status);
         }
-        SetStatsLastLoad(loaded, context.path, loaded ? L"统计状态已恢复" : state.status);
-        RecordStatsDiagnostic(operation, loaded ? L"load-success" : L"load-missing-or-corrupt",
-            context.path, &state, loaded ? L"" : state.status);
     } else if (succeeded) {
         ResetBattleStatsForLoadedScenario(L"load-path-unknown",CurrentScenarioOrdinal());
         StatsFailureNoThrow(L"无法确认本次读取的存档路径，从此次载入后重新记录。");
         SetStatsLastLoad(false, context.path, L"无法确认本次读取的存档路径");
         RecordStatsDiagnostic(operation, L"load-path-missing", context.path, nullptr,
             L"无法确认本次读取的存档路径");
+    } else {
+        SetStatsLastLoad(false,context.path,L"原生读取失败，保留读档前统计。");
+        RecordStatsDiagnostic(operation,L"native-load-failed",context.path,nullptr,
+            L"原生读取失败，保留读档前统计。");
     } } catch (...) {
         // A native load already replaced the game state. Never keep another
         // save's ledger if allocating or decoding its replacement failed.
@@ -936,8 +1008,12 @@ void __cdecl FinishLoadSlot(int succeeded) {
 void __cdecl FinishSaveSlot(int rawSlot) {
     if (!InterlockedCompareExchange(&gEnhancerReady, FALSE, FALSE)) return;
     if (gTransactionalHooks) {
-        if (gPrivateSaveActive && rawSlot==gPrivateSaveRawSlot) gPrivateSaveSucceeded=gCommitSucceeded;
-        if (!gCommitSucceeded) AbortSaveTransaction();
+        const bool committed=gCommitSucceeded && gActiveSaveAttempt &&
+            gCommittedSaveAttempt==gActiveSaveAttempt;
+        if (gPrivateSaveActive && rawSlot==gPrivateSaveRawSlot)
+            gPrivateSaveSucceeded=committed && gPrivateSaveAttempt==gActiveSaveAttempt;
+        if (!committed) AbortSaveTransaction();
+        SyncSaveRecoveryStatus();
         return;
     }
     if (gPrivateSaveActive && rawSlot == gPrivateSaveRawSlot) {
@@ -958,8 +1034,22 @@ void __cdecl FinishNativeSaveResult(int succeeded,int rawSlot) {
     // Opening the staged file may succeed even when a later native step
     // returns failure before reaching the commit bridge. Release its journal
     // and restore the pair on every native return, including AL == 0.
-    try { if (succeeded || gTransactionalHooks) FinishSaveSlot(rawSlot); }
-    catch (...) { AbortSaveTransaction(); StatsFailureNoThrow(L"存档统计提交未完成。"); }
+    try {
+        gNativeSaveResultObserved=true;
+        if (!succeeded && gTransactionalHooks) {
+            gCommitSucceeded=false;
+            gCommittedSaveAttempt=0;
+            if (gPrivateSaveActive && rawSlot==gPrivateSaveRawSlot) gPrivateSaveSucceeded=false;
+            AbortSaveTransaction();
+            SyncSaveRecoveryStatus();
+            SaveFailureNoThrow(L"原生保存未完成，未将本次操作标记为成功。");
+        } else if (succeeded) {
+            FinishSaveSlot(rawSlot);
+            if (gTransactionalHooks && (!gCommitSucceeded || !gActiveSaveAttempt ||
+                gCommittedSaveAttempt!=gActiveSaveAttempt))
+                SaveFailureNoThrow(L"原生返回成功，但本次存档事务没有对应的提交确认，未标记保存成功。");
+        }
+    } catch (...) { AbortSaveTransaction(); SyncSaveRecoveryStatus(); SaveFailureNoThrow(L"存档统计提交未完成。"); }
 }
 
 std::wstring FileTimeText(const FILETIME& utc) {
@@ -1025,22 +1115,34 @@ void SaveFilename65Impl(char* output, int rawSlot) {
     // The native stack buffer holds 16 bytes.  A short private filename
     // isolates this transaction from every numbered player/native save.
     if (gTransactionalHooks && output) {
+        if (!gPrivateSaveActive || !gPrivateSaveAttempt ||
+            gPrivateSaveAttempt!=gActiveSaveAttempt) BeginSaveAttempt();
         gSaveLayout.nativeFilename(output,rawSlot);
         const std::wstring nativeName(output,output+strlen(output));
         const int slot=EffectiveSaveSlot(rawSlot);
-        const std::wstring sourceExtension=slot>=0 ? SaveBaseForSlot(slot)+L".EXS" : L"";
+        const bool requireExtension=gSaveLayout.extensionCapability==NativeExtensionCapability::Verified;
+        const std::wstring sourceExtension=requireExtension && slot>=0 ? SaveBaseForSlot(slot)+L".EXS" : L"";
         const std::wstring target=gPrivateSaveActive ? gPrivateTargetBase+L".E5S" : gSaveRoot+L"\\"+nativeName;
-        const std::wstring extension=gPrivateSaveActive ? gPrivateTargetBase+L".EXS" : sourceExtension;
+        const std::wstring extension=requireExtension && gPrivateSaveActive ? gPrivateTargetBase+L".EXS" : sourceExtension;
+        gSaveTarget=target;
+        gSaveOperation=BeginStatsOperation(L"save",target);
         gCommitSucceeded=false;
+        gCommittedSaveAttempt=0;
         gNativeSaveWriteCount=0;
         std::wstring error;
+        if (gSaveLayout.extensionCapability==NativeExtensionCapability::Unsupported) {
+            strcpy_s(output,16,"?:\\XAFAIL.E5S");
+            SaveFailureNoThrow(L"检测到未验证或不对称的扩展存档结构，已拒绝覆盖原存档。");
+            return;
+        }
         if (ScenarioLoadInProgress() || !BeginSaveTransaction(gSaveRoot,target,sourceExtension,extension,output,error,
-                CompiledEngineProfile()==EngineProfileId::Ccz66)) {
+                requireExtension)) {
             // Intentionally invalid filename: a failed transaction must not
             // fall through and let the engine overwrite the original.
             strcpy_s(output,16,"?:\\XAFAIL.E5S");
-            SetBattleStatsStatus(error.empty()?L"正在读档，暂不能保存。":error,true);
-        }
+            SyncSaveRecoveryStatus(error.c_str());
+            SaveFailureNoThrow(error.empty()?L"正在读档，暂不能保存。":error.c_str());
+        } else SyncSaveRecoveryStatus();
         return;
     }
     if (output && rawSlot == kPrivateSaveSlot65 && gPrivateSaveActive) {
@@ -1056,8 +1158,9 @@ void __stdcall SaveFilename65Bridge(char* output, int rawSlot) {
     try { SaveFilename65Impl(output,rawSlot); }
     catch (...) {
         AbortSaveTransaction();
+        SyncSaveRecoveryStatus();
         if (output) strcpy_s(output,16,"?:\\XAFAIL.E5S");
-        StatsFailureNoThrow(L"无法建立完整存档事务，原存档未被替换。");
+        SaveFailureNoThrow(L"无法建立完整存档事务，原存档未被替换。");
     }
 }
 
@@ -1067,6 +1170,7 @@ void __stdcall LoadFilename65Bridge(char* output, int rawSlot) {
     if (output && !gLoadContexts.empty()) {
         try { gLoadContexts.back().path=gSaveRoot+L"\\"+std::wstring(output,output+strlen(output)); }
         catch (...) { gLoadContexts.back().path.clear(); }
+        RecordStatsDiagnostic(gLoadContexts.back().operation,L"load-path",gLoadContexts.back().path);
     }
 }
 
@@ -1087,15 +1191,22 @@ int __fastcall SaveCloseBridge(void* file, void*) {
 }
 int __cdecl CommitSave() {
     std::wstring error;
-    try { gCommitSucceeded=FinishSaveTransaction(error); }
+    try { gCommitSucceeded=gActiveSaveAttempt && FinishSaveTransaction(error); }
     catch (...) { gCommitSucceeded=false; AbortSaveTransaction(); }
+    SyncSaveRecoveryStatus(error.c_str());
+    gCommittedSaveAttempt=gCommitSucceeded ? gActiveSaveAttempt : 0;
     if (!gCommitSucceeded) {
-        StatsFailureNoThrow(error.empty()?L"存档事务未能完成，原存档保留。":error.c_str());
+        SaveFailureNoThrow(error.empty()?L"存档事务未能完成，原存档保留。":error.c_str());
         bool showDialog=!gPrivateSaveActive;
 #ifdef XA66_TEST
         showDialog=showDialog && gSaveFailureDialogForTest;
 #endif
         if (showDialog) MessageBoxW(gMainWindow,error.empty()?L"存档事务未能完成，原存档保留。":error.c_str(),L"存档未完成",MB_OK|MB_ICONERROR);
+    } else {
+        RecordStatsDiagnostic(gSaveOperation,L"save-committed",gSaveTarget,nullptr,
+            ReadSaveRecoveryStatus()==SaveRecoveryStatus::CleanupPending ?
+                L"原生存档与统计保存成功；事务清理待重试。" :
+                L"原生存档与内嵌战场统计已完成写入和复读校验。");
     }
     return gCommitSucceeded ? 1:0;
 }
@@ -1162,17 +1273,31 @@ void SavePrivate(void* game, bool atStart) {
     }
     gPrivateSaveRawSlot = nativeSlot;
     gPrivateSaveSucceeded = false;
+    BeginSaveAttempt();
+    gPrivateSaveAttempt=gActiveSaveAttempt;
     const std::wstring privateRoot = PatchPrivatePath(gSaveRoot, CompiledEngineProfile());
     const std::wstring folder = privateRoot + L"\\autosave";
     wchar_t privateName[64] = {};
     swprintf_s(privateName, L"\\%s-%03d", atStart ? L"start" : L"end", rotating);
     const std::wstring targetBase = folder + privateName;
     gPrivateTargetBase=targetBase;
+    gSaveTarget=targetBase+L".E5S";
+    gSaveOperation=BeginStatsOperation(L"save-auto",gSaveTarget);
     gPrivateSaveActive = true;
     const bool saved = NativeSaveSafe(game, nativeSlot);
     gPrivateSaveActive = false;
     gPrivateSaveRawSlot = -1;
-    if (!saved || !gPrivateSaveSucceeded) { InterlockedExchange(&gSaving, FALSE); return; }
+    gPrivateSaveAttempt=0;
+    if (!saved || !gPrivateSaveSucceeded) {
+        // NativeSaveSafe converts SEH to false, so the outer C++ catch does
+        // not run. Release this attempt's live transaction before returning.
+        AbortSaveTransaction();
+        SyncSaveRecoveryStatus();
+        if (!saved || !gNativeSaveResultObserved)
+            SaveFailureNoThrow(L"本次自动保存未收到对应的原生成功与事务提交确认，原记录未更新。");
+        InterlockedExchange(&gSaving, FALSE);
+        return;
+    }
     if (!EnsureFolder(gSaveRoot + L"\\patch") || !EnsureFolder(privateRoot) || !EnsureFolder(folder)) {
         InterlockedExchange(&gSaving, FALSE);
         return;
@@ -1210,8 +1335,9 @@ void __cdecl TurnStartPrivateHelper(void* game) {
     try { if (gFeatureSettings.autoSaveTurnStart) SavePrivate(game, true); }
     catch (...) {
         AbortSaveTransaction(); gPrivateSaveActive=false; gPrivateTargetBase.clear();
+        SyncSaveRecoveryStatus();
         InterlockedExchange(&gSaving,FALSE);
-        StatsFailureNoThrow(L"回合开始自动存档未完成。");
+        SaveFailureNoThrow(L"回合开始自动存档未完成。");
     }
 }
 
@@ -1219,8 +1345,9 @@ void __cdecl TurnEndPrivateHelper(void* game) {
     try { if (gFeatureSettings.autoSaveTurnEnd) SavePrivate(game, false); }
     catch (...) {
         AbortSaveTransaction(); gPrivateSaveActive=false; gPrivateTargetBase.clear();
+        SyncSaveRecoveryStatus();
         InterlockedExchange(&gSaving,FALSE);
-        StatsFailureNoThrow(L"回合结束自动存档未完成。");
+        SaveFailureNoThrow(L"回合结束自动存档未完成。");
     }
 }
 
@@ -1672,12 +1799,28 @@ bool RegisterBrowser() {
 }
 }
 
+void SetSaveRecoveryReady(bool ready, const wchar_t* detail) noexcept {
+    AcquireSRWLockExclusive(&gRecoveryDetailLock);
+    try { gRecoveryDetail=ready ? L"" : (detail ? detail : L""); } catch (...) {}
+    InterlockedExchange(&gRecoveryReady,ready ? TRUE : FALSE);
+    ReleaseSRWLockExclusive(&gRecoveryDetailLock);
+    // Publish acquires the shared lock; release exclusive ownership first.
+    PublishPersistenceCapability();
+}
+
 bool InitializeSaveEnhancer(const wchar_t* gameRoot) {
     InterlockedExchange(&gEnhancerReady, FALSE);
-    if (!gameRoot || !*gameRoot) return false;
+    if (!gameRoot || !*gameRoot) {
+        SetStatsPersistenceCapability(false,false,L"无法确认游戏目录，统计保存与恢复钩子未启用。");
+        return false;
+    }
     gSaveRoot = gameRoot;
     SaveLayout layout;
-    if (!ResolveSaveLayout(layout)) return false;
+    if (!ResolveSaveLayout(layout)) {
+        SetStatsPersistenceCapability(false,false,
+            L"保存或读取结构无法验证，可能含未知或不对称扩展链；统计不能随存档保存。");
+        return false;
+    }
     struct PendingPatch {
         BYTE* site;
         BYTE* original;
@@ -1736,6 +1879,8 @@ bool InitializeSaveEnhancer(const wchar_t* gameRoot) {
     }
     if (!prepared) {
         for (auto& patch : patches) if (*patch.thunk) VirtualFree(*patch.thunk, 0, MEM_RELEASE);
+        SetStatsPersistenceCapability(false,layout.extensionCapability==NativeExtensionCapability::Verified,
+            L"统计保存与恢复钩子准备失败。");
         return false;
     }
     gSaveLayout = layout;
@@ -1758,9 +1903,12 @@ bool InitializeSaveEnhancer(const wchar_t* gameRoot) {
     }
     if (installed != _countof(patches)) {
         RestoreSaveEnhancer();
+        SetStatsPersistenceCapability(false,layout.extensionCapability==NativeExtensionCapability::Verified,
+            L"统计保存与恢复钩子安装失败。");
         return false;
     }
     InterlockedExchange(&gEnhancerReady, TRUE);
+    PublishPersistenceCapability();
     return true;
 }
 
@@ -1773,10 +1921,12 @@ void RestoreSaveEnhancer() {
     // A foreign edit may prevent restoring one site.  Residual boundary
     // bridges must not start a private save after dependent hooks are gone.
     InterlockedExchange(&gEnhancerReady, FALSE);
+    PublishPersistenceCapability();
     gLoadContexts.clear();
     EndSaveGroupRead();
     InterlockedExchange(&gPendingLoadSlot, -1);
     AbortSaveTransaction();
+    SyncSaveRecoveryStatus();
     if (!gSaveLayout.saveResultSite) return;
     struct RestorePatch {
         BYTE* site;
@@ -1833,6 +1983,14 @@ bool OpenSaveBrowser(HWND owner, const wchar_t* gameRoot) {
     if (gBrowser && IsWindow(gBrowser)) { ShowWindow(gBrowser, SW_RESTORE); SetForegroundWindow(gBrowser); return true; }
     if (!gameRoot || !*gameRoot || !RegisterBrowser()) return false;
     gSaveRoot = gameRoot;
+    std::wstring recoveryError;
+    const bool recovered=RecoverSaveTransactions(gSaveRoot,recoveryError);
+    SetSaveRecoveryReady(recovered,recoveryError.c_str());
+    if (!recovered) {
+        MessageBoxW(owner,recoveryError.empty() ? L"存档事务尚未完整恢复，暂不能浏览存档。" : recoveryError.c_str(),
+            L"存档恢复未完成",MB_OK|MB_ICONERROR);
+        return false;
+    }
     RECT ownerRect = {}; GetWindowRect(owner, &ownerRect);
     gBrowser = CreateWindowExW(WS_EX_TOOLWINDOW, L"XiaoAn66SaveBrowser", L"存档浏览",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, ownerRect.left + 30, ownerRect.top + 30,
@@ -1859,10 +2017,15 @@ bool ResolveSaveEnhancerImageForTest(BYTE* image, uintptr_t virtualBase,
     SaveEnhancerImageLayout& output) {
     output = SaveEnhancerImageLayout();
     SaveLayout layout;
-    if (!ResolveSaveLayoutInImage(image, virtualBase, layout)) return false;
+    const bool resolved=ResolveSaveLayoutInImage(image, virtualBase, layout);
+    output.extensionCapability=layout.extensionCapability;
+    if (!resolved) return false;
     const auto address = [image, virtualBase](const void* pointer) -> uintptr_t {
         return pointer ? virtualBase + (reinterpret_cast<const BYTE*>(pointer) - image) : 0;
     };
+    output.hasAutomaticBoundaries=layout.callSite && layout.endCallSite;
+    output.extensionSaveSite=address(layout.extensionSaveSite);
+    output.extensionLoadSite=address(layout.extensionLoadSite);
     output.nativeAuto = address(reinterpret_cast<const void*>(layout.nativeAuto));
     output.nativeSave = address(reinterpret_cast<const void*>(layout.nativeSave));
     output.nativeEndAuto = address(reinterpret_cast<const void*>(layout.nativeEndAuto));
@@ -1892,10 +2055,14 @@ void ConfigureSaveEnhancerForTest(const wchar_t* gameRoot, BYTE* campaign,
     gLoadContexts.clear();
     gSaveRoot = gameRoot ? gameRoot : L"";
     gSaveLayout = SaveLayout();
+    gSaveLayout.extensionCapability=NativeExtensionCapability::None;
     gSaveLayout.campaignByte = campaign;
     gSaveLayout.nativeSave = reinterpret_cast<NativeSaveFn>(nativeSave);
     gSaveLayout.nativeFilename = reinterpret_cast<NativeFilenameFn>(nativeFilename);
     InterlockedExchange(&gEnhancerReady, gameRoot && nativeSave ? TRUE : FALSE);
+    SetSaveRecoveryReady(true);
+    BeginSaveAttempt();
+    gPrivateSaveAttempt=0;
 }
 
 void SavePrivateForTest(void* game, bool atStart) { SavePrivate(game, atStart); }
@@ -1940,7 +2107,15 @@ uintptr_t ConfigureSaveCommitBridgeForTest(uintptr_t post,uintptr_t continuation
     return reinterpret_cast<uintptr_t>(&SaveCommitBridge);
 }
 uintptr_t SaveResultBridgeForTest() { return reinterpret_cast<uintptr_t>(&SaveResultBridge); }
-void SetSaveTransactionalHooksForTest(bool enabled) { gTransactionalHooks=enabled; }
+void SetSaveTransactionalHooksForTest(bool enabled) {
+    gTransactionalHooks=enabled;
+    PublishPersistenceCapability();
+}
 #ifdef XA66_TEST
 void SetSaveFailureDialogForTest(bool enabled) { gSaveFailureDialogForTest=enabled; }
+
+void SetSaveExtensionCapabilityForTest(NativeExtensionCapability capability) {
+    gSaveLayout.extensionCapability=capability;
+    PublishPersistenceCapability();
+}
 #endif

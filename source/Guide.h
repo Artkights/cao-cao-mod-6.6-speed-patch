@@ -5,12 +5,15 @@
 #include <string>
 #include <vector>
 
-// The guide is deliberately independent from the accelerator state.  It reads
-// the current game's script/data files and owns its own modeless window.
+// The guide owns its modeless window and reads the current game's scripts.
+// Valid loaded runtime names take priority; physical tables fill missing IDs.
 bool OpenGuide(HWND owner, const wchar_t* gameRoot);
 void CloseGuide();
 bool IsGuideWindow(HWND window);
 bool HandleGuideMessage(MSG* message);
+
+// Enables only the independently audited 6.5/Protected220 conditional reader.
+void ConfigureGuideConditionalExtension(bool enabled) noexcept;
 
 // Called by the EXE CreateFileA import hook.  The guide keeps only the last
 // successfully shaped RS/R_XX.eex or RS/S_XX.eex name; it never changes what
@@ -79,3 +82,13 @@ struct GuideTestStats {
 
 bool BuildGuideStatsForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot, GuideTestStats& stats);
 
+
+// Synthetic EEX regression entry point: exercises the shared parser and reward
+// renderer without depending on a particular game's Data.e5 name table.
+bool BuildGuideScriptTextForTest(const std::vector<unsigned char>& bytes,
+    const std::vector<std::wstring>& people, std::wstring& text, std::wstring& diagnostics);
+
+#ifdef XA66_TEST
+struct BattleResourceSnapshot;
+bool CaptureGuideResourcesForTest(const wchar_t* root, BattleResourceSnapshot& snapshot);
+#endif

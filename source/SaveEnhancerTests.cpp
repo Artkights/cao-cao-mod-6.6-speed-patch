@@ -5,6 +5,7 @@
 #include "BattleStatsPersistence.h"
 #include "ScenarioLifecycle.h"
 #include "SaveTransactions.h"
+#include "StatsDiagnostics.h"
 #include <filesystem>
 
 #include <cstdio>
@@ -472,6 +473,14 @@ BattleStatsPersistedState MakeLoadState(uint64_t campaign, long long current, lo
     unit.comboExtraHitCount = total + 4; unit.attackBlockCount = total + 5;
     unit.spellBlockCount = total + 6; unit.defeatedEnemies = 70;
     state.campaignUnits.push_back(unit);
+    state.currentBattleParticipants.push_back(unit.personId);
+    BattleRosterEntry roster;
+    roster.personId = unit.personId;
+    roster.label = unit.label;
+    roster.joined = roster.tracking = true;
+    roster.lastCamp = 0;
+    roster.source = BattleRosterSource::ExistingCampaignLedger;
+    state.campaignRoster.push_back(roster);
     return state;
 }
 
@@ -587,6 +596,29 @@ void ValidateSynchronousLoadStatistics() {
         !snapshot.status.empty(),
         "prevent successful native loads with corrupt statistics from inheriting another save's data");
 
+    const auto legacySave=(root / L"SV" / L"SV004.E5S").wstring();
+    const auto legacySidecar=(root / L"SV" / L"SV004.stats").wstring();
+    auto legacy=stateA;
+    legacy.units.push_back(legacy.units.front());
+    legacy.units.back().slot=3;
+    memcpy(units.data()+3*0x30,units.data()+2*0x30,sizeof(WORD));
+    Check(WriteTestFile(legacySave,"native-legacy-duplicate-identity") &&
+        SaveBattleStatsSidecar(legacySave,legacySidecar,legacy,error),
+        "prepare a valid legacy sidecar whose distinct slots migrate to one runtime person");
+    InvokeNativeLoad(loadStart,3,true);
+    ReadBattleStatsSnapshot(snapshot);
+    const auto migrationInfo=ReadStatsPersistenceInfo();
+    Check(snapshot.units.empty() && snapshot.campaignUnits.empty() && snapshot.historyIncomplete &&
+        snapshot.scenarioOrdinal==ordinal && snapshot.campaignId!=0 &&
+        migrationInfo.lastLoad.find(L"存档统计内容无效")!=std::wstring::npos,
+        "model migration failure keeps a fresh current-scene identity and reports failed restoration");
+
+    Check(WriteTestFile(legacySidecar,"corrupt-existing-sidecar"),"prepare a present but corrupt migration sidecar");
+    InvokeNativeLoad(loadStart,3,true);
+    ReadBattleStatsSnapshot(snapshot);
+    Check(snapshot.status.find(L"该存档没有历史统计")==std::wstring::npos && !snapshot.status.empty(),
+        "an existing corrupt sidecar retains its error instead of being reported as absent history");
+
     ConfigureSaveEnhancerForTest(nullptr, nullptr, 0, 0);
     ShutdownScenarioLifecycle();
     ShutdownBattleStats();
@@ -595,6 +627,8 @@ void ValidateSynchronousLoadStatistics() {
 
 uintptr_t gTestSaveResultBridge = 0;
 DWORD gTestSaveResultSucceeded = 0;
+NativeExtensionCapability gCommitExtensionCapability=NativeExtensionCapability::None;
+int gCommitExtensionFault=0;
 DWORD gCommitPostCalls = 0, gCommitPostArgument = 1, gCommitPostFlags = 0;
 DWORD gCommitPostEax = 0, gCommitPostEcx = 0, gCommitPostEdx = 0;
 DWORD gCommitOutputEax = 0, gCommitOutputEcx = 0, gCommitOutputEdx = 0;
@@ -739,9 +773,9 @@ void InvokeProductionSaveResult(int rawSlot, bool succeeded) {
         "execute the real save result bridge preserving AL, registers, carry and RET 4 on every native return");
 }
 
-bool StageCommitBridgeSave(const std::wstring& root, bool complete) {
+bool StageCommitBridgeSave(const std::wstring& root, bool complete, int rawSlot=0) {
     char filename[16] = {};
-    RouteSaveFilenameForTest(filename, 0);
+    RouteSaveFilenameForTest(filename, rawSlot);
     if (!SaveTransactionActive() || strncmp(filename, "SV\\X", 4)) return false;
     const std::wstring temporary = root + L"\\" + std::wstring(filename, filename + strlen(filename));
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
@@ -758,15 +792,17 @@ bool StageCommitBridgeSave(const std::wstring& root, bool complete) {
     const bool flushed = FlushFileBuffers(file) != FALSE;
     const bool closed = CloseHandle(file) != FALSE;
     if (complete) ObserveSaveClose(flushed && closed);
-    if (CompiledEngineProfile() == EngineProfileId::Ccz66 && complete) {
+    if (gCommitExtensionCapability == NativeExtensionCapability::Verified && complete &&
+        gCommitExtensionFault != 1) {
         const bool extension = WriteTestFile(root + L"\\SV\\SV001.EXS", "new-native-extension");
-        ObserveSaveExtension(extension);
+        if (gCommitExtensionFault != 2)
+            ObserveSaveExtension(extension && gCommitExtensionFault != 3);
         okay = extension && okay;
     }
     return okay && flushed && closed;
 }
 
-void ValidateProductionSaveCommitAndResultBridges() {
+void ValidateProductionSaveCommitAndResultBridges(NativeExtensionCapability capability) {
     wchar_t temporary[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, temporary);
     const auto root = std::filesystem::path(temporary) /
@@ -779,8 +815,14 @@ void ValidateProductionSaveCommitAndResultBridges() {
     BYTE campaign = 0;
     ConfigureSaveEnhancerForTest(rootText.c_str(), &campaign,
         reinterpret_cast<uintptr_t>(&FakeNativeSave), reinterpret_cast<uintptr_t>(&FakeFilename));
+    gCommitExtensionCapability=capability;
+    gCommitExtensionFault=0;
+    SetSaveExtensionCapabilityForTest(capability);
     SetSaveTransactionalHooksForTest(true);
     SetSaveFailureDialogForTest(false);
+    SetSaveRecoveryReady(false,L"待恢复的保存组尚未确认。");
+    Check(!ReadStatsPersistenceInfo().available,
+        "unresolved recovery reports persistence unavailable while the verified native guards remain enabled");
     const uintptr_t commit = ConfigureSaveCommitBridgeForTest(
         reinterpret_cast<uintptr_t>(&FakeCommitPostWrite),
         reinterpret_cast<uintptr_t>(&NativeCommitSucceededContinuation),
@@ -789,27 +831,53 @@ void ValidateProductionSaveCommitAndResultBridges() {
     gCommitPostCalls = 0;
     auto state = MakeLoadState(303, 99, 999);
     state.active = false;
+    // Schema 4 records no tactical ledger while an R scene is active.  The
+    // campaign row remains available for the save transaction, but the
+    // current-battle units and participant set must be empty.
+    state.units.clear();
+    state.currentBattleParticipants.clear();
     std::wstring error;
-    Check(WriteTestFile(save, "old-native") && WriteTestFile(extension, "old-extension") &&
+    Check(WriteTestFile(save, "old-native") &&
+        (capability==NativeExtensionCapability::None || WriteTestFile(extension, "old-extension")) &&
         RestoreBattleStatsState(state, GetTickCount64()) && StageCommitBridgeSave(rootText, true),
         "stage a real transactional filename and four complete native writes before the production commit bridge");
     InvokeProductionSaveCommit(commit, true);
     BattleStatsPersistedState persisted;
     Check(!SaveTransactionActive() && ReadBattleStatsEmbedded(save, persisted, error) == BattleStatsReadResult::Loaded &&
-        SameLedger(persisted.units, state.units) && SameLedger(persisted.campaignUnits, state.campaignUnits),
+        SameLedger(persisted.units, state.units) && SameLedger(persisted.campaignUnits, state.campaignUnits) &&
+        ReadStatsPersistenceInfo().available,
         "the production commit bridge persists both snapshotted ledgers with the native save");
     InvokeProductionSaveResult(0, true);
     Check(RecoverSaveTransactions(rootText, error), "successful save result leaves no active transaction lock");
 
     const std::string committedPrefix = ReadTestFile(save);
     const std::string committedExtension = ReadTestFile(extension);
+    if (capability==NativeExtensionCapability::None) {
+        Check(committedExtension.empty() && GetFileAttributesW(extension.c_str())==INVALID_FILE_ATTRIBUTES,
+            "direct E5S production filename and commit succeed without generating EXS or observing any extension callback");
+    } else {
+        for (int fault : {1,2,3}) {
+            gCommitExtensionFault=fault;
+            Check(StageCommitBridgeSave(rootText,true),
+                "stage a required extension transaction with missing callback, missing file or failed validation");
+            InvokeProductionSaveCommit(commit,false);
+            InvokeProductionSaveResult(0,false);
+            Check(!SaveTransactionActive() && ReadTestFile(save)==committedPrefix &&
+                ReadTestFile(extension)==committedExtension && RecoverSaveTransactions(rootText,error),
+                "required extension failure restores the previous complete group and releases its lock");
+        }
+        gCommitExtensionFault=0;
+    }
     Check(StageCommitBridgeSave(rootText, true), "stage another complete native save before an injected commit failure");
     SetSaveTransactionFaultForTest(1);
     InvokeProductionSaveCommit(commit, false);
     SetSaveTransactionFaultForTest(0);
     InvokeProductionSaveResult(0, false);
+    BattleStatsSnapshot afterFailure;
+    ReadBattleStatsSnapshot(afterFailure);
     Check(!SaveTransactionActive() && ReadTestFile(save) == committedPrefix &&
-        ReadTestFile(extension) == committedExtension && RecoverSaveTransactions(rootText, error),
+        ReadTestFile(extension) == committedExtension && RecoverSaveTransactions(rootText, error) &&
+        afterFailure.historyIncomplete==state.historyIncomplete,
         "commit failure restores the previous save group and releases its lock before the native failure return");
 
     Check(StageCommitBridgeSave(rootText, false) && SaveTransactionActive(),
@@ -823,15 +891,218 @@ void ValidateProductionSaveCommitAndResultBridges() {
     InvokeProductionSaveResult(0, true);
     Check(!SaveTransactionActive() && RecoverSaveTransactions(rootText, error),
         "a later complete save commits after an earlier native failure without stale transaction state");
+    Check(ReadBattleStatsEmbedded(save,persisted,error)==BattleStatsReadResult::Loaded &&
+        persisted.historyIncomplete==state.historyIncomplete,
+        "a recovered disk-save failure does not contaminate later persisted collection completeness");
+    Check(StageCommitBridgeSave(rootText,true), "stage a committed save whose transaction cleanup will fail");
+    SetSaveTransactionFaultForTest(11);
+    InvokeProductionSaveCommit(commit,true);
+    InvokeProductionSaveResult(0,true);
+    Check(!SaveTransactionActive() && ReadSaveRecoveryStatus()==SaveRecoveryStatus::CleanupPending &&
+        !ReadStatsPersistenceInfo().available &&
+        ReadStatsPersistenceInfo().lastSave.find(L"清理待重试")!=std::wstring::npos,
+        "a production commit preserves successful-save cleanup-pending diagnostics and reports readiness accurately");
+    ObserveSaveLoadForTest(0);
+    Check(!ReadStatsPersistenceInfo().available && !ScenarioLoadInProgress(),
+        "a cleanup failure blocks native load while retaining its cleanup-only state");
+    SetSaveTransactionFaultForTest(0);
+    Check(StageCommitBridgeSave(rootText,true), "the next production save retries pending cleanup without recursive lock acquisition");
+    InvokeProductionSaveCommit(commit,true);
+    InvokeProductionSaveResult(0,true);
+    Check(ReadSaveRecoveryStatus()==SaveRecoveryStatus::Ready && ReadStatsPersistenceInfo().available,
+        "successful cleanup and a fresh production commit restore persistence availability");
+
+    Check(StageCommitBridgeSave(rootText,true), "stage a production rollback whose Restored marker cannot be written");
+    ObserveSaveWrite(1,0);
+    SetSaveTransactionFaultForTest(10);
+    InvokeProductionSaveCommit(commit,false);
+    InvokeProductionSaveResult(0,false);
+    Check(ReadSaveRecoveryStatus()==SaveRecoveryStatus::RecoveryPending && !ReadStatsPersistenceInfo().available,
+        "a failed durable recovery confirmation immediately revokes production persistence availability");
+    char blocked[16]={};
+    RouteSaveFilenameForTest(blocked,0);
+    ObserveSaveLoadForTest(0);
+    Check(!strcmp(blocked,"?:\\XAFAIL.E5S") && !SaveTransactionActive() &&
+        !ScenarioLoadInProgress() && !ReadStatsPersistenceInfo().available,
+        "failed save and load recovery retries retain unavailable capability and refuse native I/O");
+    SetSaveTransactionFaultForTest(0);
+    Check(StageCommitBridgeSave(rootText,true), "retry production persistence after recovery confirmation becomes writable");
+    InvokeProductionSaveCommit(commit,true);
+    InvokeProductionSaveResult(0,true);
+    Check(ReadSaveRecoveryStatus()==SaveRecoveryStatus::Ready && ReadStatsPersistenceInfo().available,
+        "a successful runtime recovery retry restores capability without restarting the process");
+    SetSaveExtensionCapabilityForTest(NativeExtensionCapability::Unsupported);
+    const auto beforeRejectedSave=ReadTestFile(save);
+    char rejected[16]={};
+    RouteSaveFilenameForTest(rejected,0);
+    Check(!SaveTransactionActive() && !strcmp(rejected,"?:\\XAFAIL.E5S") &&
+        ReadTestFile(save)==beforeRejectedSave && ReadTestFile(extension)==committedExtension,
+        "unsupported extension capability rejects the filename transaction without replacing either original");
     SetSaveFailureDialogForTest(true);
     SetSaveTransactionalHooksForTest(false);
     ConfigureSaveEnhancerForTest(nullptr, nullptr, 0, 0);
     ShutdownBattleStats();
     std::filesystem::remove_all(root);
 }
+int gPrivateTransactionalMode=0;
+uintptr_t gPrivateCommitBridge=0;
+extern "C" void __cdecl PrivateTransactionalBody(int rawSlot) {
+    if (gPrivateTransactionalMode==1) {
+        // The native core can branch to its failure epilogue before calling
+        // the file writer or filename hook at all.
+        InvokeProductionSaveResult(rawSlot,false);
+        return;
+    }
+    if (gPrivateTransactionalMode==2 || gPrivateTransactionalMode==3) {
+        Check(StageCommitBridgeSave(gFakeRoot,false,rawSlot),
+            "stage an incomplete private native write before SEH or a missing result callback");
+        if (gPrivateTransactionalMode==2) RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);
+        return;
+    }
+    Check(StageCommitBridgeSave(gFakeRoot,true,rawSlot),"stage this private save through the production filename bridge");
+    InvokeProductionSaveCommit(gPrivateCommitBridge,true);
+    InvokeProductionSaveResult(rawSlot,true);
+}
+__declspec(naked) void PrivateTransactionalNative() {
+    __asm {
+        push dword ptr [esp+4]
+        call PrivateTransactionalBody
+        add esp,4
+        ret 4
+    }
+}
+
+void ValidatePrivateAttemptIdentity() {
+    wchar_t temporary[MAX_PATH]={};
+    GetTempPathW(MAX_PATH,temporary);
+    const auto root=std::filesystem::path(temporary) /
+        (L"CczPrivateAttempt-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(root/L"SV");
+    gFakeRoot=root.wstring();
+    BYTE campaign=0;
+    BYTE game[4]={0,0,1,0};
+    auto state=MakeLoadState(404,44,444);
+    Check(RestoreBattleStatsState(state,GetTickCount64()),"seed complete schema-4 statistics for private save attempts");
+    ConfigureSaveEnhancerForTest(gFakeRoot.c_str(),&campaign,
+        reinterpret_cast<uintptr_t>(&PrivateTransactionalNative),reinterpret_cast<uintptr_t>(&FakeFilename));
+    SetSaveExtensionCapabilityForTest(NativeExtensionCapability::None);
+    SetSaveTransactionalHooksForTest(true);
+    SetSaveFailureDialogForTest(false);
+    gCommitExtensionCapability=NativeExtensionCapability::None;
+    gPrivateCommitBridge=ConfigureSaveCommitBridgeForTest(reinterpret_cast<uintptr_t>(&FakeCommitPostWrite),
+        reinterpret_cast<uintptr_t>(&NativeCommitSucceededContinuation),reinterpret_cast<uintptr_t>(&NativeCommitFailedContinuation));
+    gTestSaveResultBridge=SaveResultBridgeForTest();
+    gFeatureSettings.autoSaveSlots=5;
+    gFeatureSettings.saveScreenshots=false;
+    const auto base=PatchPrivatePath(gFakeRoot,CompiledEngineProfile())+L"\\autosave\\start-001";
+    gPrivateTransactionalMode=0;
+    SavePrivateForTest(game,true);
+    const auto saved=ReadTestFile(base+L".E5S");
+    Check(!saved.empty() && WriteTestFile(base+L".ini","previous-committed-index"),
+        "complete a private save and retain its index as a subsequent failure sentinel");
+    gPrivateTransactionalMode=1;
+    SavePrivateForTest(game,true);
+    const auto failedInfo=ReadStatsPersistenceInfo();
+    Check(!SaveTransactionActive() && ReadTestFile(base+L".E5S")==saved &&
+        ReadTestFile(base+L".ini")=="previous-committed-index" &&
+        failedInfo.lastSave.find(L"原生保存未完成")!=std::wstring::npos,
+        "a native failure before filename cannot reuse a preceding commit or relabel the previous autosave");
+    for (const int mode : {2,3}) {
+        gPrivateTransactionalMode=mode;
+        SavePrivateForTest(game,true);
+        std::wstring recoveryError;
+        const bool readLocked=BeginSaveGroupRead(gFakeRoot,recoveryError);
+        Check(!SaveTransactionActive() && readLocked && ReadTestFile(base+L".E5S")==saved &&
+            ReadTestFile(base+L".ini")=="previous-committed-index" &&
+            ReadSaveRecoveryStatus()==SaveRecoveryStatus::Ready,
+            "private native SEH and missing result callbacks abort their partial transaction and release the root lock");
+        if (readLocked) EndSaveGroupRead();
+    }
+    gPrivateTransactionalMode=0;
+    SavePrivateForTest(game,true);
+    Check(ReadTestFile(base+L".ini")!="previous-committed-index" && !SaveTransactionActive(),
+        "a fresh successful attempt commits after a pre-filename failure without stale state");
+    SetSaveFailureDialogForTest(true);
+    SetSaveTransactionalHooksForTest(false);
+    ConfigureSaveEnhancerForTest(nullptr,nullptr,0,0);
+    ShutdownBattleStats();
+    std::filesystem::remove_all(root);
+}
+
+void ValidateExtensionCapabilityMutations(const std::vector<BYTE>& image,DWORD base,
+    const SaveEnhancerImageLayout& resolved) {
+    SaveEnhancerImageLayout layout;
+    auto changed=image;
+    if (resolved.extensionCapability==NativeExtensionCapability::Verified) {
+        Check(resolved.extensionSaveSite && resolved.extensionLoadSite,
+            "verified native extension capability proves both callback sites");
+        changed[resolved.extensionSaveSite-base]=0x90;
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an unknown save extension callback instead of treating it as an E5S-only game");
+        changed=image;
+        changed[resolved.extensionLoadSite-base]=0x90;
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an unknown load extension callback instead of installing a partial persistence chain");
+        changed=image;
+        BYTE* before=changed.data()+(resolved.commitSite-base)-5;
+        before[0]=0xE8;
+        const int32_t displacement=static_cast<int32_t>((resolved.saveFilenameCall-17)-(resolved.commitSite));
+        memcpy(before+1,&displacement,4);
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an asymmetric direct-save and extended-load graph");
+        changed=image;
+        const auto loadCave=resolved.extensionLoadSite-base-31;
+        memcpy(changed.data()+resolved.loadStartSite-base+7,changed.data()+loadCave,6);
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an asymmetric extended-save and direct-load graph");
+    } else {
+        Check(!resolved.extensionSaveSite && !resolved.extensionLoadSite,
+            "direct E5S capability has no invented extension callback requirement");
+        changed[resolved.commitSite-base-5]=0xE9;
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an unrecognized jump inserted into a direct save chain");
+        changed=image;
+        changed[resolved.loadStartSite-base+7]=0xE9;
+        Check(!ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            layout.extensionCapability==NativeExtensionCapability::Unsupported,
+            "reject an unrecognized jump inserted into a direct load chain");
+    }
+    if (resolved.nativeAuto) {
+        changed=image;
+        changed[resolved.nativeAuto-base]=0x90;
+        Check(ResolveSaveEnhancerImageForTest(changed.data(),base,layout) &&
+            !layout.hasAutomaticBoundaries && layout.commitSite==resolved.commitSite &&
+            layout.extensionCapability==resolved.extensionCapability,
+            "an unknown optional automatic boundary leaves the ordinary persistence graph available");
+    }
+}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc==3 && !wcscmp(argv[1],L"--extension-variant")) {
+        std::vector<BYTE> image;
+        DWORD base=0;
+        Check(LoadImage(argv[2],image,base),"load real PE fixture for capability and production transaction regression");
+        if (failures) return 1;
+        SaveEnhancerImageLayout layout;
+        Check(ResolveSaveEnhancerImageForTest(image.data(),base,layout),
+            "resolve real fixture persistence capability without relying on sample addresses");
+        if (failures) return 1;
+        printf("profile=%u extensionCapability=%u automaticBoundaries=%u\n",
+            static_cast<unsigned>(CompiledEngineProfile()),static_cast<unsigned>(layout.extensionCapability),
+            static_cast<unsigned>(layout.hasAutomaticBoundaries));
+        ValidateExtensionCapabilityMutations(image,base,layout);
+        ValidateSynchronousLoadStatistics();
+        ValidateProductionSaveCommitAndResultBridges(layout.extensionCapability);
+        ValidatePrivateAttemptIdentity();
+        printf("SaveEnhancerExtensionVariant: %d failures\n",failures);
+        return failures ? 1:0;
+    }
     if (argc == 3 && (!wcscmp(argv[1], L"--layout-only") || !wcscmp(argv[2], L"--layout-only"))) {
         const wchar_t* path = !wcscmp(argv[1], L"--layout-only") ? argv[2] : argv[1];
         std::vector<BYTE> image;
@@ -930,7 +1201,9 @@ int wmain(int argc, wchar_t** argv) {
     ValidateNativeDisabledAndEndOwner();
     if (engine64 || engine65) ValidatePrivateSaveTransactions65();
     ValidateSynchronousLoadStatistics();
-    ValidateProductionSaveCommitAndResultBridges();
+    ValidateProductionSaveCommitAndResultBridges(engine64 || engine65 ?
+        NativeExtensionCapability::None : NativeExtensionCapability::Verified);
+    ValidatePrivateAttemptIdentity();
     printf("SaveEnhancerTests: %d failures\n", failures);
     return failures ? 1 : 0;
 }

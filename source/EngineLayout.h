@@ -18,27 +18,15 @@ enum EngineSiteIndex : size_t {
     EngineSiteCount
 };
 
-// The resolver is deliberately explicit about the trust level of a plan.  A
-// caller may present a ForceRequired plan to the user, but must not apply it
-// as if it were an automatically verified layout.
-enum class EngineResolveMode : unsigned char {
-    Automatic,
-    Forced
-};
-
-enum class EnginePlanStatus : unsigned char {
-    Unresolved,
-    AutoVerified,
-    ForceRequired,
-    ForceAccepted,
-    Rejected
-};
+enum class EngineAnalysisSource : unsigned char { Disk, Runtime };
+enum class EngineSiteByteSource : unsigned char { Disk, RuntimeOnly };
 
 struct EngineSitePlan {
     EngineSiteIndex index = EngineSiteCount;
     uintptr_t legacyAddress = 0;
     uintptr_t rva = 0;
     size_t rawFileOffset = SIZE_MAX;
+    EngineSiteByteSource byteSource = EngineSiteByteSource::RuntimeOnly;
     size_t length = 0;
     unsigned capability = 0;
     bool required = false;
@@ -52,13 +40,13 @@ struct EngineSitePlan {
 // RVA and rawFileOffset make the same plan useful for an on-disk report.
 struct EnginePatchPlan {
     EngineProfileId profile = EngineProfileId::Unknown;
-    EngineResolveMode mode = EngineResolveMode::Automatic;
     EnginePlanStatus status = EnginePlanStatus::Unresolved;
     unsigned confidence = 0;
     uintptr_t preferredBase = 0x400000;
     uintptr_t loadedBase = 0;
     size_t imageSize = 0;
     unsigned capabilities = 0;
+    bool runtimeValidated = false;
     EngineSitePlan sites[EngineSiteCount] = {};
     EngineSitePlan nativeRoute;
     EngineSitePlan nativeState;
@@ -202,20 +190,21 @@ enum EngineCapability : unsigned {
     CapabilityNativeSuper = 1u << 11
 };
 
-bool ResolveEngineLayout(const BYTE* image, EngineLayout& layout, uintptr_t virtualBase = 0);
+bool ResolveEngineLayout(const BYTE* image, EngineLayout& layout, uintptr_t virtualBase = 0,
+    EngineAnalysisSource source = EngineAnalysisSource::Disk, uintptr_t runtimeMemoryBase = 0);
 
-// Explicit fallback for a user-selected family.  It uses that family's built
-// in address template, checks PE/section boundaries, and captures the target's
-// actual bytes.  It never infers or automatically accepts the family.
-bool ResolveForcedEngineLayout(const BYTE* image, size_t imageSize,
-    EngineProfileId profile, EngineLayout& layout, uintptr_t virtualBase = 0);
+// Explicit version fallback. Runtime bytes are captured as the restoration
+// baseline; disk raw offsets, executable section flags and signature identity
+// do not authorize or block this user-selected template.
+bool ResolveVersionEngineLayout(const BYTE* image, size_t imageSize, EngineProfileId profile,
+    EngineLayout& layout, uintptr_t virtualBase = 0);
 
 // Build the file-addressable/auditable plan for a resolved mapped image.  The
 // existing resolver remains the source of truth; this helper adds raw offsets
-// and explicit mode/status without changing legacy callers.
+// without changing legacy callers.
 bool BuildEnginePatchPlan(const BYTE* image, size_t imageSize, const EngineLayout& layout,
     EnginePatchPlan& plan, uintptr_t virtualBase = 0,
-    EngineResolveMode mode = EngineResolveMode::Automatic);
+    EngineAnalysisSource source = EngineAnalysisSource::Disk, uintptr_t runtimeMemoryBase = 0);
 
 const wchar_t* EnginePlanStatusName(EnginePlanStatus status);
 std::wstring EnginePatchPlanReport(const EnginePatchPlan& plan);

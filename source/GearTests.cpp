@@ -366,11 +366,44 @@ void CacheTests() {
             "module replacement restores old and intercepts new");
     }
 }
+
+void VersionImportTests() {
+    ResetClocks();
+    MockImage fixture;
+    DWORD slots[2] = {};
+    Check(NativeClockSlots(fixture.Module(), 0x200, slots) && slots[0] == 0x500 && slots[1] == 0x580,
+        "version imports resolve clock slots without protected header or call signatures");
+    Check(ConfigureNativeImportsCore(fixture.Module(), 0x200),
+        "configure native imports accepts a different PE layout");
+    HookRecord additions[maxHooks];
+    size_t count = 0;
+    Check(HookNativeClockSlots(fixture.Module(), additions, &count) && count == 2,
+        "version-selected clock imports install from named slots");
+    UnIntercept();
+    Check(fixture.kernelIat[0].u1.Function == reinterpret_cast<DWORD>(FakeTick) &&
+        fixture.userIat[0].u1.Function == reinterpret_cast<DWORD>(FakeTimer),
+        "version-selected clock imports restore actual original pointers");
+    fixture.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = 0;
+    Check(ConfigureNativeClockSlotsCore(fixture.Module(), 0x500, 0x580,
+        reinterpret_cast<void*>(FakeTick), reinterpret_cast<void*>(FakeTimer)),
+        "verified explicit clocks configure without a public import table");
+    count = 0;
+    Check(HookNativeClockSlots(fixture.Module(), additions, &count) && count == 2,
+        "explicit native clock slots install independently of OFT and descriptors");
+    UnIntercept();
+    Check(!ConfigureNativeClockSlotsCore(fixture.Module(), 0x500, 0x580,
+        reinterpret_cast<void*>(FakeTimer), reinterpret_cast<void*>(FakeTick)),
+        "changed clock targets cannot authorize stale native slots");
+    fixture.kernelIat[0].u1.Function = reinterpret_cast<DWORD>(FakeTime);
+    Check(!ConfigureNativeClockSlotsCore(fixture.Module(), 0x500, 0x580,
+        reinterpret_cast<void*>(FakeTime), reinterpret_cast<void*>(FakeTimer)),
+        "matching unknown clock wrapper is preserved rather than bypassed");
+}
 } // namespace
 
 int main() {
     NativeClockTests(); CurveAndClockTests(); GranularityAndTransitionTests();
-    TimerTests(); ImportTests(); CacheTests();
+    TimerTests(); ImportTests(); CacheTests(); VersionImportTests();
     printf("GearTests: %s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -1,6 +1,7 @@
 #include "SaveTransactions.h"
 #include "BattleStatsPersistence.h"
 #include "EngineProfile.h"
+#include "StatsDiagnostics.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -72,6 +73,16 @@ BattleStatsPersistedState SampleState(bool newer) {
     unit.label = L"已退场角色";
     unit.damageDealt = newer ? 555 : 500;
     state.campaignUnits.push_back(unit);
+    state.currentBattleParticipants.push_back(state.units[0].personId);
+    for (const BattleUnitTotals& total : state.campaignUnits) {
+        BattleRosterEntry entry;
+        entry.personId = total.personId;
+        entry.label = total.label;
+        entry.joined = entry.tracking = true;
+        entry.lastCamp = 0;
+        entry.source = BattleRosterSource::ExistingCampaignLedger;
+        state.campaignRoster.push_back(entry);
+    }
     return state;
 }
 
@@ -429,6 +440,272 @@ bool WriteSized(const std::wstring& path, LONGLONG bytes) {
     return CloseHandle(file) && ok;
 }
 
+std::wstring JournalPath(const std::wstring& root) {
+    return PatchPrivatePath(root, CompiledEngineProfile()) + L"\\transactions\\active.ini";
+}
+
+std::wstring JournalValue(const std::wstring& root, const wchar_t* key) {
+    wchar_t value[32768] = {};
+    GetPrivateProfileStringW(L"Transaction", key, L"", value, _countof(value), JournalPath(root).c_str());
+    return value;
+}
+
+bool BeginMode(const Fixture& fixture, char (&filename)[16], bool extension) {
+    std::wstring error;
+    return RestoreBattleStatsState(SampleState(true), GetTickCount64()) &&
+        BeginSaveTransaction(fixture.root, fixture.target,
+            extension ? fixture.nativeExtension : L"", extension ? fixture.targetExtension : L"",
+            filename, error, extension);
+}
+
+bool WriteMode(const Fixture& fixture, const char* filename, bool extension) {
+    return SimulateNativeWriter(fixture, filename, false, false, 4, true, extension, extension);
+}
+
+DWORD RunStateChild(const std::wstring& root, int fault, bool extension, const wchar_t* operation) {
+    wchar_t executable[32768] = {};
+    GetModuleFileNameW(nullptr, executable, _countof(executable));
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --state-crash \"" + root +
+        L"\" " + std::to_wstring(fault) + L" " + (extension ? L"1" : L"0") + L" " + operation;
+    STARTUPINFOW startup = {sizeof(startup)};
+    startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, root.c_str(), &startup, &process)) return MAXDWORD;
+    const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    DWORD code = MAXDWORD;
+    if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
+    else TerminateProcess(process.hProcess, 92);
+    CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    return code;
+}
+
+int StateCrashChild(const std::wstring& root, int fault, bool extension, const wchar_t* operation) {
+    std::wstring error;
+    if (!wcscmp(operation, L"recover")) {
+        SetSaveTransactionFaultForTest(fault);
+        RecoverSaveTransactions(root, error);
+        return 94;
+    }
+    const Fixture fixture = Paths(root, true);
+    char filename[16] = {};
+    if (!BeginMode(fixture, filename, extension) || !WriteMode(fixture, filename, extension)) return 93;
+    SetSaveTransactionFaultForTest(fault);
+    if (!wcscmp(operation, L"abort")) AbortSaveTransaction();
+    else {
+        if (!wcscmp(operation, L"rollback")) ObserveSaveWrite(1, 0);
+        FinishSaveTransaction(error);
+    }
+    return 94;
+}
+
+void ValidateE5sOnly(const std::wstring& root) {
+    const Fixture fixture = Prepare(root, true);
+    HANDLE nativeLock = CreateFileW(fixture.nativeExtension.c_str(), GENERIC_READ, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr);
+    HANDLE targetLock = CreateFileW(fixture.targetExtension.c_str(), GENERIC_READ, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr);
+    Check(nativeLock != INVALID_HANDLE_VALUE && targetLock != INVALID_HANDLE_VALUE,
+        "exclusively lock unrelated EXS files throughout E5S-only transactions");
+    char filename[16] = {};
+    std::wstring error;
+    Check(BeginMode(fixture, filename, false) && JournalValue(root, L"Count") == L"1" &&
+        WriteMode(fixture, filename, false) && FinishSaveTransaction(error),
+        "E5S-only save accepts empty extension paths and commits while unrelated EXS are inaccessible");
+    const auto committed = ReadBytes(fixture.target);
+    BattleStatsPersistedState state;
+    Check(ReadBattleStatsEmbedded(fixture.target, state, error) == BattleStatsReadResult::Loaded &&
+        state.units[0].damageDealt == 99, "E5S-only save contains the matching statistics snapshot");
+    Check(BeginMode(fixture, filename, false) && WriteMode(fixture, filename, false),
+        "begin E5S-only replacement failure with inaccessible unrelated EXS");
+    SetSaveTransactionFaultForTest(2);
+    Check(!FinishSaveTransaction(error), "reject injected E5S-only replacement failure");
+    SetSaveTransactionFaultForTest(0);
+    Check(ReadBytes(fixture.target) == committed && RecoverSaveTransactions(root, error),
+        "E5S-only rollback restores its last committed E5S without opening EXS");
+    Check(RunStateChild(root, 3, false, L"commit") == 91 && JournalValue(root, L"Count") == L"1" &&
+        RecoverSaveTransactions(root, error) && ReadBytes(fixture.target) == committed,
+        "recover a real E5S-only child-process crash while both EXS remain locked");
+    if (nativeLock != INVALID_HANDLE_VALUE) CloseHandle(nativeLock);
+    if (targetLock != INVALID_HANDLE_VALUE) CloseHandle(targetLock);
+    Check(ReadBytes(fixture.nativeExtension) == fixture.originalNativeExtension &&
+        ReadBytes(fixture.targetExtension) == fixture.originalTargetExtension,
+        "E5S-only success, rollback and crash recovery preserve unrelated EXS byte for byte");
+}
+
+void ValidateFirstPrivateSave(const std::wstring& root) {
+    const Fixture fixture = Paths(root, true);
+    std::filesystem::create_directories(std::filesystem::path(fixture.target).parent_path());
+    Check(GetFileAttributesW((root + L"\\SV").c_str()) == INVALID_FILE_ATTRIBUTES,
+        "prepare a first private autosave before any numbered save directory exists");
+    char filename[16] = {};
+    std::wstring error;
+    Check(BeginMode(fixture, filename, false) && WriteMode(fixture, filename, false) && FinishSaveTransaction(error),
+        "first private autosave creates the native staging directory without requiring an earlier manual save");
+    BattleStatsPersistedState state;
+    Check(ReadBattleStatsEmbedded(fixture.target, state, error) == BattleStatsReadResult::Loaded &&
+        GetFileAttributesW(fixture.nativeExtension.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(fixture.targetExtension.c_str()) == INVALID_FILE_ATTRIBUTES,
+        "first E5S-only autosave contains statistics and creates no EXS files");
+}
+
+void ValidateStateCrash(const std::wstring& root, int fault, bool extension,
+    const wchar_t* operation, bool expectNew) {
+    const Fixture fixture = Prepare(root, true);
+    Check(RunStateChild(root, fault, extension, operation) == 91,
+        "terminate a real child at the requested durable-state or cleanup instruction boundary");
+    const auto beforeRecovery = ReadBytes(fixture.target);
+    std::wstring error;
+    Check(RecoverSaveTransactions(root, error), "recover after an interrupted state transition or cleanup");
+    if (expectNew) {
+        BattleStatsPersistedState state;
+        Check(ReadBytes(fixture.target) == beforeRecovery &&
+            ReadBattleStatsEmbedded(fixture.target, state, error) == BattleStatsReadResult::Loaded &&
+            state.units[0].damageDealt == 99,
+            "a durable Committed marker preserves the new E5S even when backups were partly deleted");
+        Check(ReadBytes(fixture.nativeExtension) == fixture.originalNativeExtension &&
+            ReadBytes(fixture.targetExtension) == (extension ? Bytes("new-native-extension") : fixture.originalTargetExtension),
+            "committed cleanup preserves the correct native and private EXS ownership");
+    } else Check(OriginalPairRestored(fixture),
+        "Prepared recovery and Restored cleanup both preserve the previous complete save group");
+    Check(GetFileAttributesW(JournalPath(root).c_str()) == INVALID_FILE_ATTRIBUTES &&
+        RecoverSaveTransactions(root, error), "completed state recovery removes its journal and remains idempotent");
+}
+
+void ValidateRecoveryCrash(const std::wstring& root, int fault, bool extension) {
+    const Fixture fixture = Prepare(root, true);
+    Check(RunStateChild(root, 3, extension, L"commit") == 91,
+        "prepare a real post-replacement crash before interrupting recovery again");
+    Check(RunStateChild(root, fault, extension, L"recover") == 91,
+        "terminate a separate recovery process during restoration or cleanup");
+    std::wstring error;
+    Check(RecoverSaveTransactions(root, error) && OriginalPairRestored(fixture) &&
+        RecoverSaveTransactions(root, error),
+        "a third process state safely finishes recovery interrupted after restoring or deleting any member");
+}
+
+void ValidateStateCompatibility(const std::wstring& root, bool committed) {
+    const Fixture fixture = Prepare(root, true);
+    Check(RunStateChild(root, committed ? 25 : 3, true, L"commit") == 91,
+        "prepare a durable journal for legacy reader-format compatibility");
+    const auto saved = ReadBytes(fixture.target);
+    const auto journal = JournalPath(root);
+    Check(WritePrivateProfileStringW(L"Transaction", L"SchemaVersion", nullptr, journal.c_str()) &&
+        WritePrivateProfileStringW(L"Transaction", L"State", nullptr, journal.c_str()),
+        "retain only the legacy Committed bit and member fields");
+    std::wstring error;
+    Check(RecoverSaveTransactions(root, error) &&
+        (committed ? ReadBytes(fixture.target) == saved : OriginalPairRestored(fixture)),
+        "read legacy Prepared and cleanup-only journals without guessing their outcome");
+}
+
+void ValidateMarkerAndCleanupFailure(const std::wstring& root, bool committed) {
+    const Fixture fixture = Prepare(root, true);
+    char filename[16] = {};
+    std::wstring error;
+    Check(BeginMode(fixture, filename, true) && WriteMode(fixture, filename, true),
+        "prepare marker and cleanup retry fixture");
+    if (!committed) ObserveSaveWrite(1, 0);
+    SetSaveTransactionFaultForTest(committed ? 11 : 10);
+    Check(FinishSaveTransaction(error) == committed && !SaveTransactionActive(),
+        "cleanup failure cannot turn a committed save into failure; failed restore seal remains recoverable");
+    Check(ReadSaveRecoveryStatus() == (committed ? SaveRecoveryStatus::CleanupPending : SaveRecoveryStatus::RecoveryPending),
+        "the nonblocking public recovery status distinguishes cleanup from unconfirmed rollback");
+    Check(JournalValue(root, L"State") == (committed ? L"Committed" : L"Prepared") &&
+        GetFileAttributesW((fixture.target + L".xa-old").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((fixture.nativeExtension + L".xa-old").c_str()) != INVALID_FILE_ATTRIBUTES,
+        "failed cleanup or Restored marker retains its journal and complete backups");
+    const auto saved = ReadBytes(fixture.target);
+    SetSaveTransactionFaultForTest(0);
+    Check(RecoverSaveTransactions(root, error) &&
+        (committed ? ReadBytes(fixture.target) == saved : OriginalPairRestored(fixture)) &&
+        ReadSaveRecoveryStatus() == SaveRecoveryStatus::Ready,
+        "retry cleanup-only or Prepared recovery after the transient failure ends");
+}
+
+void ValidatePreparationFailure(const std::wstring& root, int fault) {
+    const Fixture fixture = Prepare(root, true);
+    char filename[16] = {};
+    SetSaveTransactionFaultForTest(fault);
+    Check(!BeginMode(fixture, filename, true) && !SaveTransactionActive(),
+        "contain allocation failure during snapshot capture or backup preparation");
+    SetSaveTransactionFaultForTest(0);
+    bool clean = true;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const std::wstring name = entry.path().filename().wstring();
+        if (name.rfind(L"X", 0) == 0 || name.find(L".xa-old") != std::wstring::npos ||
+            name.find(L".tmp") != std::wstring::npos) clean = false;
+    }
+    std::wstring error;
+    Check(clean && OriginalPairRestored(fixture) && RecoverSaveTransactions(root, error) &&
+        BeginMode(fixture, filename, true),
+        "pre-journal failure removes owned staging files and backups and releases locks for retry");
+    AbortSaveTransaction();
+}
+
+void ValidateEnumerationFailure(const std::wstring& root, int fault) {
+    const Fixture fixture = Prepare(root, true);
+    Check(RunStateChild(root, 3, true, L"commit") == 91, "prepare interrupted save for enumeration failure");
+    SetSaveTransactionFaultForTest(fault);
+    std::wstring error;
+    Check(!RecoverSaveTransactions(root, error) && !error.empty(),
+        "enumeration allocation and I/O failures are not mistaken for successful recovery");
+    SetSaveTransactionFaultForTest(0);
+    Check(RecoverSaveTransactions(root, error) && OriginalPairRestored(fixture),
+        "enumeration failure releases search and root handles and preserves recoverable saves");
+}
+
+void ValidateLegacyRestoredAndMissingBackup(const std::wstring& root, bool restored) {
+    const Fixture fixture = Prepare(root, true);
+    Check(RunStateChild(root, restored ? 22 : 3, true, restored ? L"rollback" : L"commit") == 91,
+        "prepare Restored or Prepared legacy-format recovery evidence");
+    const auto journal = JournalPath(root);
+    Check(WritePrivateProfileStringW(L"Transaction", L"SchemaVersion", nullptr, journal.c_str()) &&
+        WritePrivateProfileStringW(L"Transaction", L"State", nullptr, journal.c_str()) &&
+        DeleteFileW((fixture.target + L".xa-old").c_str()),
+        "simulate a partially removed backup while retaining the legacy cleanup bit");
+    const auto nativeBefore = ReadBytes(fixture.nativeExtension);
+    const auto targetBefore = ReadBytes(fixture.target);
+    std::wstring error;
+    const bool recovered = RecoverSaveTransactions(root, error);
+    Check(recovered == restored && ReadBytes(fixture.target) == targetBefore &&
+        (restored ? OriginalPairRestored(fixture) : !error.empty()),
+        "legacy cleanup-only does not require backups; legacy Prepared with a missing backup cannot be guessed safe");
+    if (!restored) Check(ReadBytes(fixture.nativeExtension) == nativeBefore &&
+        GetFileAttributesW(journal.c_str()) != INVALID_FILE_ATTRIBUTES,
+        "invalid legacy recovery preserves remaining metadata and does not delete its evidence");
+}
+
+void ValidateDiagnostics(const std::wstring& root) {
+    const Fixture fixture = Prepare(root, true);
+    InitializeStatsDiagnostics(root.c_str());
+    char filename[16] = {};
+    std::wstring error;
+    Check(BeginMode(fixture, filename, false) && WriteMode(fixture, filename, false) && FinishSaveTransaction(error),
+        "persist a real E5S-only transaction with stage diagnostics enabled");
+    BattleStatsPersistedState before, after;
+    Check(CaptureBattleStatsState(before, GetTickCount64()) && BeginMode(fixture, filename, false) &&
+        WriteMode(fixture, filename, false), "capture statistics history before a diagnosed save failure");
+    ObserveSaveWrite(1, 0);
+    Check(!FinishSaveTransaction(error) && CaptureBattleStatsState(after, GetTickCount64()) &&
+        before.historyIncomplete == after.historyIncomplete,
+        "save failure diagnostics do not mark combat history incomplete");
+    const auto path = PatchPrivatePath(root, CompiledEngineProfile()) + L"\\diagnostics\\stats.log";
+    const auto bytes = ReadBytes(path);
+    const std::string log(bytes.begin(), bytes.end());
+    Check(log.find("captured") != std::string::npos && log.find("embedded_verified") != std::string::npos &&
+        log.find("target_committed") != std::string::npos && log.find("save_commit_failed") != std::string::npos &&
+        log.find("restored") != std::string::npos && log.find("rollback") != std::string::npos &&
+        log.find("extensionRequired=0") != std::string::npos && log.find("writes=5") != std::string::npos,
+        "diagnostic evidence records success, rollback, actual extension policy and native I/O observations");
+    HANDLE lockedLog = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    Check(lockedLog != INVALID_HANDLE_VALUE && BeginMode(fixture, filename, false) &&
+        WriteMode(fixture, filename, false) && FinishSaveTransaction(error),
+        "an inaccessible diagnostic log cannot prevent committing a complete save");
+    if (lockedLog != INVALID_HANDLE_VALUE) CloseHandle(lockedLog);
+    InitializeStatsDiagnostics(nullptr);
+}
+
 int ValidateRealExtensionFixture(const std::wstring& dllPath) {
     // Load only the PE image for instruction/data inspection. Never run
     // DllMain, SaveVar or any dependency initialization in this fixture.
@@ -478,6 +755,8 @@ int ValidateRealExtensionFixture(const std::wstring& dllPath) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 6 && !wcscmp(argv[1], L"--state-crash"))
+        return StateCrashChild(argv[2], _wtoi(argv[3]), !wcscmp(argv[4], L"1"), argv[5]);
     if (argc == 3 && !wcscmp(argv[1], L"--native-extension-fixture"))
         return ValidateRealExtensionFixture(argv[2]);
     if (argc == 3 && !wcscmp(argv[1], L"--crash-private")) return CrashChild(argv[2]);
@@ -515,6 +794,41 @@ int wmain(int argc, wchar_t** argv) {
     ValidateAllocationFailure(root + L"\\finish-allocation-failure", 5);
     ValidateAllocationFailure(root + L"\\recover-allocation-failure", 6);
     ValidateAllocationFailure(root + L"\\read-allocation-failure", 7);
+    ValidateE5sOnly(root + L"\\e5s-only");
+    ValidateFirstPrivateSave(root + L"\\first-private-save");
+    ValidatePreparationFailure(root + L"\\snapshot-allocation", 8);
+    ValidatePreparationFailure(root + L"\\backup-allocation", 9);
+    ValidateEnumerationFailure(root + L"\\enumeration-allocation", 12);
+    ValidateEnumerationFailure(root + L"\\enumeration-io", 13);
+    ValidateMarkerAndCleanupFailure(root + L"\\restored-marker-failure", false);
+    ValidateMarkerAndCleanupFailure(root + L"\\committed-cleanup-failure", true);
+    ValidateFailure(root + L"\\commit-marker-failure", 14, false, false, true);
+    ValidateStateCompatibility(root + L"\\legacy-prepared", false);
+    ValidateStateCompatibility(root + L"\\legacy-committed", true);
+    ValidateLegacyRestoredAndMissingBackup(root + L"\\legacy-restored-cleanup", true);
+    ValidateLegacyRestoredAndMissingBackup(root + L"\\legacy-missing-backup", false);
+    ValidateStrictJournal(root + L"\\invalid-state", L"State", L"Unknown", L"Prepared");
+    ValidateStrictJournal(root + L"\\state-bit-mismatch", L"Committed", L"1", L"0");
+    ValidateStrictJournal(root + L"\\missing-state", L"State", nullptr, L"Prepared");
+    ValidateStrictJournal(root + L"\\invalid-schema", L"SchemaVersion", L"999", L"2");
+    for (const bool extension : {false, true}) {
+        const std::wstring group = root + (extension ? L"\\extended" : L"\\native-only");
+        std::vector<int> rollbackPoints = {21,22,24};
+        std::vector<int> commitPoints = {25,24};
+        for (int member = 0; member < (extension ? 3 : 1); ++member) {
+            rollbackPoints.push_back(200 + member);
+            rollbackPoints.push_back(230 + member);
+            commitPoints.push_back(230 + member);
+        }
+        for (const int point : rollbackPoints) {
+            ValidateStateCrash(group + L"-rollback-" + std::to_wstring(point), point, extension, L"rollback", false);
+            ValidateStateCrash(group + L"-abort-" + std::to_wstring(point), point, extension, L"abort", false);
+            ValidateRecoveryCrash(group + L"-recovery-" + std::to_wstring(point), point, extension);
+        }
+        for (const int point : commitPoints)
+            ValidateStateCrash(group + L"-commit-" + std::to_wstring(point), point, extension, L"commit", true);
+    }
+    ValidateDiagnostics(root + L"\\diagnostics");
     ShutdownBattleStats();
     printf("SaveTransactionsTests: %d failures\n", failures);
     wprintf(L"Temporary test evidence: %s\n", root.c_str());

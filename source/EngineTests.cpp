@@ -1,5 +1,6 @@
 #include "Patch.h"
 #include <stdio.h>
+#include <string.h>
 
 int EngineTestTimerABI(bool usesThis, uintptr_t stage, uintptr_t deadline, uintptr_t context, bool fallback);
 int EngineTestSuperWaitABI(bool usesThis, uintptr_t stage, uintptr_t context, uintptr_t caller,
@@ -8,6 +9,7 @@ int EngineTestSuperCaller(uintptr_t caller);
 void EngineTestSuperWhitelist(uintptr_t caller);
 void EngineTestSuperCallbacks(ULONGLONG (WINAPI* clock)(), void (WINAPI* sleep)(DWORD),
     bool (__cdecl* pump)());
+bool EngineTestWriteCode(uintptr_t address, const BYTE* bytes, size_t length);
 
 HMODULE gInstance = nullptr;
 uintptr_t gGameBase = 0;
@@ -102,6 +104,28 @@ int LegacyStageReference(WORD speed, BYTE phase, const BYTE table[3], BYTE& coun
 }
 
 int main() {
+    SYSTEM_INFO system = {};
+    GetSystemInfo(&system);
+    const size_t pageBytes = system.dwPageSize;
+    BYTE* pages = static_cast<BYTE*>(VirtualAlloc(nullptr, pageBytes * 2,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    bool pageRestoration = pages != nullptr;
+    if (pages) {
+        DWORD previous = 0;
+        pageRestoration = VirtualProtect(pages, pageBytes, PAGE_EXECUTE_READ, &previous) != 0;
+        const BYTE patch[] = {0x90, 0x90, 0xEB, 0x00};
+        gGameBase = reinterpret_cast<uintptr_t>(pages);
+        pageRestoration = EngineTestWriteCode(0x400000 + pageBytes - 2, patch, sizeof(patch)) && pageRestoration;
+        MEMORY_BASIC_INFORMATION first = {}, second = {};
+        pageRestoration = VirtualQuery(pages, &first, sizeof(first)) &&
+            VirtualQuery(pages + pageBytes, &second, sizeof(second)) && pageRestoration;
+        pageRestoration = pageRestoration && first.Protect == PAGE_EXECUTE_READ &&
+            second.Protect == PAGE_EXECUTE_READWRITE &&
+            memcmp(pages + pageBytes - 2, patch, sizeof(patch)) == 0;
+        VirtualFree(pages, 0, MEM_RELEASE);
+        gGameBase = 0;
+    }
+    Check(pageRestoration, "cross-page runtime writes restore each original page permission independently");
     int timerValue = 0x1234;
     const uintptr_t timerContext = reinterpret_cast<uintptr_t>(&timerValue);
     Check(EngineTestTimerABI(true, reinterpret_cast<uintptr_t>(&ThisStage),

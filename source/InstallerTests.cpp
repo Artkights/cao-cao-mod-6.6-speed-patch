@@ -2,6 +2,7 @@
 #include "ResourceIds.h"
 
 #include <stdio.h>
+#include <cstring>
 
 namespace {
 int failures = 0;
@@ -15,6 +16,98 @@ bool SameHash(const std::vector<unsigned char>& bytes, const wchar_t* path) {
     std::wstring left, right, error;
     return XiaoAnInstall::Sha256Bytes(bytes, left, error) &&
            XiaoAnInstall::Sha256File(path, right, error) && !_wcsicmp(left.c_str(), right.c_str());
+}
+
+struct GearExports {
+    IMAGE_EXPORT_DIRECTORY* directory = nullptr;
+    DWORD* names = nullptr;
+    WORD* ordinals = nullptr;
+    DWORD* functions = nullptr;
+    IMAGE_DATA_DIRECTORY range = {};
+    size_t nameOffsets[6] = {};
+};
+
+bool InspectGear(std::vector<unsigned char>& bytes, GearExports& output) {
+    output = {};
+    if (bytes.size() < sizeof(IMAGE_DOS_HEADER)) return false;
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes.data());
+    if (dos->e_lfanew <= 0 || static_cast<size_t>(dos->e_lfanew) > bytes.size() - sizeof(IMAGE_NT_HEADERS32)) return false;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(bytes.data() + dos->e_lfanew);
+    auto raw = [&](DWORD rva, size_t length) -> unsigned char* {
+        if (rva < nt->OptionalHeader.SizeOfHeaders && rva <= bytes.size() && length <= bytes.size() - rva)
+            return bytes.data() + rva;
+        const auto sections = IMAGE_FIRST_SECTION(nt);
+        for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+            const auto& section = sections[index];
+            if (rva < section.VirtualAddress || rva - section.VirtualAddress >= section.SizeOfRawData) continue;
+            const size_t offset = static_cast<size_t>(section.PointerToRawData) + rva - section.VirtualAddress;
+            if (offset <= bytes.size() && length <= bytes.size() - offset) return bytes.data() + offset;
+        }
+        return nullptr;
+    };
+    output.range = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    output.directory = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(raw(output.range.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY)));
+    if (!output.directory || output.directory->NumberOfNames != 6 || output.directory->NumberOfFunctions != 6) return false;
+    output.names = reinterpret_cast<DWORD*>(raw(output.directory->AddressOfNames, 6 * sizeof(DWORD)));
+    output.ordinals = reinterpret_cast<WORD*>(raw(output.directory->AddressOfNameOrdinals, 6 * sizeof(WORD)));
+    output.functions = reinterpret_cast<DWORD*>(raw(output.directory->AddressOfFunctions, 6 * sizeof(DWORD)));
+    if (!output.names || !output.ordinals || !output.functions) return false;
+    for (size_t index = 0; index < 6; ++index) {
+        const auto name = raw(output.names[index], 1);
+        if (!name || !memchr(name, 0, bytes.size() - static_cast<size_t>(name - bytes.data()))) return false;
+        output.nameOffsets[index] = static_cast<size_t>(name - bytes.data());
+    }
+    return true;
+}
+
+void CheckGearContract(std::vector<unsigned char> bytes) {
+    GearExports table;
+    Check(InspectGear(bytes, table), "inspect the six-export Gear fixture");
+    if (!table.directory) return;
+    bool configureAtSix = false;
+    size_t configureIndex = 0;
+    for (size_t index = 0; index < 6; ++index)
+        if (!strcmp(reinterpret_cast<const char*>(bytes.data() + table.nameOffsets[index]), "ConfigureNativeImports")) {
+            configureAtSix = table.ordinals[index] == 5 && table.directory->Base == 1;
+            configureIndex = index;
+        }
+    Check(configureAtSix, "current Gear exposes ConfigureNativeImports at ordinal 6");
+    const auto current = bytes;
+    std::wstring error;
+    Check(XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "current payload requires the verified six-export contract");
+
+    // Model the historical artifact by removing only the new named export and
+    // truncating the function array to ordinals 1..5. The original code and
+    // lookup layout remain those of an actual compiled Gear DLL.
+    for (size_t index = configureIndex; index + 1 < 6; ++index) {
+        table.names[index] = table.names[index + 1];
+        table.ordinals[index] = table.ordinals[index + 1];
+    }
+    table.directory->NumberOfFunctions = table.directory->NumberOfNames = 5;
+    Check(XiaoAnInstall::ValidateGearBytes(bytes, error), "historical five-export Gear remains valid for legacy recognition");
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "historical Gear cannot be embedded as a current payload");
+
+    bytes = current; InspectGear(bytes, table);
+    bytes[table.nameOffsets[configureIndex]] = 'X';
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject renamed or missing ConfigureNativeImports");
+    bytes = current; InspectGear(bytes, table);
+    table.ordinals[configureIndex] = 0;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject a wrong ConfigureNativeImports ordinal");
+    bytes = current; InspectGear(bytes, table);
+    table.directory->NumberOfNames = 5;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject incomplete export counts");
+    bytes = current; InspectGear(bytes, table);
+    table.functions[5] = table.range.VirtualAddress;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject a forwarded Gear export");
+    bytes = current; InspectGear(bytes, table);
+    table.functions[5] = 0;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject a null Gear export");
+    bytes = current; InspectGear(bytes, table);
+    table.directory->AddressOfFunctions = 0xfffffff0;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject an out-of-bounds export function array");
+    bytes = current; InspectGear(bytes, table);
+    table.functions[5] = 0xfffffff0;
+    Check(!XiaoAnInstall::ValidateGearPayloadBytes(bytes, error), "reject an out-of-bounds export code address");
 }
 }
 
@@ -30,7 +123,7 @@ int wmain(int argc, wchar_t** argv) {
           "CNG SHA-256 matches the standard abc vector");
     Check(XiaoAnInstall::ValidatePe32Executable(argv[1], error), "installer is an x86 PE32 executable");
     Check(XiaoAnInstall::ValidateProxyAudio(argv[2], error), "built proxy has the exact 20 forwarders");
-    Check(XiaoAnInstall::ValidateGear(argv[3], error), "built gear module has the exact five exports");
+    Check(XiaoAnInstall::ValidateGear(argv[3], error), "built gear module has the current six exports");
     Check(XiaoAnInstall::ValidateOriginalAudio(argv[4], error), "sample original audio has 20 implementations");
 
     HMODULE installer = LoadLibraryExW(argv[1], nullptr, LOAD_LIBRARY_AS_DATAFILE);
@@ -54,6 +147,7 @@ int wmain(int argc, wchar_t** argv) {
     Check(proxy != proxy65, "6.5 and 6.6 runtime resources are distinct");
     Check(SameHash(proxy, argv[2]), "embedded proxy is byte-identical to the final build");
     Check(SameHash(gear, argv[3]), "embedded gear module is byte-identical to the final build");
+    CheckGearContract(gear);
     size_t lines = 0;
     for (unsigned char ch : config) if (ch == '\n') ++lines;
     if (!config.empty() && config.back() != '\n') ++lines;

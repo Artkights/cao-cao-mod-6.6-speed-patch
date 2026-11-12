@@ -21,9 +21,9 @@ function Source-Paths([string[]]$Names) {
 }
 $compilerOptions = @('/nologo','/O2','/W4','/WX','/MT','/EHsc','/utf-8','/std:c++17','/DUNICODE','/D_UNICODE')
 $libraries = @('user32.lib','comctl32.lib','gdi32.lib','winmm.lib','shell32.lib','bcrypt.lib','ole32.lib','oleaut32.lib')
-$installSources = @('InstallCommon.cpp','EngineProfile.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp')
-$featureSources = @('Guide.cpp','Features.cpp','FeatureUi.cpp','BattleRuntime.cpp','BattleInfo.cpp','SaveEnhancer.cpp','SaveTransactions.cpp','ScenarioLifecycle.cpp','BattleStats.cpp','BattleStatsPersistence.cpp','StatsDiagnostics.cpp','AnimationRuntime.cpp','RPresentation.cpp','SPresentation.cpp','NoticePresentation.cpp','PresentationDiagnostics.cpp')
-$runtimeSources = @('Proxy.cpp','Engine.cpp') + $installSources + @('Ui.cpp') + $featureSources
+$installSources = @('InstallCommon.cpp','PeImage.cpp','EngineProfile.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp')
+$featureSources = @('Guide.cpp','ScenarioScript.cpp','Features.cpp','FeatureUi.cpp','BattleRuntime.cpp','BattleInfo.cpp','SaveEnhancer.cpp','SaveTransactions.cpp','ScenarioLifecycle.cpp','BattleRosterRuntime.cpp','BattleStats.cpp','BattleStatsPersistence.cpp','StatsDiagnostics.cpp','AnimationRuntime.cpp','RPresentation.cpp','SPresentation.cpp','NoticePresentation.cpp','PresentationDiagnostics.cpp')
+$runtimeSources = @('Proxy.cpp','ProtectedRuntime.cpp','Engine.cpp') + $installSources + @('Ui.cpp') + $featureSources
 $commonRoot = Join-Path $buildRoot 'common'
 New-Item -ItemType Directory -Force -Path $commonRoot | Out-Null
 Push-Location $commonRoot
@@ -35,7 +35,7 @@ try {
 foreach ($generation in @('64','65','66')) {
     $targetRoot = Join-Path $buildRoot $generation
     New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
-    foreach ($resource in @('Ui.rc','UiIds.h','ResourceIds.h','FeatureSelection.rc','Doro-white.ico')) {
+    foreach ($resource in @('Ui.rc','UiIds.h','ResourceIds.h','FeatureSelection.rc','Doro-white.ico','TableControls.manifest','Version.h','Version.rc')) {
         Copy-Item -LiteralPath (Join-Path $sourceRoot $resource) -Destination $targetRoot -Force
     }
     Copy-Item -LiteralPath (Join-Path $commonRoot 'UninstallWorker.exe') -Destination $targetRoot -Force
@@ -47,10 +47,13 @@ foreach ($generation in @('64','65','66')) {
         Invoke-Native 'cl.exe' ($compilerOptions + $generationOptions + @('/LD') + (Source-Paths $runtimeSources) + @('Ui.res','/Fe:Koeicda.dll','/link','/BASE:0x63000000','/DYNAMICBASE','/MAP:Koeicda.map') + $libraries)
         if ($Tests) {
             $testSets = @(
-                @{Name='EngineTests'; Files=@('Engine.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp','Features.cpp','EngineTests.cpp')},
-                @{Name='LayoutTests'; Files=@('Engine.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp','Features.cpp','LayoutTests.cpp')},
-                @{Name='EngineProfileTests'; Files=@('EngineProfileTests.cpp','EngineProfile.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp')},
-                @{Name='ConfigTests'; Files=@('ConfigTests.cpp') + $installSources + $featureSources; Resource=$true},
+                @{Name='PeImageTests'; Files=@('PeImageTests.cpp','PeImage.cpp')},
+                @{Name='EngineTests'; Files=@('Engine.cpp','PeImage.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp','Features.cpp','EngineTests.cpp')},
+                @{Name='LayoutTests'; Files=@('Engine.cpp','PeImage.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp','Features.cpp','LayoutTests.cpp')},
+                @{Name='EngineProfileTests'; Files=@('EngineProfileTests.cpp','PeImage.cpp','EngineProfile.cpp','EngineLayout.cpp','RPresentationLayout.cpp','SPresentationLayout.cpp')},
+                @{Name='ConfigTests'; Files=@('ConfigTests.cpp','ProtectedRuntime.cpp') + $installSources + $featureSources; Resource=$true},
+                @{Name='ProtectedRuntimeTests'; Files=@('ProtectedRuntimeTests.cpp','ProtectedRuntime.cpp')},
+                @{Name='RuntimeStartupTests'; Files=@('RuntimeStartupTests.cpp')},
                 @{Name='InstallerTests'; Files=@('InstallerTests.cpp') + $installSources},
                 @{Name='InstallerProfileTests'; Files=@('InstallerProfileTests.cpp') + $installSources},
                 @{Name='UninstallWorkerCompatibilityTests'; Files=@('UninstallWorkerCompatibilityTests.cpp') + $installSources},
@@ -67,6 +70,7 @@ foreach ($generation in @('64','65','66')) {
                 @{Name='BattleInfoTests'; Files=@('BattleInfoTests.cpp','BattleInfo.cpp'); Resource=$true},
                 @{Name='StatsDiagnosticsTests'; Files=@('StatsDiagnosticsTests.cpp','StatsDiagnostics.cpp','BattleStats.cpp','BattleRuntime.cpp') + $installSources},
                 @{Name='ScenarioLifecycleTests'; Files=@('ScenarioLifecycleTests.cpp','ScenarioLifecycle.cpp')},
+                @{Name='BattleRosterRuntimeTests'; Files=@('BattleRosterRuntimeTests.cpp','BattleRosterRuntime.cpp','BattleRuntime.cpp')},
                 @{Name='SaveTransactionsTests'; Files=@('SaveTransactionsTests.cpp','SaveTransactions.cpp','BattleStats.cpp','BattleStatsPersistence.cpp','BattleRuntime.cpp','StatsDiagnostics.cpp') + $installSources},
                 @{Name='SaveEnhancerTests'; Files=@('SaveEnhancerTests.cpp','SaveEnhancer.cpp','SaveTransactions.cpp','ScenarioLifecycle.cpp','BattleStats.cpp','BattleStatsPersistence.cpp','BattleRuntime.cpp','StatsDiagnostics.cpp','Guide.cpp','Features.cpp') + $installSources; Resource=$true},
                 @{Name='AudioExportTests'; Files=@('AudioExportTests.cpp')},
@@ -76,6 +80,12 @@ foreach ($generation in @('64','65','66')) {
             )
             foreach ($test in $testSets) {
                 if ($TestNames.Count -and $test.Name -notin $TestNames) { continue }
+                # Guide and the statistics model share the EEX decoder. Keep
+                # every standalone harness linked to the production parser.
+                if ('ScenarioScript.cpp' -notin $test.Files -and
+                    ('Guide.cpp' -in $test.Files -or 'BattleStats.cpp' -in $test.Files)) {
+                    $test.Files += 'ScenarioScript.cpp'
+                }
                 $testArguments = $compilerOptions + $generationOptions + @('/DXA66_TEST','/WX') + (Source-Paths $test.Files)
                 if ($test.Resource) { $testArguments += 'Ui.res' }
                 Invoke-Native 'cl.exe' ($testArguments + @(('/Fe:' + $test.Name + '.exe'),'/link') + $libraries)
@@ -85,7 +95,7 @@ foreach ($generation in @('64','65','66')) {
 }
 $packageRoot = Join-Path $buildRoot 'package'
 New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
-foreach ($resource in @('Installer.rc','ResourceIds.h','FeatureSelection.rc','Doro-white.ico','pl_06.ini','features.ini')) {
+foreach ($resource in @('Installer.rc','ResourceIds.h','FeatureSelection.rc','Doro-white.ico','pl_06.ini','features.ini','Version.h','Version.rc')) {
     Copy-Item -LiteralPath (Join-Path $sourceRoot $resource) -Destination $packageRoot -Force
 }
 Copy-Item -LiteralPath (Join-Path $buildRoot '65\Koeicda.dll') -Destination (Join-Path $packageRoot 'Koeicda65.dll') -Force

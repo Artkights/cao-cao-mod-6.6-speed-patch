@@ -3,6 +3,7 @@
 #include "BattleStats.h"
 #include "Features.h"
 #include "ResourceIds.h"
+#include "TableControls.h"
 
 #include <algorithm>
 #include <commctrl.h>
@@ -10,16 +11,10 @@
 #include <vector>
 
 namespace {
-class TableControlsContext {
-public:
-    explicit TableControlsContext(HMODULE) {
-        const INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES};
-        InitCommonControlsEx(&controls);
-    }
-};
 constexpr UINT_PTR kRefreshTimer = 0x6810;
 constexpr UINT kUnitList = 0x6812;
 constexpr UINT kStatsTabs = 0x6813;
+constexpr UINT kRosterStatus = 0x6814;
 constexpr UINT_PTR kListSubclass = 0x6814;
 constexpr UINT kFitColumns = WM_APP + 0x681;
 constexpr UINT kDpiChanged = 0x02E0;
@@ -27,9 +22,14 @@ constexpr UINT kDpiChanged = 0x02E0;
 HWND gWindow = nullptr;
 HWND gList = nullptr;
 HWND gTabs = nullptr;
+HWND gRosterStatus = nullptr;
 HWND gHeaderTips = nullptr;
 HFONT gFont = nullptr;
 BattleStatsSnapshot gStats;
+bool gTabUserSelected = false;
+bool gHasSnapshot = false;
+bool gLastSnapshotActive = false;
+int gLastSnapshotOrdinal = -1;
 int gSortColumn = -1;
 bool gDescending = true;
 bool gFitPending = false;
@@ -77,6 +77,7 @@ void UpdateFont(HWND window) {
     gFont = next;
     if (gList) SendMessageW(gList, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
     if (gTabs) SendMessageW(gTabs, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
+    if (gRosterStatus) SendMessageW(gRosterStatus, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
     if (previous) DeleteObject(previous);
 }
 
@@ -249,10 +250,39 @@ void InsertRow(int row, const std::wstring& label, const BattleUnitTotals* total
     }
 }
 
+void Layout(HWND window);
+
+std::wstring RosterStatusText() {
+    std::wstring status;
+    if (gStats.rosterHistoryIncomplete)
+        status = L"旧档加入名单由已有记录和 R 剧本静态推断，可能包含未执行分支。";
+    if (!gStats.rosterAvailable) {
+        if (!status.empty()) status += L"\r\n";
+        status += L"尚未确认加入名单，保留历史统计；全局统计暂不采集新数据。";
+    }
+    return status;
+}
+
 void Render(bool resetTop = false, bool preserveSelection = true) {
     if (!gList) return;
+    const std::wstring status = RosterStatusText();
+    if (gRosterStatus) {
+        // Reflow only when the warning changes, keeping normal timer refresh
+        // from needlessly moving every control and invalidating the list.
+        wchar_t previous[512] = {};
+        GetWindowTextW(gRosterStatus, previous, static_cast<int>(_countof(previous)));
+        if (status != previous) {
+            SetWindowTextW(gRosterStatus, status.c_str());
+            Layout(gWindow);
+        }
+    }
     const bool campaign = gTabs && TabCtrl_GetCurSel(gTabs) == 1;
-    const auto& units = campaign ? gStats.campaignUnits : gStats.units;
+    // R/menu scenes never expose the previous S ledger on the current tab.
+    // The model clears it as well, but keeping this UI guard makes restored
+    // legacy snapshots safe during the transition.
+    const std::vector<BattleUnitTotals> empty;
+    const auto& units = campaign || gStats.active ?
+        (campaign ? gStats.campaignUnits : gStats.units) : empty;
     const int top = resetTop ? 0 : ListView_GetTopIndex(gList);
     LVITEMW selected = {};
     selected.mask = LVIF_PARAM;
@@ -272,7 +302,8 @@ void Render(bool resetTop = false, bool preserveSelection = true) {
     SendMessageW(gList, LVM_DELETEALLITEMS, 0, 0);
     if (units.empty())
         InsertRow(0, gStats.loading ? L"正在恢复统计数据。" :
-            (campaign ? L"当前存档暂无全局统计数据。" : L"当前战场暂无统计数据。"), nullptr);
+            (!campaign && !gStats.active ? L"当前不在战场中。" :
+             (campaign ? L"尚未确认我军加入单位。" : L"当前战场暂无统计数据。")), nullptr);
     for (size_t row = 0; row < rows.size(); ++row) {
         const BattleUnitTotals& totals = *rows[row];
         const std::wstring label = totals.label.empty() ?
@@ -297,7 +328,21 @@ void Render(bool resetTop = false, bool preserveSelection = true) {
 }
 
 void Refresh() {
-    ReadBattleStatsSnapshot(gStats);
+    BattleStatsSnapshot next;
+    ReadBattleStatsSnapshot(next);
+    // A window can remain open while a save is restored or while the game
+    // crosses from an R scene into an S scene.  Follow the new default tab
+    // until the user has explicitly selected a tab; after that, preserve the
+    // user's choice across timer refreshes and lifecycle changes.
+    const bool contextChanged = !gHasSnapshot ||
+        next.active != gLastSnapshotActive ||
+        next.scenarioOrdinal != gLastSnapshotOrdinal;
+    gStats = std::move(next);
+    if (gTabs && !gTabUserSelected && contextChanged)
+        TabCtrl_SetCurSel(gTabs, gStats.active ? 0 : 1);
+    gHasSnapshot = true;
+    gLastSnapshotActive = gStats.active;
+    gLastSnapshotOrdinal = gStats.scenarioOrdinal;
     Render();
 }
 
@@ -308,7 +353,14 @@ void Layout(HWND window) {
     const int width = std::max(100, static_cast<int>(client.right - client.left) - margin * 2);
     const int height = std::max(80, static_cast<int>(client.bottom - client.top) - margin * 2);
     MoveWindow(gTabs, margin, margin, width, Scale(28), TRUE);
-    const int listTop = Scale(34);
+    const std::wstring status = RosterStatusText();
+    const int statusHeight = status.empty() ? 0 :
+        Scale(status.find(L'\n') == std::wstring::npos ? 24 : 44);
+    if (gRosterStatus) {
+        ShowWindow(gRosterStatus, statusHeight ? SW_SHOWNA : SW_HIDE);
+        MoveWindow(gRosterStatus, margin, margin + Scale(32), width, statusHeight, TRUE);
+    }
+    const int listTop = Scale(34) + statusHeight;
     MoveWindow(gList, margin, margin + listTop, width, std::max(30, height - listTop), TRUE);
     ConfigureColumns();
 }
@@ -320,6 +372,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         gWindow = window;
         gSortColumn = -1;
         gDescending = true;
+        gTabUserSelected = false;
+        gHasSnapshot = false;
+        gLastSnapshotActive = false;
+        gLastSnapshotOrdinal = -1;
         gFitPending = false;
         gFitting = false;
         HICON icon = static_cast<HICON>(LoadImageW(gInstance, MAKEINTRESOURCEW(IDI_DORO_WHITE),
@@ -335,6 +391,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             item.pszText = const_cast<wchar_t*>(index ? L"全局统计" : L"当前战场");
             SendMessageW(gTabs, TCM_INSERTITEMW, index, reinterpret_cast<LPARAM>(&item));
         }
+        ReadBattleStatsSnapshot(gStats);
+        TabCtrl_SetCurSel(gTabs, gStats.active ? 0 : 1);
+        gHasSnapshot = true;
+        gLastSnapshotActive = gStats.active;
+        gLastSnapshotOrdinal = gStats.scenarioOrdinal;
+        gRosterStatus = CreateWindowExW(0, L"STATIC", nullptr,
+            WS_CHILD | SS_LEFT | SS_NOPREFIX, 0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(kRosterStatus), gInstance, nullptr);
         gList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, nullptr,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             0, 0, 0, 0, window, reinterpret_cast<HMENU>(kUnitList), gInstance, nullptr);
@@ -370,10 +434,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             SendMessageW(gList, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
         if (gFont) {
             SendMessageW(gTabs, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            SendMessageW(gRosterStatus, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
         }
         SetTimer(window, kRefreshTimer,
             static_cast<UINT>(gFeatureSettings.battleRefreshMilliseconds), nullptr);
-        Refresh();
+        Render();
         EnsureMinimumSize(window);
         return 0;
     }
@@ -412,6 +477,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         const auto* notice = reinterpret_cast<const NMHDR*>(lParam);
         if (!notice) break;
         if (notice->hwndFrom == gTabs && notice->code == TCN_SELCHANGE) {
+            gTabUserSelected = true;
             gSortColumn = -1;
             gDescending = true;
             Render(true, false);
@@ -441,9 +507,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         gFont = nullptr;
         gList = nullptr;
         gTabs = nullptr;
+        gRosterStatus = nullptr;
         gWindow = nullptr;
         gSortColumn = -1;
         gDescending = true;
+        gTabUserSelected = false;
+        gHasSnapshot = false;
+        gLastSnapshotActive = false;
+        gLastSnapshotOrdinal = -1;
         gFitPending = false;
         gFitting = false;
         return 0;

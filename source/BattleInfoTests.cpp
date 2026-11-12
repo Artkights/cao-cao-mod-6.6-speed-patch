@@ -205,6 +205,7 @@ BattleStatsSnapshot MakeFixture(size_t count) {
     BattleStatsSnapshot fixture;
     fixture.knownMetrics = 0x3FF;
     fixture.active = true;
+    fixture.rosterAvailable = true;
     fixture.physicalReceivedAvailable = true;
     fixture.strategyReceivedAvailable = true;
     const wchar_t* names[] = {L"曹操", L"夏侯惇", L"荀彧", L"典韦", L"许褚", L"郭嘉"};
@@ -621,6 +622,37 @@ int wmain(int argc, wchar_t** argv) {
     CheckArrow(header, 4, true);
     Check(Person(list, 0) == gFixture.units.back().personId,
         "first click after reopening starts descending");
+    CloseBattleInfo();
+    gFixture.active = false;
+    gFixture.scenarioIsR = true;
+    Check(OpenBattleInfo(nullptr), "R scene statistics window opens");
+    window = FindWindowW(L"XiaoAn66BattleInfoWindow", nullptr);
+    list = GetDlgItem(window, 0x6812);
+    tabs = GetDlgItem(window, 0x6813);
+    Check(TabCtrl_GetCurSel(tabs) == 1, "R scene initially selects campaign statistics");
+    CheckDefaultOrder(list, gFixture.campaignUnits);
+    SelectPage(window, tabs, 0);
+    Check(ListView_GetItemCount(list) == 1 && Cell(list, 0, 0) == L"当前不在战场中。" &&
+        Person(list, 0) == -1, "R current page hides stale battle rows and displays an empty-state message");
+    Refresh(window);
+    Check(TabCtrl_GetCurSel(tabs) == 0, "refresh in R does not override a manual page selection");
+    gFixture.active = true;
+    gFixture.scenarioIsR = false;
+    SelectPage(window, tabs, 1);
+    Refresh(window);
+    Check(TabCtrl_GetCurSel(tabs) == 1, "transition to S preserves the user's existing page choice");
+    gFixture.rosterAvailable = false;
+    gFixture.rosterHistoryIncomplete = true;
+    Refresh(window);
+    wchar_t rosterStatus[512] = {};
+    GetWindowTextW(GetDlgItem(window, 0x6814), rosterStatus, static_cast<int>(_countof(rosterStatus)));
+    Check(std::wstring(rosterStatus).find(L"可能包含未执行分支") != std::wstring::npos &&
+        std::wstring(rosterStatus).find(L"暂不采集新数据") != std::wstring::npos,
+        "old roster inference and unavailable join collection are explicitly visible");
+    RECT statusRect = {}, listRect = {};
+    GetWindowRect(GetDlgItem(window, 0x6814), &statusRect);
+    GetWindowRect(list, &listRect);
+    Check(statusRect.bottom <= listRect.top, "two-line roster warning does not overlap the table");
     CloseBattleInfo();
     std::printf("BattleInfoTests: %s (%d failures)\n", gFailures ? "FAIL" : "PASS", gFailures);
     return gFailures ? 1 : 0;

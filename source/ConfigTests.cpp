@@ -8,6 +8,11 @@ HANDLE gForwardResult = reinterpret_cast<HANDLE>(1234);
 DWORD gForwardError = ERROR_ALREADY_EXISTS;
 int gForwardCalls = 0;
 bool gForwardArguments = false;
+int gWideForwardCalls = 0;
+bool gWideForwardArguments = false;
+int gDispatchACalls = 0, gDispatchWCalls = 0, gTranslateCalls = 0;
+bool gMessageForwardArguments = false;
+constexpr DWORD kMessageForwardError = ERROR_INVALID_ACCESS;
 thread_local bool gTestLoaderCallout = false;
 BOOLEAN NTAPI TestLoaderCallout() { return gTestLoaderCallout ? TRUE : FALSE; }
 struct StartupProbe {
@@ -17,6 +22,7 @@ struct StartupProbe {
     int operation = 0;
     bool ready = false;
     HANDLE result = INVALID_HANDLE_VALUE;
+    LRESULT messageResult = 0;
     DWORD lastError = 0;
 };
 DWORD WINAPI RunStartupProbe(void* parameter) {
@@ -32,7 +38,19 @@ DWORD WINAPI RunStartupProbe(void* parameter) {
         PatchedDispatch(&message);
     } else if (probe.operation == 3) {
         MSG message = {};
-        PatchedTranslate(&message);
+        probe.messageResult = PatchedTranslate(&message);
+    } else if (probe.operation == 4) {
+        probe.result = PatchedNativeCreateFileW(L"RS\\S_18.eex", GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    } else if (probe.operation == 5) {
+        probe.result = PatchedNativeCreateFileA("RS\\R_19.eex", GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    } else if (probe.operation == 6) {
+        MSG message = {};
+        probe.messageResult = PatchedNativeDispatchA(&message);
+    } else if (probe.operation == 7) {
+        MSG message = {};
+        probe.messageResult = PatchedNativeDispatchW(&message);
     } else probe.ready = AwaitStartup();
     probe.lastError = GetLastError();
     SetEvent(probe.finished);
@@ -45,6 +63,33 @@ HANDLE WINAPI TestCreateFileA(LPCSTR fileName, DWORD desiredAccess, DWORD shareM
         !security && disposition == OPEN_EXISTING && flags == FILE_ATTRIBUTE_NORMAL && !templateFile;
     SetLastError(gForwardError);
     return gForwardResult;
+}
+HANDLE WINAPI TestCreateFileW(LPCWSTR fileName, DWORD desiredAccess, DWORD shareMode,
+    LPSECURITY_ATTRIBUTES security, DWORD disposition, DWORD flags, HANDLE templateFile) {
+    ++gWideForwardCalls;
+    gWideForwardArguments = fileName && !wcscmp(fileName, L"RS\\S_18.eex") &&
+        desiredAccess == GENERIC_READ && shareMode == FILE_SHARE_READ && !security &&
+        disposition == OPEN_EXISTING && flags == FILE_ATTRIBUTE_NORMAL && !templateFile;
+    SetLastError(gForwardError);
+    return gForwardResult;
+}
+LRESULT WINAPI TestNativeDispatchA(const MSG* message) {
+    ++gDispatchACalls;
+    gMessageForwardArguments = message && message->message == 0 && !message->hwnd;
+    SetLastError(kMessageForwardError);
+    return 101;
+}
+LRESULT WINAPI TestNativeDispatchW(const MSG* message) {
+    ++gDispatchWCalls;
+    gMessageForwardArguments = message && message->message == 0 && !message->hwnd;
+    SetLastError(kMessageForwardError);
+    return 202;
+}
+BOOL WINAPI TestNativeTranslate(const MSG* message) {
+    ++gTranslateCalls;
+    gMessageForwardArguments = message && message->message == 0 && !message->hwnd;
+    SetLastError(kMessageForwardError);
+    return TRUE;
 }
 HANDLE OpenScenarioForTest(const char* path) {
     return PatchedCreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -89,9 +134,41 @@ HWND FindTestWindow(const wchar_t* className) {
     EnumThreadWindows(GetCurrentThreadId(), &FindTestWindowCallback, reinterpret_cast<LPARAM>(&search));
     return search.result;
 }
+
+std::vector<unsigned char> ResourceGateScenario() {
+    // One 0x7B branch-2 condition (person 0 belongs to our army), guarding
+    // a real 0x38 ability change. Use the production parser and renderer to
+    // observe whether the Proxy has authorized the condition decoder.
+    const std::vector<unsigned char> condition = {
+        0x7B, 0, 0, 0, 2, 0, 0, 0, 0, 0, '0', ',', '1', 0
+    };
+    const std::vector<unsigned char> action = {
+        0x38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 25, 0, 0, 0
+    };
+    std::vector<unsigned char> bytes = {
+        'E', 'E', 'X', 0, 0, 0, 0, 0, 0, 0, 14, 0, 0, 0, 1, 0,
+        static_cast<unsigned char>(condition.size() + action.size() + 4), 0
+    };
+    bytes.insert(bytes.end(), condition.begin(), condition.end());
+    bytes.insert(bytes.end(), {0, 0, static_cast<unsigned char>(action.size()), 0});
+    bytes.insert(bytes.end(), action.begin(), action.end());
+    return bytes;
 }
 
-bool InitializeEngine() { return true; }
+bool GuideConditionalExtensionMatches(bool enabled) {
+    std::wstring text, diagnostics;
+    if (!BuildGuideScriptTextForTest(ResourceGateScenario(), {L"曹操"}, text, diagnostics) ||
+        text.find(L"曹操攻击力提升 25 点") == std::wstring::npos) return false;
+    if (enabled) return text.find(L"曹操已加入我军") != std::wstring::npos &&
+        text.find(L"尚未解析的扩展条件（0x7B）") == std::wstring::npos &&
+        diagnostics.find(L"condition-unresolved") == std::wstring::npos;
+    return text.find(L"尚未解析的扩展条件（0x7B）") != std::wstring::npos &&
+        text.find(L"曹操已加入我军") == std::wstring::npos &&
+        diagnostics.find(L"condition-unresolved: id=123") != std::wstring::npos;
+}
+}
+
+bool InitializeEngine(bool) { return true; }
 bool ApplyEngineState(const Settings&) { return true; }
 void RestoreEngine() {}
 void SetNativeToggleHandler(void (__cdecl*)()) {}
@@ -149,6 +226,14 @@ int main() {
         observed == L"R_13.eex",
         "rejected unknown profile discards pending capture and only forwards later opens");
     gTestCreateFileA = nullptr;
+    gNativeCreateFile = &TestCreateFileA;
+    const int beforeNativeCalls = gForwardCalls;
+    const HANDLE nativeResult = PatchedNativeCreateFileA("RS/R_16.eex", GENERIC_READ,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(nativeResult == gForwardResult && gForwardCalls == beforeNativeCalls + 1 &&
+        gForwardArguments && GetLastError() == gForwardError,
+        "protected file hook forwards through the preserved VFS target with complete arguments and LastError");
+    gNativeCreateFile = nullptr;
     gStartupThread = GetCurrentThreadId();
     gWithinLoaderCallout = &TestLoaderCallout;
     auto resetStartup = [&]() {
@@ -166,15 +251,15 @@ int main() {
         HANDLE thread = CreateThread(nullptr, 0, &RunStartupProbe, &probe, 0, nullptr);
         check(thread && WaitForSingleObject(probe.entered, 3000) == WAIT_OBJECT_0,
             "start an independent game-thread startup probe");
+        const bool done = WaitForSingleObject(probe.finished, 3000) == WAIT_OBJECT_0;
+        check(done, loaderCallout ? "loader callbacks bypass startup wait without deadlocking the loader" :
+            "pending startup forwards immediately without waiting for unpacking or worker completion");
         if (!loaderCallout) {
-            check(WaitForSingleObject(probe.finished, 30) == WAIT_TIMEOUT,
-                "hold game file, dispatch, or translation until model and save hooks are ready");
+            check(!InterlockedCompareExchange(&gStartupFinished, FALSE, FALSE),
+                "game-thread request completed while initialization was still pending");
             InterlockedExchange(&gStartupAccepted, accepted ? TRUE : FALSE);
             CompleteStartup();
         }
-        const bool done = WaitForSingleObject(probe.finished, 3000) == WAIT_OBJECT_0;
-        check(done, loaderCallout ? "loader callbacks bypass startup wait without deadlocking the loader" :
-            "completion releases the waiting game thread, including initialization failures");
         if (thread) {
             WaitForSingleObject(thread, 3000);
             CloseHandle(thread);
@@ -188,14 +273,14 @@ int main() {
     check(!AwaitStartup() && GetLastError() == ERROR_BAD_FORMAT,
         "initialization worker never waits for its own startup event and preserves LastError");
     StartupProbe startup = probeStartup(0, false, true);
-    check(startup.ready && startup.lastError == ERROR_BAD_FORMAT && StartupUiAvailable(),
-        "successful startup wait preserves the original LastError and enables patch UI");
+    check(!startup.ready && startup.lastError == ERROR_BAD_FORMAT && StartupUiAvailable(),
+        "pending startup reports unready transparently and enables UI only after worker completion");
     resetStartup();
     gTestCreateFileA = &TestCreateFileA;
     gForwardError = ERROR_SHARING_VIOLATION;
     startup = probeStartup(1, false, true);
     check(startup.result == gForwardResult && startup.lastError == gForwardError,
-        "file wrapper resumes the original request and LastError after initialization");
+        "pending file wrapper forwards the original request and LastError before initialization");
     gTestCreateFileA = nullptr;
     resetStartup();
     startup = probeStartup(0, true, false);
@@ -203,10 +288,89 @@ int main() {
         "unready loader callback remains a transparent call instead of claiming initialized state");
     resetStartup();
     probeStartup(2, false, false);
-    check(!StartupUiAvailable(), "failed initialization releases dispatch without activating patch windows");
+    check(!StartupUiAvailable(), "failed initialization forwards dispatch without activating patch windows");
     resetStartup();
     probeStartup(3, false, true);
-    check(StartupUiAvailable(), "the first input translation is gated until successful initialization");
+    check(StartupUiAvailable(), "input translation stays transparent until successful initialization");
+
+    resetStartup();
+    gNativeCreateFile = &TestCreateFileA;
+    const int nativeBeforePending = gForwardCalls;
+    startup = probeStartup(5, false, false);
+    check(startup.result == gForwardResult && startup.lastError == gForwardError &&
+        gForwardCalls == nativeBeforePending + 1 && gForwardArguments,
+        "pending native ANSI file call preserves its VFS target, arguments and LastError");
+    gNativeCreateFile = nullptr;
+    resetStartup();
+    gNativeCreateFileW = &TestCreateFileW;
+    startup = probeStartup(4, false, false);
+    check(startup.result == gForwardResult && startup.lastError == gForwardError &&
+        gWideForwardCalls == 1 && gWideForwardArguments,
+        "pending native Unicode file call preserves its VFS target, arguments and LastError");
+    gNativeCreateFileW = nullptr;
+
+    resetStartup();
+    gNativeDispatchA = &TestNativeDispatchA;
+    startup = probeStartup(6, false, false);
+    check(startup.messageResult == 101 && startup.lastError == kMessageForwardError &&
+        gDispatchACalls == 1 && gMessageForwardArguments,
+        "pending ANSI message call preserves its original target, result and LastError");
+    gNativeDispatchA = nullptr;
+    resetStartup();
+    gNativeDispatchW = &TestNativeDispatchW;
+    startup = probeStartup(7, false, false);
+    check(startup.messageResult == 202 && startup.lastError == kMessageForwardError &&
+        gDispatchWCalls == 1 && gMessageForwardArguments,
+        "pending Unicode message call preserves its original target, result and LastError");
+    gNativeDispatchW = nullptr;
+    resetStartup();
+    gNativeTranslate = &TestNativeTranslate;
+    startup = probeStartup(3, false, false);
+    check(startup.messageResult == TRUE && startup.lastError == kMessageForwardError &&
+        gTranslateCalls == 1 && gMessageForwardArguments,
+        "pending translation preserves its original target, result and LastError");
+    gNativeTranslate = nullptr;
+    BYTE* gateImage = static_cast<BYTE*>(VirtualAlloc(nullptr, 0x1000,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(gateImage != nullptr, "allocate an isolated live import slot for restoration regression");
+    if (gateImage) {
+        gGameBase = reinterpret_cast<uintptr_t>(gateImage);
+        gRuntimeImageSize = 0x1000;
+        gRuntimeNativePlan = RuntimeNativeImportPlan();
+        auto& gateSite = gRuntimeNativePlan.sites[static_cast<size_t>(RuntimeNativeImportKind::CreateFileA)];
+        gateSite.slotOffset = 0x100;
+        gateSite.original = reinterpret_cast<void*>(&TestCreateFileA);
+        gateSite.replacement = reinterpret_cast<void*>(&PatchedNativeCreateFileA);
+        gateSite.protection = PAGE_READWRITE;
+        gateSite.present = gateSite.committed = true;
+        *reinterpret_cast<void**>(gateImage + gateSite.slotOffset) = gateSite.replacement;
+        gRuntimeNativeGate = true;
+        gNativeCreateFile = &TestCreateFileA;
+        gNativeCreateFileW = &TestCreateFileW;
+        gNativeDispatchA = &TestNativeDispatchA;
+        gNativeDispatchW = &TestNativeDispatchW;
+        gNativeTranslate = &TestNativeTranslate;
+        RestoreProtectedGate();
+        const int beforeRestoredForward = gForwardCalls;
+        const HANDLE restoredForward = PatchedNativeCreateFileA("RS/R_16.eex", GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(!gRuntimeNativeGate && !gateSite.committed &&
+            *reinterpret_cast<void**>(gateImage + gateSite.slotOffset) == gateSite.original &&
+            gNativeCreateFileW == &TestCreateFileW && gNativeDispatchA == &TestNativeDispatchA &&
+            gNativeDispatchW == &TestNativeDispatchW && gNativeTranslate == &TestNativeTranslate &&
+            restoredForward == gForwardResult && gForwardCalls == beforeRestoredForward + 1 &&
+            GetLastError() == gForwardError,
+            "restored import slots retain original forwarding targets for wrappers already in flight");
+        VirtualFree(gateImage, 0, MEM_RELEASE);
+        gGameBase = 0;
+        gRuntimeImageSize = 0;
+        gRuntimeNativePlan = RuntimeNativeImportPlan();
+        gNativeCreateFile = nullptr;
+        gNativeCreateFileW = nullptr;
+        gNativeDispatchA = nullptr;
+        gNativeDispatchW = nullptr;
+        gNativeTranslate = nullptr;
+    }
     CloseHandle(gStartupEvent);
     gStartupEvent = nullptr;
     gWithinLoaderCallout = nullptr;
@@ -229,6 +393,71 @@ int main() {
         HasFeature(XiaoAnInstall::FeatureGuide) && !HasFeature(XiaoAnInstall::FeatureAccelerator) &&
         ResolveKeyCommand(VK_TAB, 0) == -1,
         "a guide-only installation keeps accelerator shortcuts inactive");
+    struct FeatureMode {
+        unsigned mask;
+        const wchar_t* state;
+        bool resources;
+        bool conditional;
+        bool accelerator;
+        const char* name;
+    };
+    const FeatureMode featureModes[] = {
+        {XiaoAnInstall::FeatureAccelerator, L"1", false, false, true,
+            "accelerator-only mode disables resources and conditions while retaining accelerator shortcuts"},
+        {XiaoAnInstall::FeatureGuide, L"2", true, true, false,
+            "guide-only mode retries resources and enables audited conditions without accelerator shortcuts"},
+        {XiaoAnInstall::FeatureBattleStats, L"4", true, false, false,
+            "statistics-only mode retries resources without granting guide conditions or accelerator shortcuts"},
+        {XiaoAnInstall::FeatureAll, L"7", true, true, true,
+            "all-features mode retries resources and independently enables audited conditions and accelerator shortcuts"}
+    };
+    for (const auto& mode : featureModes) {
+        const bool loaded = WritePrivateProfileStringW(L"Install", L"FeatureMask", mode.state, featureState.c_str()) &&
+            LoadInstalledFeatures(gDirectory, CompiledEngineProfile());
+        // This harness has no game getter code: initialization genuinely
+        // fails, exercising the same delayed-layout path as a packed game.
+        const bool layoutReady = InitializeRuntimeResourceProviders(true, EngineProfileId::Ccz65);
+        BattleResourceSnapshot pending;
+        const bool contentReady = ReadBattleResourceSnapshot(pending);
+        check(loaded && gInstalledFeatures == mode.mask && !layoutReady && !contentReady &&
+            !pending.runtimeProfileReady && BattleRuntimeResourceNamesEnabled() == mode.resources &&
+            GuideConditionalExtensionMatches(mode.conditional) &&
+            ResolveKeyCommand(VK_TAB, 0) == (mode.accelerator ? static_cast<int>(CommandOpenConfig) : -1), mode.name);
+    }
+    check(!InitializeRuntimeResourceProviders(false, EngineProfileId::Ccz65) &&
+        BattleRuntimeResourceNamesEnabled() && GuideConditionalExtensionMatches(false),
+        "an unaudited 6.5 image retains resource discovery without enabling 0x7B");
+    // Publish valid resource tables after the failed initialization. This
+    // existing runtime fixture models delayed table availability; it does
+    // not change the production Proxy's condition authorization.
+    std::vector<BYTE> gatePeople(1024 * 0x48), gateItems(255 * 25);
+    for (unsigned i = 0; i < 1024; ++i) {
+        const uint16_t tag = static_cast<uint16_t>(0x1000 + i);
+        memcpy(gatePeople.data() + i * 0x48, &tag, sizeof(tag));
+    }
+    const BYTE gatePersonName[] = {0xB2, 0xDC, 0xB2, 0xD9}; // 曹操 (CP936)
+    const BYTE gateItemName[] = {0xB6, 0xCC, 0xBD, 0xA3}; // 短剑 (CP936)
+    memcpy(gatePeople.data() + 8, gatePersonName, sizeof(gatePersonName));
+    memcpy(gateItems.data(), gateItemName, sizeof(gateItemName));
+    uintptr_t gatePersonPointer = reinterpret_cast<uintptr_t>(gatePeople.data());
+    ConfigureBattleResourceLayoutForTest(reinterpret_cast<uintptr_t>(&gatePersonPointer),
+        reinterpret_cast<uintptr_t>(gateItems.data()));
+    BattleResourceSnapshot loadedResources;
+    check(ReadBattleResourceSnapshot(loadedResources) && loadedResources.peopleReady &&
+        loadedResources.itemsReady && loadedResources.people[0] == L"曹操" &&
+        loadedResources.items[0] == L"短剑" && GuideConditionalExtensionMatches(false),
+        "ready runtime resources do not authorize an unaudited condition extension");
+    for (const auto profile : {EngineProfileId::Ccz64, EngineProfileId::Ccz66, EngineProfileId::Unknown}) {
+        check(!InitializeRuntimeResourceProviders(true, profile) && BattleRuntimeResourceNamesEnabled() &&
+            GuideConditionalExtensionMatches(false),
+            "a non-6.5 profile cannot inherit Protected220 condition authorization");
+    }
+    check(!InitializeRuntimeResourceProviders(true, EngineProfileId::Ccz65) &&
+        BattleRuntimeResourceNamesEnabled() && GuideConditionalExtensionMatches(true),
+        "audited Protected220 conditions recover independently while resource layout remains pending");
+    DisableRuntimeResourceProviders();
+    check(!BattleRuntimeResourceNamesEnabled() && GuideConditionalExtensionMatches(false),
+        "provider shutdown revokes condition authorization and resource retries together");
     check(WritePrivateProfileStringW(L"Install", L"FeatureMask", L"999", featureState.c_str()) &&
         !LoadInstalledFeatures(gDirectory, CompiledEngineProfile()) &&
         gInstalledFeatures == XiaoAnInstall::FeatureNone,
@@ -324,7 +553,14 @@ int main() {
         ColumnText(battleList, 8) == L"物理受击" && ColumnText(battleList, 9) == L"策略受击",
         "battle statistics exposes current and campaign tabs with ten Unicode columns");
     BattleStatsPersistedState historical;
+    // This fixture models a pre-roster production save.  Schema 3 migration
+    // intentionally reconstructs the legacy campaign rows and marks the
+    // inferred membership as incomplete; a schema-4 state must carry its
+    // explicit roster and participant sets.
+    historical.schemaVersion = 3;
     historical.scenario = L"S_07.eex";
+    historical.active = true;
+    historical.scenarioOrdinal = 7;
     historical.knownMetrics = BattleStatsDamageDealt;
     BattleUnitTotals person;
     person.personId = 42;

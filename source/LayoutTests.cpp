@@ -1,4 +1,5 @@
 #include "EngineLayout.h"
+#include "PeImage.h"
 #include <stdio.h>
 #include <vector>
 #include <string.h>
@@ -6,6 +7,8 @@
 HMODULE gInstance = nullptr;
 uintptr_t gGameBase = 0;
 bool EngineTestInitializeImage(uintptr_t virtualBase);
+bool EngineTestInitializeRuntimeImage(uintptr_t virtualBase);
+bool EngineTestInitializeVersionImage(uintptr_t virtualBase, EngineProfileId profile);
 void EngineTestFailWrite(int index);
 bool EngineTestOwnedPhaseState(int phase, int& value, int& counter);
 
@@ -17,33 +20,102 @@ void Check(bool condition, const char* name) {
     if (!condition) ++failures;
 }
 bool LoadImage(const wchar_t* path, std::vector<BYTE>& image, DWORD& base) {
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"rb")) return false;
-    _fseeki64(file, 0, SEEK_END);
-    const __int64 length = _ftelli64(file);
-    _fseeki64(file, 0, SEEK_SET);
-    if (length < 256 || length > 64 * 1024 * 1024) { fclose(file); return false; }
-    std::vector<BYTE> raw(static_cast<size_t>(length));
-    const bool read = fread(raw.data(), 1, raw.size(), file) == raw.size();
-    fclose(file);
-    if (!read) return false;
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
-        static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS32) > raw.size()) return false;
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(raw.data() + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage > 64 * 1024 * 1024 ||
-        nt->OptionalHeader.SizeOfHeaders > raw.size()) return false;
-    image.resize(nt->OptionalHeader.SizeOfImage);
-    memcpy(image.data(), raw.data(), nt->OptionalHeader.SizeOfHeaders);
-    const auto sections = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const auto& section = sections[i];
-        if (section.PointerToRawData + static_cast<size_t>(section.SizeOfRawData) > raw.size() ||
-            section.VirtualAddress + static_cast<size_t>(section.SizeOfRawData) > image.size()) return false;
-        memcpy(image.data() + section.VirtualAddress, raw.data() + section.PointerToRawData, section.SizeOfRawData);
-    }
-    base = nt->OptionalHeader.ImageBase;
+    PeFileView file;
+    PeAnalysisView view;
+    std::wstring error;
+    if (!file.Open(path, error) || !view.Map(file, error)) return false;
+    image.assign(view.Data(), view.Data() + view.Size());
+    base = static_cast<DWORD>(view.PreferredBase());
     return true;
+}
+
+void ExerciseVersionFallback(const std::vector<BYTE>& original, DWORD base, EngineProfileId profile) {
+    std::vector<BYTE> candidate = original;
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(candidate.data());
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(candidate.data() + dos->e_lfanew);
+    auto sections = IMAGE_FIRST_SECTION(nt);
+    // Model code expanded into a protected virtual region: runtime bytes are
+    // readable, but the on-disk sections offer neither code flags nor raw bytes.
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        sections[i].Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
+        sections[i].SizeOfRawData = 0;
+    }
+    candidate[0x2D5B0] = 0x90;
+    candidate[0x2C4E8] = 0x90;
+    candidate[0x13324] = 0x12;
+    const auto baseline = candidate;
+    EngineLayout strict, selected;
+    Check(!ResolveEngineLayout(candidate.data(), strict, base),
+        "protected runtime without executable section flags fails strict layout identification");
+    Check(ResolveVersionEngineLayout(candidate.data(), candidate.size(), profile, selected, base) &&
+        selected.plan.status == EnginePlanStatus::VersionSelected &&
+        selected.plan.sites[SiteDialog].rawFileOffset == SIZE_MAX &&
+        selected.plan.sites[SiteDialog].original[0] == 0x90 &&
+        selected.plan.sites[SiteWaitCall].original[0] == 0x90,
+        "version template accepts expanded virtual bytes and captures the actual restoration baseline");
+    Check(!ResolveVersionEngineLayout(candidate.data(), 0x1000, profile, selected, base) &&
+        !ResolveVersionEngineLayout(candidate.data(), candidate.size(), EngineProfileId::Unknown, selected, base),
+        "version template still rejects truncated images and an unspecified engine family");
+    gGameBase = reinterpret_cast<uintptr_t>(candidate.data());
+    Check(EngineTestInitializeVersionImage(base, profile) && candidate == baseline &&
+        RuntimeEnginePatchPlan().status == EnginePlanStatus::VersionSelected,
+        "version initialization keeps divergent bytes intact until settings are committed");
+    Settings settings;
+    settings.superEnabled = true;
+    for (bool& flag : settings.superFlags) flag = false;
+    settings.superFlags[0] = true;
+    EngineTestFailWrite(0);
+    Check(!ApplyEngineState(settings) && candidate == baseline,
+        "version-template write failure rolls back without losing captured bytes");
+    EngineTestFailWrite(-1);
+    Check(ApplyEngineState(settings) && candidate[0x2D5B0] == 0xC2,
+        "version-selected injection applies despite a mismatched original signature");
+    RestoreEngine();
+    Check(candidate == baseline && !EngineError()[0],
+        "version-template uninstall restores all actual bytes including the original modifier and native state");
+}
+
+void ExerciseRuntimeView(const std::vector<BYTE>& original, DWORD base, const EngineLayout& layout) {
+    auto candidate = original;
+    gGameBase = reinterpret_cast<uintptr_t>(candidate.data());
+    Check(!EngineTestInitializeRuntimeImage(base) && candidate == original,
+        "strict runtime initialization rejects a readable non-executable heap image without writing");
+    BYTE* live = static_cast<BYTE*>(VirtualAlloc(nullptr, original.size(), MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE));
+    Check(live != nullptr, "allocate isolated executable runtime image");
+    if (!live) return;
+    memcpy(live, original.data(), original.size());
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(live);
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(live + dos->e_lfanew);
+    auto sections = IMAGE_FIRST_SECTION(nt);
+    // A packed section may store far more raw container data than belongs in
+    // its virtual image. Runtime resolution must not demand disk raw offsets.
+    sections[nt->FileHeader.NumberOfSections - 1].SizeOfRawData = 0x0AF58000;
+    std::vector<BYTE> baseline(live, live + original.size());
+    gGameBase = reinterpret_cast<uintptr_t>(live);
+    const bool initialized = EngineTestInitializeRuntimeImage(base);
+    Check(initialized && RuntimeEnginePatchPlan().runtimeValidated &&
+        RuntimeEnginePatchPlan().sites[SiteDialog].byteSource == EngineSiteByteSource::RuntimeOnly &&
+        RuntimeEnginePatchPlan().sites[SiteDialog].rawFileOffset == SIZE_MAX,
+        "runtime plan verifies live executable pages and ignores oversized packed-container raw extents");
+    if (initialized) {
+        const uintptr_t code = layout.sites[SiteDialog] - 0x400000;
+        DWORD oldProtection = 0;
+        const bool inaccessible = VirtualProtect(live + code, 1, PAGE_NOACCESS, &oldProtection) != 0;
+        Settings settings;
+        settings.superEnabled = true;
+        for (bool& flag : settings.superFlags) flag = false;
+        settings.superFlags[0] = true;
+        Check(inaccessible && !ApplyEngineState(settings),
+            "live page becoming inaccessible after resolution prevents a patch write");
+        DWORD ignored = 0;
+        if (inaccessible) VirtualProtect(live + code, 1, oldProtection, &ignored);
+        RestoreEngine();
+        Check(memcmp(live, baseline.data(), baseline.size()) == 0,
+            "runtime page failure leaves every original byte intact after restoration");
+    }
+    VirtualFree(live, 0, MEM_RELEASE);
+    gGameBase = 0;
 }
 }
 
@@ -103,6 +175,8 @@ int wmain(int argc, wchar_t** argv) {
             safeCallers = safeCallers && layout.waitCallers[i] != layout.sites[SiteRWait] + 5;
         Check(safeCallers, "profile-specific S wait whitelist excludes the separately controlled R wait");
         const auto original = image;
+        ExerciseRuntimeView(original, base, layout);
+        ExerciseVersionFallback(original, base, layout.profile);
         if (is64) {
             // Exercise the same public settings transaction without indexing
             // native Z/phase-table fields that do not exist in 6.4.
@@ -357,7 +431,7 @@ int wmain(int argc, wchar_t** argv) {
         memcpy(image.data() + delay + 0x100, image.data() + delay, backup.size());
         Check(ResolveEngineLayout(image.data(), altered, base) &&
             !(altered.capabilities & CapabilitySuperDelay) &&
-            altered.plan.status == EnginePlanStatus::ForceRequired &&
+            altered.plan.status == EnginePlanStatus::Rejected &&
             altered.plan.evidence.find(L"Resolution=Ambiguous") != std::wstring::npos,
             "ambiguous delay signatures disable only the affected feature");
         memset(image.data() + delay, 0x90, backup.size());
@@ -381,7 +455,7 @@ int wmain(int argc, wchar_t** argv) {
         image[delay + (is65 ? 32 : 23)] = 0x90;
         Check(ResolveEngineLayout(image.data(), altered, base) &&
             !(altered.capabilities & CapabilitySuperDelay) &&
-            altered.plan.status == EnginePlanStatus::ForceRequired &&
+            altered.plan.status == EnginePlanStatus::Rejected &&
             altered.plan.evidence.find(L"Resolution=Missing") != std::wstring::npos,
             "unrecognized wait semantics disable only the affected feature");
     }

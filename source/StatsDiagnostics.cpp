@@ -166,7 +166,10 @@ std::wstring Summarize(const BattleStatsPersistedState& state) {
     result << L"schema=" << state.schemaVersion << L" campaign=" << state.campaignId <<
         L" battle=" << state.battleInstance << L" scenario=" << state.scenarioOrdinal <<
         L" active=" << state.active << L" incomplete=" << state.historyIncomplete <<
-        L" metrics=" << state.knownMetrics << L" elapsedMs=" << state.elapsedMilliseconds;
+        L" metrics=" << state.knownMetrics << L" elapsedMs=" << state.elapsedMilliseconds <<
+        L" roster.count=" << state.campaignRoster.size() <<
+        L" participants.count=" << state.currentBattleParticipants.size() <<
+        L" roster.incomplete=" << state.rosterHistoryIncomplete;
     WriteUnits(result, L"current", state.units);
     WriteUnits(result, L"campaign", state.campaignUnits);
     return result.str();

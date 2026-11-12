@@ -139,8 +139,8 @@ int wmain() {
         content.find(LoggedPath(save)) != std::string::npos &&
         content.find(Utf8(L"一行\\r\\n下一行\\t结束")) != std::string::npos,
         "UTF-8 log records build, actual Unicode save path, and escaped single-line diagnostics");
-    const size_t capture = content.find("schema=3");
-    const size_t restored = content.find("schema=3", capture + 1);
+    const size_t capture = content.find("schema=4");
+    const size_t restored = content.find("schema=4", capture + 1);
     const size_t endCapture = content.find(" detail=", capture);
     const size_t endRestored = content.find("\r\n", restored);
     Check(capture != std::string::npos && restored != std::string::npos &&

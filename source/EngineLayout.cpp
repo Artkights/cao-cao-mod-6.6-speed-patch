@@ -1,4 +1,5 @@
 #include "EngineLayout.h"
+#include "PeImage.h"
 #include "RPresentation.h"
 #include "SPresentation.h"
 #include <initializer_list>
@@ -8,6 +9,18 @@
 
 namespace {
 constexpr uintptr_t kOrigin = 0x400000;
+thread_local EngineAnalysisSource gAnalysisSource = EngineAnalysisSource::Disk;
+thread_local uintptr_t gRuntimeMemoryBase = 0;
+struct AnalysisScope {
+    EngineAnalysisSource previous;
+    uintptr_t previousBase;
+    explicit AnalysisScope(EngineAnalysisSource source, uintptr_t memoryBase = 0)
+        : previous(gAnalysisSource), previousBase(gRuntimeMemoryBase) {
+        gAnalysisSource = source;
+        if (memoryBase) gRuntimeMemoryBase = memoryBase;
+    }
+    ~AnalysisScope() { gAnalysisSource = previous; gRuntimeMemoryBase = previousBase; }
+};
 
 bool CopyMemoryChecked(void* to, const void* from, size_t length) {
     __try {
@@ -35,6 +48,8 @@ struct Image {
     uintptr_t virtualBase;
     IMAGE_SECTION_HEADER sections[96];
     WORD count;
+    bool runtime = false;
+    uintptr_t runtimeMemoryBase = 0;
     mutable unsigned uniqueSignatures = 0;
     mutable unsigned missingSignatures = 0;
     mutable unsigned ambiguousSignatures = 0;
@@ -46,10 +61,13 @@ struct Image {
     bool Executable(uintptr_t address, size_t length) const {
         if (!Contains(address, length)) return false;
         const uintptr_t rva = address - kOrigin;
+        if (runtime) {
+            std::wstring error;
+            return ValidateRuntimeMemory(reinterpret_cast<const void*>(runtimeMemoryBase + rva), length, true, error);
+        }
         for (WORD i = 0; i < count; ++i) {
             const auto& section = sections[i];
-            const DWORD bytes = section.Misc.VirtualSize > section.SizeOfRawData ?
-                section.Misc.VirtualSize : section.SizeOfRawData;
+            const DWORD bytes = PeLogicalSectionSize(section);
             if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) && rva >= section.VirtualAddress &&
                 rva - section.VirtualAddress < bytes && length <= bytes - (rva - section.VirtualAddress)) return true;
         }
@@ -68,11 +86,10 @@ struct Image {
         }
         for (WORD i = 0; i < count; ++i) {
             const auto& section = sections[i];
-            const DWORD virtualSize = section.Misc.VirtualSize > section.SizeOfRawData ?
-                section.Misc.VirtualSize : section.SizeOfRawData;
+            const DWORD virtualSize = PeLogicalSectionSize(section);
             if (rva < section.VirtualAddress ||
                 static_cast<uint64_t>(rva - section.VirtualAddress) + length > section.SizeOfRawData ||
-                static_cast<uint64_t>(rva - section.VirtualAddress) >= virtualSize ||
+                static_cast<uint64_t>(rva - section.VirtualAddress) + length > virtualSize ||
                 !section.SizeOfRawData) continue;
             const uint64_t raw = static_cast<uint64_t>(section.PointerToRawData) +
                 (rva - section.VirtualAddress);
@@ -120,10 +137,9 @@ struct Image {
         }
         for (WORD i = 0; i < count; ++i) {
             const auto& section = sections[i];
-            if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            if (!runtime && !(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
             uintptr_t start = kOrigin + section.VirtualAddress;
-            size_t length = section.Misc.VirtualSize > section.SizeOfRawData ?
-                section.Misc.VirtualSize : section.SizeOfRawData;
+            size_t length = PeLogicalSectionSize(section);
             if (!Contains(start, length) || length < pattern.size()) continue;
             uintptr_t end = start + length;
             if (begin) {
@@ -148,6 +164,12 @@ struct Image {
                     const size_t offset = anchorPosition - anchor;
                     if (Match(sectionData + offset, pattern.begin(), pattern.size())) {
                         const uintptr_t at = start + offset;
+                        if (runtime && !Executable(at, pattern.size())) {
+                            const size_t consumed = anchorPosition - searchOffset + 1;
+                            searchOffset = anchorPosition + 1;
+                            remaining -= consumed;
+                            continue;
+                        }
                         if (result) { ++ambiguousSignatures; return 0; }
                         result = at;
                     }
@@ -159,6 +181,7 @@ struct Image {
                 for (size_t offset = 0; offset < candidateCount; ++offset) {
                     if (!Match(sectionData + offset, pattern.begin(), pattern.size())) continue;
                     const uintptr_t at = start + offset;
+                    if (runtime && !Executable(at, pattern.size())) continue;
                     if (result) { ++ambiguousSignatures; return 0; }
                     result = at;
                 }
@@ -174,10 +197,9 @@ struct Image {
         if (!target || !callers || !capacity) return 0;
         for (WORD i = 0; i < this->count; ++i) {
             const auto& section = sections[i];
-            if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            if (!runtime && !(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
             uintptr_t start = kOrigin + section.VirtualAddress;
-            size_t length = section.Misc.VirtualSize > section.SizeOfRawData ?
-                section.Misc.VirtualSize : section.SizeOfRawData;
+            size_t length = PeLogicalSectionSize(section);
             if (!Contains(start, length) || length < 5) continue;
             const BYTE* sectionData = At(start);
             const size_t candidateCount = length - 4;
@@ -194,7 +216,7 @@ struct Image {
                 int32_t displacement = 0;
                 memcpy(&displacement, bytes + 1, sizeof(displacement));
                 const uintptr_t callTarget = static_cast<uint32_t>(at + 5 + displacement);
-                if (callTarget == target && found < capacity)
+                if (callTarget == target && found < capacity && (!runtime || Executable(at, 5)))
                     callers[found++] = at + 5;
                 const size_t consumed = offset - searchOffset + 1;
                 searchOffset = offset + 1;
@@ -206,25 +228,27 @@ struct Image {
 };
 
 bool ParseImage(const BYTE* bytes, uintptr_t virtualBase, Image& image) {
-    IMAGE_DOS_HEADER dos;
-    IMAGE_NT_HEADERS32 nt;
-    if (!bytes || !CopyMemoryChecked(&dos, bytes, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
-        dos.e_lfanew < static_cast<LONG>(sizeof(dos)) || dos.e_lfanew > 0x100000 ||
-        !CopyMemoryChecked(&nt, bytes + dos.e_lfanew, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_I386 || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
-        nt.OptionalHeader.SizeOfImage < 4096 || nt.OptionalHeader.SizeOfImage > 64 * 1024 * 1024 ||
-        !nt.FileHeader.NumberOfSections || nt.FileHeader.NumberOfSections > 96) return false;
-    const size_t sectionOffset = dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
-        nt.FileHeader.SizeOfOptionalHeader;
-    const size_t sectionBytes = nt.FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
-    if (sectionOffset >= nt.OptionalHeader.SizeOfHeaders ||
-        sectionBytes > nt.OptionalHeader.SizeOfHeaders - sectionOffset ||
-        !CopyMemoryChecked(image.sections, bytes + sectionOffset, sectionBytes)) return false;
+    IMAGE_DOS_HEADER dos = {};
+    if (!bytes || !CopyMemoryChecked(&dos, bytes, sizeof(dos)) || dos.e_lfanew < sizeof(dos) ||
+        dos.e_lfanew > 0x100000) return false;
+    IMAGE_NT_HEADERS32 nt = {};
+    if (!CopyMemoryChecked(&nt, bytes + dos.e_lfanew, sizeof(nt)) ||
+        nt.OptionalHeader.SizeOfHeaders > nt.OptionalHeader.SizeOfImage ||
+        !nt.OptionalHeader.SizeOfHeaders || nt.OptionalHeader.SizeOfHeaders > 0x100000) return false;
+    std::vector<BYTE> headerCopy(nt.OptionalHeader.SizeOfHeaders);
+    if (!CopyMemoryChecked(headerCopy.data(), bytes, headerCopy.size())) return false;
+    PeImageMetadata metadata;
+    std::wstring error;
+    if (!ParsePeImageMetadata(headerCopy.data(), headerCopy.size(), 0, false, metadata, error)) return false;
+    if (!CopyMemoryChecked(image.sections, metadata.sections.data(),
+        metadata.sections.size() * sizeof(IMAGE_SECTION_HEADER))) return false;
     image.data = bytes;
-    image.size = nt.OptionalHeader.SizeOfImage;
-    image.headers = nt.OptionalHeader.SizeOfHeaders;
-    image.count = nt.FileHeader.NumberOfSections;
+    image.size = metadata.nt.OptionalHeader.SizeOfImage;
+    image.headers = metadata.nt.OptionalHeader.SizeOfHeaders;
+    image.count = metadata.nt.FileHeader.NumberOfSections;
     image.virtualBase = virtualBase ? virtualBase : reinterpret_cast<uintptr_t>(bytes);
+    image.runtime = gAnalysisSource == EngineAnalysisSource::Runtime;
+    image.runtimeMemoryBase = gRuntimeMemoryBase ? gRuntimeMemoryBase : image.virtualBase;
     return true;
 }
 
@@ -299,10 +323,9 @@ void ResolveWaitCallers(const Image& image, EngineLayout& layout) {
     // recognized contexts, so unrelated waits cannot exhaust a candidate cap.
     for (WORD sectionIndex = 0; sectionIndex < image.count; ++sectionIndex) {
         const auto& section = image.sections[sectionIndex];
-        if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (!image.runtime && !(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
         const uintptr_t start = kOrigin + section.VirtualAddress;
-        const size_t length = section.Misc.VirtualSize > section.SizeOfRawData ?
-            section.Misc.VirtualSize : section.SizeOfRawData;
+        const size_t length = PeLogicalSectionSize(section);
         if (!image.Contains(start, length) || length < 5) continue;
         const BYTE* sectionData = image.At(start);
         const size_t candidateCount = length - 4;
@@ -412,7 +435,8 @@ static bool Resolve66(const BYTE* bytes, EngineLayout& output, uintptr_t virtual
             layout.sites[SiteWaitBranch] && layout.sites[SiteDialogDisplay] &&
             layout.sites[SiteDialog] && layout.sites[SiteMapText] &&
             layout.sites[SiteExtendedDisplay])
-            layout.capabilities |= CapabilityNativeSuper;
+            layout.capabilities |= CapabilityNativeSuper|CapabilityDialog3|CapabilityExtraDelay|
+                CapabilityDialogDisplay|CapabilityExtendedDisplay;
     }
 
     uintptr_t wait = image.Find({0x55,0x8B,0xEC,0xE8,-1,-1,-1,-1,0x85,0xC0,0x75,0x07,
@@ -685,7 +709,8 @@ static bool Resolve65(const BYTE* bytes, EngineLayout& output, uintptr_t virtual
             layout.sites[SiteWaitBranch] && layout.sites[SiteDialogDisplay] &&
             layout.sites[SiteDialog] && layout.sites[SiteMapText] &&
             layout.sites[SiteExtendedDisplay])
-            layout.capabilities |= CapabilityNativeSuper;
+            layout.capabilities |= CapabilityNativeSuper|CapabilityExtraDelay|
+                CapabilityDialogDisplay|CapabilityExtendedDisplay;
     }
 
     uintptr_t wait = image.Find({0x55,0x8B,0xEC,0xB9,-1,-1,-1,-1,
@@ -1133,7 +1158,9 @@ void SetTemplates(EngineLayout& layout) {
 }
 }
 
-bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virtualBase) {
+bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virtualBase,
+    EngineAnalysisSource source, uintptr_t runtimeMemoryBase) {
+    AnalysisScope scope(source, runtimeMemoryBase);
     output = EngineLayout();
     EngineLayout layout = {};
     // Family identity needs the native toggle and wait/stage relationship. A
@@ -1144,8 +1171,7 @@ bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virt
         ResolveAnimationPresentation(bytes, layout, virtualBase);
         AppendRPresentationLayout(bytes, layout, virtualBase);
         AppendSPresentationLayout(bytes, layout, virtualBase);
-        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase,
-            EngineResolveMode::Automatic);
+        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase, source);
         output = layout;
         return true;
     }
@@ -1157,8 +1183,7 @@ bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virt
         ResolveAnimationPresentation(bytes, layout, virtualBase);
         AppendRPresentationLayout(bytes, layout, virtualBase);
         AppendSPresentationLayout(bytes, layout, virtualBase);
-        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase,
-            EngineResolveMode::Automatic);
+        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase, source);
         output = layout;
         return true;
     }
@@ -1170,13 +1195,12 @@ bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virt
         ResolveAnimationPresentation(bytes, layout, virtualBase);
         AppendRPresentationLayout(bytes, layout, virtualBase);
         AppendSPresentationLayout(bytes, layout, virtualBase);
-        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase,
-            EngineResolveMode::Automatic);
+        BuildEnginePatchPlan(bytes, layout.plan.imageSize, layout, layout.plan, virtualBase, source);
         output = layout;
         return true;
     }
     // Keep a rejected candidate's diagnostics for the installer report. This
-    // does not authorize runtime writes or infer a family for forced mode.
+    // never authorizes runtime writes against an unresolved layout.
     if (layout.nativeSuper || partial66.nativeSuper || partial64.waitWrapper ||
         partial64.ambiguousSignatureAttempts || partial64.missingSignatureAttempts) {
         if (!layout.nativeSuper) layout = partial66;
@@ -1186,9 +1210,8 @@ bool ResolveEngineLayout(const BYTE* bytes, EngineLayout& output, uintptr_t virt
         ResolveAnimationPresentation(bytes, layout, virtualBase);
         AppendRPresentationLayout(bytes, layout, virtualBase);
         AppendSPresentationLayout(bytes, layout, virtualBase);
-        BuildEnginePatchPlan(bytes, 0, layout, layout.plan, virtualBase,
-            EngineResolveMode::Automatic);
-        layout.plan.status = EnginePlanStatus::ForceRequired;
+        BuildEnginePatchPlan(bytes, 0, layout, layout.plan, virtualBase, source);
+        layout.plan.status = EnginePlanStatus::Rejected;
         output = layout;
     }
     return false;
@@ -1224,7 +1247,8 @@ EngineSitePlan MakePlanSite(const Image& image, const EngineLayout& layout,
     result.capability = SiteCapability(index);
     result.required = SiteRequired(layout, index);
     result.present = address != 0 && image.Contains(address, length);
-    if (result.present) image.RawOffset(address, length, result.rawFileOffset);
+    if (result.present && image.RawOffset(address, length, result.rawFileOffset))
+        result.byteSource = EngineSiteByteSource::Disk;
     if (original) memcpy(result.original, original, sizeof(result.original));
     if (enabled) memcpy(result.enabled, enabled, sizeof(result.enabled));
     if (result.present && (length > sizeof(result.original) ||
@@ -1236,8 +1260,7 @@ EngineSitePlan MakePlanSite(const Image& image, const EngineLayout& layout,
 const wchar_t* EnginePlanStatusName(EnginePlanStatus status) {
     switch (status) {
     case EnginePlanStatus::AutoVerified: return L"自动识别已验证";
-    case EnginePlanStatus::ForceRequired: return L"需要用户确认的强制模式";
-    case EnginePlanStatus::ForceAccepted: return L"已接受强制模式";
+    case EnginePlanStatus::VersionSelected: return L"按版本模板注入";
     case EnginePlanStatus::Rejected: return L"已拒绝";
     default: return L"未解析";
     }
@@ -1246,10 +1269,11 @@ const wchar_t* EnginePlanStatusName(EnginePlanStatus status) {
 std::wstring EnginePatchPlanReport(const EnginePatchPlan& plan) {
     std::wstringstream text;
     text << L"EnginePlanVersion=1\r\nProfile=" << static_cast<unsigned>(plan.profile)
-        << L"\r\nMode=" << (plan.mode == EngineResolveMode::Forced ? L"Forced" : L"Automatic")
+        << L"\r\nMode=" << (plan.status == EnginePlanStatus::VersionSelected ? L"VersionSelected" : L"Automatic")
         << L"\r\nStatus=" << static_cast<unsigned>(plan.status) << L"\r\nConfidence=" << plan.confidence
         << L"\r\nConfidenceBasis=RuleBasedLevelNotProbability"
         << L"\r\nImageSize=" << plan.imageSize << L"\r\nCapabilities=" << plan.capabilities
+        << L"\r\nRuntimeValidated=" << (plan.runtimeValidated ? 1 : 0)
         << L"\r\nEvidence=" << plan.evidence << L"\r\n";
     auto add = [&](const wchar_t* name, const EngineSitePlan& site) {
         text << L"\r\n[" << name << L"]\r\nPresent=" << (site.present ? 1 : 0)
@@ -1258,7 +1282,8 @@ std::wstring EnginePatchPlanReport(const EnginePatchPlan& plan) {
             << L"\r\nAddress=0x" << site.legacyAddress << L"\r\nRawFileOffset=";
         if (site.rawFileOffset == SIZE_MAX) text << L"Unavailable";
         else text << L"0x" << site.rawFileOffset;
-        text << std::dec << L"\r\nLength=" << site.length << L"\r\nOriginal=";
+        text << L"\r\nByteSource=" << (site.byteSource == EngineSiteByteSource::Disk ? L"Disk" : L"RuntimeOnly")
+            << std::dec << L"\r\nLength=" << site.length << L"\r\nOriginal=";
         for (size_t i = 0; i < site.length && i < sizeof(site.original); ++i) {
             if (i) text << L' ';
             text << std::hex << std::uppercase << std::setfill(L'0') << std::setw(2)
@@ -1280,20 +1305,21 @@ std::wstring EnginePatchPlanReport(const EnginePatchPlan& plan) {
     return text.str();
 }
 
-bool ResolveForcedEngineLayout(const BYTE* bytes, size_t imageSize,
+bool ResolveVersionEngineLayout(const BYTE* bytes, size_t imageSize,
     EngineProfileId profile, EngineLayout& output, uintptr_t virtualBase) {
     output = EngineLayout();
     Image image = {};
-    if ((profile != EngineProfileId::Ccz64 && profile != EngineProfileId::Ccz65 && profile != EngineProfileId::Ccz66) ||
-        !ParseImage(bytes, virtualBase, image) || (imageSize && image.size > imageSize)) return false;
+    if ((profile != EngineProfileId::Ccz64 && profile != EngineProfileId::Ccz65 &&
+         profile != EngineProfileId::Ccz66) || !ParseImage(bytes, virtualBase, image) ||
+        (imageSize && image.size > imageSize)) return false;
 
-    // First retain every independently resolved site.  The fixed template is
-    // only the explicit fallback for sites the selected family cannot resolve.
-    EngineLayout resolved = {};
-    const bool discovered = profile == EngineProfileId::Ccz64 ?
-        Resolve64(bytes, resolved, virtualBase) : profile == EngineProfileId::Ccz65 ?
-        Resolve65(bytes, resolved, virtualBase) : Resolve66(bytes, resolved, virtualBase);
-    EngineLayout layout = {};
+    // Reuse independently discovered addresses where available, while the
+    // selected family supplies the ABI and offsets for unresolved sites.
+    EngineLayout resolved;
+    if (profile == EngineProfileId::Ccz64) Resolve64(bytes, resolved, virtualBase);
+    else if (profile == EngineProfileId::Ccz65) Resolve65(bytes, resolved, virtualBase);
+    else Resolve66(bytes, resolved, virtualBase);
+    EngineLayout layout;
     layout.profile = profile;
     layout.stageUsesThis = profile != EngineProfileId::Ccz66;
     layout.phaseOwnedByPatch = profile == EngineProfileId::Ccz64;
@@ -1304,61 +1330,44 @@ bool ResolveForcedEngineLayout(const BYTE* bytes, size_t imageSize,
         0x413324,0,0x415B40,0x42C4EF,0x42C812,0x455CE5};
     const uintptr_t sites66[EngineSiteCount] = {0x42D5B0,0x4332A6,0x422DBA,0x429964,0x42C4E8,
         0x413324,0x42DB2C,0x415B40,0x42C4EF,0x42C812,0x455CE5};
-    memcpy(layout.sites, profile == EngineProfileId::Ccz64 ? sites64 : profile == EngineProfileId::Ccz65 ? sites65 : sites66, sizeof(layout.sites));
-    if (profile == EngineProfileId::Ccz64) {
-        layout.waitWrapper = 0x42C4E0;
-        layout.nativeStage = 0x422B33;
-        layout.timerContext = 0x4B1B18;
-        layout.phase = 0x4B3D18;
-        layout.speed = 0x4CE7BC;
-        layout.sleep = 0x4298F6;
-        layout.deadline = 0x421DF2;
-        layout.capabilities = CapabilitySuperDialog | CapabilitySuperMapText | CapabilitySuperDelay |
-            CapabilitySuperR | CapabilitySuperS | CapabilityPhase | CapabilityInput |
-            CapabilityExtraDelay | CapabilityDialogDisplay | CapabilityExtendedDisplay;
-    } else {
-        layout.waitWrapper = profile == EngineProfileId::Ccz65 ? 0x42C4E0 : 0x42C4E5;
+    memcpy(layout.sites, profile == EngineProfileId::Ccz64 ? sites64 :
+        profile == EngineProfileId::Ccz65 ? sites65 : sites66, sizeof(layout.sites));
+    layout.waitWrapper = profile == EngineProfileId::Ccz66 ? 0x42C4E5 : 0x42C4E0;
+    layout.nativeStage = profile == EngineProfileId::Ccz64 ? 0x422B33 : 0x4750E0;
+    layout.timerContext = profile == EngineProfileId::Ccz66 ? 0 : 0x4B1B18;
+    layout.phase = 0x4B3D18;
+    layout.speed = profile == EngineProfileId::Ccz66 ? 0x500AD8 : 0x4CE7BC;
+    layout.sleep = profile == EngineProfileId::Ccz66 ? 0x411195 : 0x4298F6;
+    layout.deadline = profile == EngineProfileId::Ccz66 ? 0x40C19D : 0x421DF2;
+    layout.pump = 0x47EAC4;
+    if (!layout.phaseOwnedByPatch) {
         layout.nativeSuper = profile == EngineProfileId::Ccz65 ? 0x4250B3 : 0x4250E6;
         layout.nativeSuperCall = profile == EngineProfileId::Ccz65 ? 0x4132E2 : 0x4132E3;
         layout.nativeSuperState = profile == EngineProfileId::Ccz65 ? 0x4CE7BF : 0x500ADB;
         layout.nativeSuperBusy = 0x500E0C;
-        layout.nativeStage = 0x4750E0;
-        layout.timerContext = profile == EngineProfileId::Ccz65 ? 0x4B1B18 : 0;
-        layout.phase = 0x4B3D18;
-        layout.speed = profile == EngineProfileId::Ccz65 ? 0x4CE7BC : 0x500AD8;
         layout.phaseTable = 0x4750DC;
         layout.phaseCounter = 0x4750DF;
-        layout.capabilities = CapabilitySuperDialog | CapabilitySuperMapText | CapabilitySuperDelay |
-            CapabilitySuperR | CapabilityInput | CapabilityExtraDelay | CapabilityDialogDisplay |
-            CapabilityExtendedDisplay | CapabilityNativeSuper |
-            (layout.dialog3Applicable ? CapabilityDialog3 : 0u);
     }
-    if (discovered) {
+    layout.capabilities = CapabilitySuperDialog|CapabilitySuperMapText|CapabilitySuperDelay|
+        CapabilitySuperR|CapabilitySuperS|CapabilityPhase|CapabilityInput|CapabilityExtraDelay|
+        CapabilityDialogDisplay|CapabilityExtendedDisplay|
+        (layout.phaseOwnedByPatch ? 0u : CapabilityNativeSuper)|
+        (layout.dialog3Applicable ? CapabilityDialog3 : 0u);
+    if (resolved.profile == profile) {
         for (size_t i = 0; i < EngineSiteCount; ++i)
             if (resolved.sites[i]) layout.sites[i] = resolved.sites[i];
-        if (resolved.waitWrapper) layout.waitWrapper = resolved.waitWrapper;
-        if (resolved.nativeSuper) layout.nativeSuper = resolved.nativeSuper;
-        if (resolved.nativeSuperCall) layout.nativeSuperCall = resolved.nativeSuperCall;
-        if (resolved.nativeSuperState) layout.nativeSuperState = resolved.nativeSuperState;
-        if (resolved.nativeSuperBusy) layout.nativeSuperBusy = resolved.nativeSuperBusy;
-        if (resolved.nativeStage) layout.nativeStage = resolved.nativeStage;
-        if (resolved.timerContext) layout.timerContext = resolved.timerContext;
-        if (resolved.phase) layout.phase = resolved.phase;
-        if (resolved.speed) layout.speed = resolved.speed;
-        if (resolved.phaseTable) layout.phaseTable = resolved.phaseTable;
-        if (resolved.phaseCounter) layout.phaseCounter = resolved.phaseCounter;
-        layout.sleep = resolved.sleep;
-        layout.deadline = resolved.deadline;
-        layout.pump = resolved.pump;
+        uintptr_t* destinations[] = {&layout.waitWrapper,&layout.nativeStage,&layout.timerContext,
+            &layout.phase,&layout.speed,&layout.sleep,&layout.deadline,&layout.pump,
+            &layout.nativeSuper,&layout.nativeSuperCall,&layout.nativeSuperState,
+            &layout.nativeSuperBusy,&layout.phaseTable,&layout.phaseCounter};
+        const uintptr_t values[] = {resolved.waitWrapper,resolved.nativeStage,resolved.timerContext,
+            resolved.phase,resolved.speed,resolved.sleep,resolved.deadline,resolved.pump,
+            resolved.nativeSuper,resolved.nativeSuperCall,resolved.nativeSuperState,
+            resolved.nativeSuperBusy,resolved.phaseTable,resolved.phaseCounter};
+        for (size_t i = 0; i < _countof(values); ++i) if (values[i]) *destinations[i] = values[i];
         layout.waitCallerCount = resolved.waitCallerCount;
-        layout.uniqueSignatureAttempts = resolved.uniqueSignatureAttempts;
-        layout.missingSignatureAttempts = resolved.missingSignatureAttempts;
-        layout.ambiguousSignatureAttempts = resolved.ambiguousSignatureAttempts;
-        layout.ambiguousWaitCallers = resolved.ambiguousWaitCallers;
         memcpy(layout.waitCallers, resolved.waitCallers, sizeof(layout.waitCallers));
         memcpy(layout.waitKinds, resolved.waitKinds, sizeof(layout.waitKinds));
-        // Timer ABI and presentation callers need independent confirmation.
-        layout.capabilities |= resolved.capabilities & (CapabilityPhase | CapabilitySuperS);
     }
     SetTemplates(layout);
     ResolveAnimationPresentation(bytes, layout, virtualBase);
@@ -1366,40 +1375,44 @@ bool ResolveForcedEngineLayout(const BYTE* bytes, size_t imageSize,
     AppendSPresentationLayout(bytes, layout, virtualBase);
     for (size_t i = 0; i < EngineSiteCount; ++i) {
         if (!layout.sites[i]) continue;
-        size_t raw = 0;
-        if (!image.Executable(layout.sites[i], kSiteLengths[i]) ||
-            !image.RawOffset(layout.sites[i], kSiteLengths[i], raw) ||
+        if (!image.Contains(layout.sites[i], kSiteLengths[i]) ||
             !CopyMemoryChecked(layout.siteOriginal[i], image.At(layout.sites[i]), kSiteLengths[i])) return false;
     }
-    size_t raw = 0;
-    if (!layout.phaseOwnedByPatch &&
-        (!image.Executable(layout.nativeSuper, 5) || !image.RawOffset(layout.nativeSuper, 5, raw) ||
-         !image.Contains(layout.nativeSuperState, 1) || !image.Contains(layout.nativeSuperBusy, 1) ||
-         !image.Contains(layout.phaseTable, 4))) return false;
-    if (layout.phaseOwnedByPatch &&
-        (!image.Contains(layout.nativeStage, 1) || !image.Contains(layout.timerContext, 1) ||
-         !image.Contains(layout.phase, 1) || !image.Contains(layout.speed, 1))) return false;
-    if (!BuildEnginePatchPlan(bytes, image.size, layout, layout.plan, virtualBase,
-        EngineResolveMode::Forced)) return false;
-    layout.plan.confidence = discovered ? 55 : 25;
-    layout.plan.evidence += discovered ?
-        L"用户选择强制模板；已保留可独立解析的站点，其余站点使用内置地址并捕获实际字节。" :
-        L"用户选择强制模板；调用图未确认，站点使用内置地址，已验证边界并捕获实际字节。";
+    const uintptr_t dependencies[] = {layout.waitWrapper,layout.nativeStage,layout.timerContext,
+        layout.phase,layout.speed,layout.sleep,layout.deadline,layout.pump,
+        layout.nativeSuperCall,layout.phaseCounter};
+    for (uintptr_t address : dependencies) {
+        BYTE captured = 0;
+        if (address && (!image.Contains(address, 1) ||
+            !CopyMemoryChecked(&captured, image.At(address), 1))) return false;
+    }
+    // The normal plan builder populates the complete audit record even when
+    // a protected zero-fill region has no corresponding bytes on disk.
+    BuildEnginePatchPlan(bytes, image.size, layout, layout.plan, virtualBase, EngineAnalysisSource::Runtime);
+    for (const EngineSitePlan& site : layout.plan.sites)
+        if (site.required && !site.present) return false;
+    const EngineSitePlan* dataSites[] = {&layout.plan.nativeRoute,&layout.plan.nativeState,
+        &layout.plan.nativeBusy,&layout.plan.phaseTable};
+    for (const EngineSitePlan* site : dataSites) if (site->required && !site->present) return false;
+    layout.plan.status = EnginePlanStatus::VersionSelected;
+    layout.plan.confidence = 0;
+    layout.plan.evidence = L"用户确认按版本模板注入；实际运行时原始字节已捕获，"
+        L"未要求签名、调用图、可执行节标记或磁盘原始偏移一致。";
     output = layout;
     return true;
 }
 
 bool BuildEnginePatchPlan(const BYTE* imageBytes, size_t imageSize, const EngineLayout& layout,
-    EnginePatchPlan& plan, uintptr_t virtualBase, EngineResolveMode mode) {
+    EnginePatchPlan& plan, uintptr_t virtualBase, EngineAnalysisSource source, uintptr_t runtimeMemoryBase) {
+    AnalysisScope scope(source, runtimeMemoryBase);
     plan = EnginePatchPlan();
     plan.profile = layout.profile;
-    plan.mode = mode;
     plan.loadedBase = virtualBase;
     plan.imageSize = imageSize;
     plan.capabilities = layout.capabilities;
+    plan.runtimeValidated = false;
     if (layout.profile == EngineProfileId::Unknown || !imageBytes) {
-        plan.status = mode == EngineResolveMode::Forced ? EnginePlanStatus::ForceRequired :
-            EnginePlanStatus::Rejected;
+        plan.status = EnginePlanStatus::Rejected;
         plan.evidence = L"没有已验证的引擎布局，不能生成可审计的写入计划。";
         return false;
     }
@@ -1416,28 +1429,52 @@ bool BuildEnginePatchPlan(const BYTE* imageBytes, size_t imageSize, const Engine
         const EngineSiteIndex index = static_cast<EngineSiteIndex>(i);
         plan.sites[i] = MakePlanSite(image, layout, index, layout.sites[i], kSiteLengths[i],
             layout.siteOriginal[i], layout.siteEnabled[i]);
+        if (source == EngineAnalysisSource::Runtime) {
+            plan.sites[i].rawFileOffset = SIZE_MAX;
+            plan.sites[i].byteSource = EngineSiteByteSource::RuntimeOnly;
+        }
         const EngineSitePlan& site = plan.sites[i];
-        if (site.required && (!site.present || site.rawFileOffset == SIZE_MAX ||
+        if (site.required && (!site.present || (source == EngineAnalysisSource::Disk && site.rawFileOffset == SIZE_MAX) ||
             !image.Executable(site.legacyAddress, site.length))) requiredOkay = false;
     }
     plan.nativeRoute = MakePlanSite(image, layout, EngineSiteCount, layout.nativeSuper, 5,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.nativeRoute.rawFileOffset = SIZE_MAX;
+        plan.nativeRoute.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.nativeRoute.capability = CapabilityNativeSuper;
     plan.nativeRoute.required = !layout.phaseOwnedByPatch;
     plan.nativeState = MakePlanSite(image, layout, EngineSiteCount, layout.nativeSuperState, 1,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.nativeState.rawFileOffset = SIZE_MAX;
+        plan.nativeState.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.nativeState.capability = CapabilityNativeSuper;
     plan.nativeState.required = !layout.phaseOwnedByPatch;
     plan.nativeBusy = MakePlanSite(image, layout, EngineSiteCount, layout.nativeSuperBusy, 1,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.nativeBusy.rawFileOffset = SIZE_MAX;
+        plan.nativeBusy.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.nativeBusy.capability = CapabilityNativeSuper;
     plan.nativeBusy.required = !layout.phaseOwnedByPatch;
     plan.phaseTable = MakePlanSite(image, layout, EngineSiteCount, layout.phaseTable, 4,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.phaseTable.rawFileOffset = SIZE_MAX;
+        plan.phaseTable.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.phaseTable.capability = CapabilityPhase;
     plan.phaseTable.required = !layout.phaseOwnedByPatch && (layout.capabilities & CapabilityPhase) != 0;
     plan.phaseValue = MakePlanSite(image, layout, EngineSiteCount, layout.phase, 1,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.phaseValue.rawFileOffset = SIZE_MAX;
+        plan.phaseValue.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.phaseValue.capability = CapabilityPhase;
     // These globals can live in PE zero-fill (.bss) in shipped builds.  Keep
     // their captured bytes in the plan when a raw mapping exists, while the
@@ -1445,17 +1482,25 @@ bool BuildEnginePatchPlan(const BYTE* imageBytes, size_t imageSize, const Engine
     plan.phaseValue.required = false;
     plan.speedValue = MakePlanSite(image, layout, EngineSiteCount, layout.speed, 1,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.speedValue.rawFileOffset = SIZE_MAX;
+        plan.speedValue.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.speedValue.capability = CapabilitySuperDelay;
     plan.speedValue.required = false;
     plan.timerContext = MakePlanSite(image, layout, EngineSiteCount, layout.timerContext, 1,
         nullptr, nullptr);
+    if (source == EngineAnalysisSource::Runtime) {
+        plan.timerContext.rawFileOffset = SIZE_MAX;
+        plan.timerContext.byteSource = EngineSiteByteSource::RuntimeOnly;
+    }
     plan.timerContext.capability = CapabilitySuperDelay;
     plan.timerContext.required = false;
     const EngineSitePlan* dataSites[] = {&plan.nativeRoute, &plan.nativeState,
         &plan.nativeBusy, &plan.phaseTable, &plan.phaseValue, &plan.speedValue,
         &plan.timerContext};
     for (const EngineSitePlan* site : dataSites)
-        if (site->required && (!site->present || site->rawFileOffset == SIZE_MAX)) requiredOkay = false;
+        if (site->required && (!site->present || (source == EngineAnalysisSource::Disk && site->rawFileOffset == SIZE_MAX))) requiredOkay = false;
     if (!layout.phaseOwnedByPatch && !image.Executable(layout.nativeSuper, 5)) requiredOkay = false;
     const unsigned requiredCapabilities = CapabilitySuperDialog|CapabilitySuperMapText|
         CapabilitySuperDelay|CapabilitySuperR|CapabilitySuperS|CapabilityPhase|CapabilityInput|
@@ -1476,19 +1521,18 @@ bool BuildEnginePatchPlan(const BYTE* imageBytes, size_t imageSize, const Engine
         << L"; MissingCapabilities=0x" << std::hex << missingCapabilities << L"; ";
     plan.evidence = evidence.str();
     if (!requiredOkay) {
-        plan.status = mode == EngineResolveMode::Forced ? EnginePlanStatus::Rejected : EnginePlanStatus::ForceRequired;
+        plan.status = EnginePlanStatus::Rejected;
         plan.evidence += L"必需站点存在缺失、不可执行或无法映射到磁盘文件的情况，不能接受写入计划。";
         return false;
     }
-    if (mode == EngineResolveMode::Automatic && !semanticComplete) {
-        plan.status = EnginePlanStatus::ForceRequired;
-        plan.evidence += L"加速功能调用关系未全部唯一确认；需要用户明确选择强制模板。";
+    if (!semanticComplete) {
+        plan.status = EnginePlanStatus::Rejected;
+        plan.evidence += L"加速功能调用关系未全部唯一确认；自动安装已停止。";
         return false;
     }
-    plan.status = mode == EngineResolveMode::Forced ? EnginePlanStatus::ForceAccepted :
-        EnginePlanStatus::AutoVerified;
-    plan.evidence += mode == EngineResolveMode::Forced ?
-        L"调用图已解析，计划由用户以强制模式接受；写入仍受原始字节校验保护。" :
-        L"调用图、站点原始字节和 PE 节到文件偏移映射均已验证。";
+    plan.status = EnginePlanStatus::AutoVerified;
+    plan.evidence += source == EngineAnalysisSource::Disk
+        ? L"调用图、站点原始字节和 PE 节到文件偏移映射均已验证。"
+        : L"运行时调用图和站点原始字节已验证；页面权限由运行时识别入口另行确认。";
     return true;
 }

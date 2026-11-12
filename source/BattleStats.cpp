@@ -4,6 +4,7 @@
 #include "BattleRuntime.h"
 #include "Guide.h"
 #include "EngineProfile.h"
+#include "ScenarioScript.h"
 #ifndef XA66_TEST
 #include "AnimationRuntime.h"
 #endif
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -185,6 +187,11 @@ std::wstring gRoot;
 RuntimeLayout gLayout;
 std::map<int, BattleUnitTotals> gTotals;
 std::map<int, BattleUnitTotals> gCampaignTotals;
+std::map<int, BattleRosterEntry> gCampaignRoster;
+std::set<int> gCurrentBattleParticipants;
+bool gRosterHistoryIncomplete = false;
+bool gRosterAvailable = false;
+bool gDeploymentAvailable = false;
 std::map<int, std::wstring> gLabels;
 SRWLOCK gStatsLock = SRWLOCK_INIT;
 class ScopedStatsLock {
@@ -857,32 +864,134 @@ BattleUnitTotals& TotalsForPersonUnlocked(std::map<int, BattleUnitTotals>& ledge
     return totals;
 }
 
+BattleRosterEntry* FindRosterUnlocked(int personId) {
+    const auto found = gCampaignRoster.find(personId);
+    return found == gCampaignRoster.end() ? nullptr : &found->second;
+}
+
+void SetObservedLabelUnlocked(int personId, const std::wstring& label) {
+    // Prepare every allocating string operation before committing labels in
+    // the roster and either ledger, so a failed allocation cannot split them.
+    std::wstring rosterLabel = label, currentLabel = label, campaignLabel = label;
+    auto known = gLabels.find(personId);
+    if (known == gLabels.end()) gLabels.emplace(personId, label);
+    else { std::wstring knownLabel = label; known->second.swap(knownLabel); }
+    if (BattleRosterEntry* entry = FindRosterUnlocked(personId)) entry->label.swap(rosterLabel);
+    const auto current = gTotals.find(personId);
+    if (current != gTotals.end()) current->second.label.swap(currentLabel);
+    const auto campaign = gCampaignTotals.find(personId);
+    if (campaign != gCampaignTotals.end()) campaign->second.label.swap(campaignLabel);
+}
+
+void TraceLedgerUnlocked(const wchar_t* stage, const wchar_t* reason) noexcept;
+
+bool IsCurrentParticipantUnlocked(int personId) {
+    return gCurrentBattleParticipants.find(personId) != gCurrentBattleParticipants.end();
+}
+
+bool AddCurrentParticipantUnlocked(int personId, int slot) {
+    auto row = gTotals.find(personId);
+    bool inserted = false;
+    if (row == gTotals.end()) {
+        BattleUnitTotals total;
+        total.personId = personId;
+        total.slot = slot;
+        const auto label = gLabels.find(personId);
+        if (label != gLabels.end()) total.label = label->second;
+        row = gTotals.emplace(personId, std::move(total)).first;
+        inserted = true;
+    }
+    try { gCurrentBattleParticipants.insert(personId); }
+    catch (...) { if (inserted) gTotals.erase(row); throw; }
+    return true;
+}
+
+bool ConfirmEventParticipantUnlocked(int personId, int slot) {
+    if (!(gDeploymentAvailable || (BattleRuntimeCapabilities() & BattleCapabilityDeployment)) ||
+        slot < 0 || slot >= 250) return false;
+    int actualPerson = -1, camp = -1;
+    BYTE visibility = 0, coordinates[2] = {};
+    const uintptr_t unit = gLayout.unitBase + static_cast<uintptr_t>(slot) * kUnitStride;
+    return UnitPersonId(slot, actualPerson) && actualPerson == personId &&
+        UnitCamp(slot, camp) && camp == 0 && ReadBytes(unit + 0x0C, &visibility, 1) &&
+        visibility == 2 && ReadBytes(unit + 6, coordinates, sizeof(coordinates)) &&
+        coordinates[0] != 255 && coordinates[1] != 255 && AddCurrentParticipantUnlocked(personId, slot);
+}
+
+void MarkRosterCampUnlocked(int personId, int camp) {
+    if (!gRosterAvailable) return;
+    BattleRosterEntry* entry = FindRosterUnlocked(personId);
+    if (!entry || camp < 0) return;
+    const bool changed = entry->lastCamp != camp || (camp != 0 && entry->tracking);
+    entry->lastCamp = camp;
+    if (camp != 0 && entry->tracking) {
+        entry->changedFaction = true;
+        entry->tracking = false;
+    }
+    if (changed) TraceLedgerUnlocked(L"roster-camp", L"confirmed-unit-camp");
+}
+
+void ObserveSlotCampUnlocked(int slot) {
+    int personId = -1, camp = -1;
+    if (UnitPersonId(slot, personId) && UnitCamp(slot, camp))
+        MarkRosterCampUnlocked(personId, camp);
+}
+
+bool CampaignTrackableUnlocked(int personId, int slot) {
+    if (!gRosterAvailable) return false;
+    BattleRosterEntry* entry = FindRosterUnlocked(personId);
+    if (!entry) return false;
+    if (!entry->joined || !entry->tracking || entry->changedFaction) return false;
+    int camp = -1;
+    if (!UnitCamp(slot, camp) || camp != 0) {
+        if (camp >= 0) MarkRosterCampUnlocked(personId, camp);
+        return false;
+    }
+    return true;
+}
+
+bool CurrentTrackableUnlocked(int personId, int slot) {
+    int camp = -1;
+    if (!gActive || !UnitCamp(slot, camp) || camp != 0) return false;
+    const BattleRosterEntry* roster = FindRosterUnlocked(personId);
+    if (roster && (!roster->tracking || roster->changedFaction)) return false;
+    return IsCurrentParticipantUnlocked(personId) || ConfirmEventParticipantUnlocked(personId, slot);
+}
+
+void AddTotalsValueUnlocked(BattleUnitTotals& totals,
+    long long BattleUnitTotals::* metric, long long amount) {
+    long long& value = totals.*metric;
+    value = amount > (std::numeric_limits<long long>::max)() - value ?
+        (std::numeric_limits<long long>::max)() : value + amount;
+}
+
 void AddMetricUnlocked(int slot, long long BattleUnitTotals::* metric,
     long long amount, uint32_t known) {
     if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     int personId = -1;
     if (amount <= 0 || !UnitPersonId(slot, personId)) return;
-    BattleUnitTotals* local = &TotalsForPersonUnlocked(gTotals, personId, slot);
-    BattleUnitTotals* campaign = &TotalsForPersonUnlocked(gCampaignTotals, personId, slot);
-    for (auto* totals : {local, campaign}) {
-        long long& value = totals->*metric;
-        value = amount > (std::numeric_limits<long long>::max)() - value ?
-            (std::numeric_limits<long long>::max)() : value + amount;
-    }
-    gKnownMetrics |= known;
+    const bool local = CurrentTrackableUnlocked(personId, slot);
+    const bool campaign = CampaignTrackableUnlocked(personId, slot);
+    if (local) AddTotalsValueUnlocked(TotalsForPersonUnlocked(gTotals, personId, slot), metric, amount);
+    if (campaign) AddTotalsValueUnlocked(TotalsForPersonUnlocked(gCampaignTotals, personId, slot), metric, amount);
+    if (local || campaign) gKnownMetrics |= known;
 }
 
 void AddDefeatUnlocked(int slot) {
     if (InterlockedCompareExchange(&gStatsDetaching,FALSE,FALSE)!=FALSE) return;
     int personId = -1;
     if (!UnitPersonId(slot, personId)) return;
-    BattleUnitTotals* local = &TotalsForPersonUnlocked(gTotals, personId, slot);
-    BattleUnitTotals* campaign = &TotalsForPersonUnlocked(gCampaignTotals, personId, slot);
-    for (auto* totals : {local, campaign}) {
-        int& value = totals->defeatedEnemies;
+    const bool local = CurrentTrackableUnlocked(personId, slot);
+    const bool campaign = CampaignTrackableUnlocked(personId, slot);
+    if (local) {
+        int& value = TotalsForPersonUnlocked(gTotals, personId, slot).defeatedEnemies;
         if (value < INT_MAX) ++value;
     }
-    gKnownMetrics |= BattleStatsDefeatedEnemies;
+    if (campaign) {
+        int& value = TotalsForPersonUnlocked(gCampaignTotals, personId, slot).defeatedEnemies;
+        if (value < INT_MAX) ++value;
+    }
+    if (local || campaign) gKnownMetrics |= BattleStatsDefeatedEnemies;
 }
 
 bool ResolvePhysicalSettlement(uintptr_t callerFrame, int targetSlot, int& actorSlot) {
@@ -1011,11 +1120,14 @@ void TraceLedgerUnlocked(const wchar_t* stage, const wchar_t* reason = L"") noex
         state.battleInstance = gBattleInstance;
         state.knownMetrics = gKnownMetrics;
         state.historyIncomplete = gHistoryIncomplete;
+        state.rosterHistoryIncomplete = gRosterHistoryIncomplete;
         state.active = gActive;
         state.elapsedMilliseconds = ElapsedUnlocked(GetTickCount64());
         state.scenario = gScenario;
         for (const auto& pair : gTotals) state.units.push_back(pair.second);
         for (const auto& pair : gCampaignTotals) state.campaignUnits.push_back(pair.second);
+        for (const auto& pair : gCampaignRoster) state.campaignRoster.push_back(pair.second);
+        state.currentBattleParticipants.assign(gCurrentBattleParticipants.begin(), gCurrentBattleParticipants.end());
         RecordStatsDiagnostic(0, stage, L"", &state, reason);
     } catch (...) {}
 }
@@ -1024,6 +1136,9 @@ void ClearTotalsUnlocked(const wchar_t* reason = L"model-initialization") {
     TraceLedgerUnlocked(L"reset_before", reason);
     gTotals.clear();
     gCampaignTotals.clear();
+    gCampaignRoster.clear();
+    gCurrentBattleParticipants.clear();
+    gRosterHistoryIncomplete = false;
     gLabels.clear();
     ++gDodgeGeneration;
     gPhysicalAction = PhysicalActionState();
@@ -1055,6 +1170,7 @@ void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int old
     if (validTarget) {
         ScopedStatsLock lock;
         if (gActive && !gLoading) {
+            ObserveSlotCampUnlocked(targetSlot);
             if (finalHp > oldHp && targetCamp == 0) {
                 AddMetricUnlocked(targetSlot, &BattleUnitTotals::recoveryDone,
                     static_cast<long long>(finalHp) - oldHp, BattleStatsRecovery);
@@ -1063,6 +1179,7 @@ void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int old
                 int actorCamp = -1;
                 if (ResolveSettlementActor(kind, callerFrame, targetSlot, actorSlot) &&
                     UnitCamp(actorSlot, actorCamp)) {
+                    ObserveSlotCampUnlocked(actorSlot);
                     const long long damage = static_cast<long long>(oldHp) - finalHp;
                     if (actorCamp == 0) {
                         AddMetricUnlocked(actorSlot, &BattleUnitTotals::damageDealt,
@@ -1096,7 +1213,7 @@ bool ReadPhysicalEvent(uintptr_t context, uint32_t comboOffset, bool requireTarg
     targetSlot = requireTarget ? target : -1;
     ordinal = combo;
     int camp = -1;
-    return UnitCamp(actorSlot, camp) && camp == 0;
+    return UnitCamp(actorSlot, camp);
 }
 
 void RecordPhysicalResultStart(uintptr_t context) {
@@ -1111,6 +1228,7 @@ void RecordPhysicalResultStart(uintptr_t context) {
     if (valid) {
         ScopedStatsLock lock;
         if (gActive && !gLoading) {
+            ObserveSlotCampUnlocked(actorSlot);
             if (!ordinal) {
                 gPhysicalAction = PhysicalActionState();
                 gPhysicalAction.context = context;
@@ -1142,6 +1260,10 @@ void RecordCriticalCommit(uintptr_t context) {
         actorSlot, targetSlot, ordinal);
     if (valid) {
         ScopedStatsLock lock;
+        if (!gLoading) {
+            ObserveSlotCampUnlocked(actorSlot);
+            ObserveSlotCampUnlocked(targetSlot);
+        }
         if (gActive && !gLoading && gCriticalAvailable && gPhysicalAction.context == context &&
             gPhysicalAction.actorSlot == actorSlot && gPhysicalAction.serial) {
             const unsigned key = (ordinal << 8) | static_cast<unsigned>(targetSlot);
@@ -1170,9 +1292,14 @@ void RecordBlockResult(BlockKind kind, int attackerSlot, int targetSlot) {
     const bool valid = attackerSlot >= 0 && attackerSlot < static_cast<int>(kUnitCount) &&
         targetSlot >= 0 && targetSlot < static_cast<int>(kUnitCount) &&
         UnitCamp(attackerSlot, attackerCamp) && UnitCamp(targetSlot, targetCamp);
-    if (valid && attackerCamp >= 2 && targetCamp == 0) {
+    if (valid) {
         ScopedStatsLock lock;
-        if (gActive && !gLoading && ((kind == BlockAttack && gAttackBlockAvailable) ||
+        if (!gLoading) {
+            ObserveSlotCampUnlocked(attackerSlot);
+            ObserveSlotCampUnlocked(targetSlot);
+        }
+        if (attackerCamp >= 2 && targetCamp == 0 && gActive && !gLoading &&
+            ((kind == BlockAttack && gAttackBlockAvailable) ||
             (kind == BlockSpell && gSpellBlockAvailable))) {
             if (kind == BlockAttack)
                 AddMetricUnlocked(targetSlot, &BattleUnitTotals::attackBlockCount,
@@ -1300,7 +1427,11 @@ void BeginHitObservation(NativeHitSnapshot& snapshot, HitObservation& observatio
         UnitCamp(observation.targetSlot,targetCamp) && targetCamp == 0 &&
         UnitPersonId(observation.targetSlot,observation.personId);
     {
-        ScopedStatsLock lock(false);
+        ScopedStatsLock lock;
+        if (!gLoading) {
+            ObserveSlotCampUnlocked(observation.actorSlot);
+            ObserveSlotCampUnlocked(observation.targetSlot);
+        }
         observation.generation = gDodgeGeneration;
         observation.eligible = observation.eligible && gActive && !gLoading &&
             (observation.strategy ? gSpellBlockAvailable : gAttackBlockAvailable);
@@ -1838,30 +1969,38 @@ void InitializeBattleStats(const wchar_t* gameRoot) {
     InstallResolvedBattleStats(image,resolved);
 }
 
-void PollBattleStats(ULONGLONG now) {
-    if (gRoot.empty() || now - gLastPoll < 250) return;
-    gLastPoll = now;
-    BattleSnapshot current;
-    if (!ReadBattleSnapshot(current)) return;
-    ScopedStatsLock lock;
-    if (gLoading) {
-        lock.Unlock();
-        return;
-    }
+static void ObserveBattleStatsSnapshotUnlocked(const BattleSnapshot& current) {
+    // R scenes retain stale S tactical rows. Only the authoritative runtime
+    // person table may report R camp changes after a successful rejoin.
+    if (gLoading || !gActive) return;
+    gDeploymentAvailable = (current.capabilities & BattleCapabilityDeployment) != 0;
     for (const BattleUnitSnapshot& unit : current.units) {
         int currentPerson = -1;
-        if (unit.camp != 0 || unit.dataId < 0 || unit.dataId >= 0xFFFF ||
+        if (unit.dataId < 0 || unit.dataId >= 0xFFFF ||
             !UnitPersonId(unit.slot, currentPerson) || currentPerson != unit.dataId) continue;
+        MarkRosterCampUnlocked(unit.dataId, unit.camp);
+        if (unit.camp != 0) continue;
         const std::wstring label = unit.name.empty() ?
             L"我方角色 " + std::to_wstring(unit.dataId) : unit.name;
-        gLabels[unit.dataId] = label;
+        SetObservedLabelUnlocked(unit.dataId, label);
+        if (BattleRosterEntry* roster = FindRosterUnlocked(unit.dataId)) {
+            if (roster->tracking && gCampaignTotals.find(unit.dataId) == gCampaignTotals.end())
+                TotalsForPersonUnlocked(gCampaignTotals, unit.dataId, unit.slot).label = label;
+        }
+        // The runtime resolver must verify the native status-2 deployment
+        // consumers before this byte can establish battlefield membership.
+        // Keep an established person in the set after retreat or death.
+        if (gActive && (current.capabilities & BattleCapabilityDeployment) &&
+            unit.visibility == 2 && unit.slot >= 0 && unit.slot < 250 &&
+            unit.x >= 0 && unit.x < 255 && unit.y >= 0 && unit.y < 255) {
+            AddCurrentParticipantUnlocked(unit.dataId, unit.slot);
+            gTotals.find(unit.dataId)->second.label = label;
+        }
         for (auto* ledger : {&gTotals, &gCampaignTotals}) {
             const auto found = ledger->find(unit.dataId);
             if (found != ledger->end()) {
                 found->second.label = label;
                 found->second.slot = unit.slot;
-            } else if (gActive && unit.visibility == 2) {
-                TotalsForPersonUnlocked(*ledger, unit.dataId, unit.slot).label = label;
             }
         }
     }
@@ -1869,7 +2008,15 @@ void PollBattleStats(ULONGLONG now) {
         TraceLedgerUnlocked(L"scene_ready");
         gAwaitingSceneReady = false;
     }
-    lock.Unlock();
+}
+
+void PollBattleStats(ULONGLONG now) {
+    if (gRoot.empty() || now - gLastPoll < 250) return;
+    gLastPoll = now;
+    BattleSnapshot current;
+    if (!ReadBattleSnapshot(current)) return;
+    ScopedStatsLock lock;
+    ObserveBattleStatsSnapshotUnlocked(current);
 }
 
 void SetBattleStatsLoading(bool loading) {
@@ -1912,6 +2059,7 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
     if (startsInstance) {
         TraceLedgerUnlocked(L"new-battle-before", L"confirmed-scenario-instance");
         gTotals.clear();
+        gCurrentBattleParticipants.clear();
         gElapsed = 0;
         gRecordExported = false;
         ++gBattleInstance;
@@ -1923,6 +2071,17 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
         swprintf_s(scenario, L"S_%02d.eex", ordinal >> 1);
         gScenario = scenario;
     }
+    if (!isBattle) {
+        // R scenes are campaign/menu scenes. Never expose the previous S
+        // ledger as the current battlefield while retaining campaign totals.
+        gTotals.clear();
+        gCurrentBattleParticipants.clear();
+        gElapsed = 0;
+        gRecordExported = false;
+        wchar_t scenario[32] = {};
+        swprintf_s(scenario, L"R_%02d.eex", ordinal >> 1);
+        gScenario = scenario;
+    }
     gScenarioOrdinal = ordinal;
     gActive = isBattle;
     gStarted = isBattle ? now : 0;
@@ -1931,6 +2090,96 @@ void NotifyBattleStatsScenarioInstalled(int ordinal, bool newCampaign,
     TraceLedgerUnlocked(startsInstance ? L"new-battle-after" : L"scenario_installed",
         newCampaign ? L"new-game" : L"confirmed-scenario-install");
     lock.Unlock();
+}
+
+void NotifyBattleRosterJoined(int personId, int scenarioOrdinal,
+    size_t commandOrdinal, ULONGLONG now) {
+    (void)now;
+    if (personId < 0 || personId >= 1024 || commandOrdinal >= 0xFFFFFFFFu || scenarioOrdinal < 0 ||
+        (scenarioOrdinal & 1) != 0) return;
+    ScopedStatsLock lock;
+    if (!gRosterAvailable || gLoading || gScenarioOrdinal != scenarioOrdinal) return;
+    auto roster = gCampaignRoster.find(personId);
+    auto ledger = gCampaignTotals.find(personId);
+    const bool duplicate = roster != gCampaignRoster.end() && roster->second.joined &&
+        roster->second.tracking && !roster->second.changedFaction &&
+        roster->second.source == BattleRosterSource::RuntimeJoin3B;
+    if (duplicate && ledger != gCampaignTotals.end()) return;
+    BattleRosterEntry entry = roster == gCampaignRoster.end() ? BattleRosterEntry() : roster->second;
+    if (!duplicate) {
+        entry.personId = personId;
+        entry.joined = entry.tracking = true;
+        entry.changedFaction = false;
+        entry.lastCamp = 0;
+        entry.joinScenarioOrdinal = scenarioOrdinal;
+        entry.joinCommandOrdinal = static_cast<uint32_t>(commandOrdinal);
+        entry.source = BattleRosterSource::RuntimeJoin3B;
+    }
+    const auto label = gLabels.find(personId);
+    if (label != gLabels.end()) entry.label = label->second;
+    if (entry.label.empty()) entry.label = L"我方角色 " + std::to_wstring(personId);
+    BattleUnitTotals total = ledger == gCampaignTotals.end() ? BattleUnitTotals() : ledger->second;
+    total.personId = personId;
+    total.label = entry.label;
+    // All strings are prepared first. If allocating a new map node fails,
+    // neither an orphan roster nor an orphan campaign row may survive.
+    bool insertedLedger = false;
+    if (ledger == gCampaignTotals.end()) {
+        ledger = gCampaignTotals.emplace(personId, std::move(total)).first;
+        insertedLedger = true;
+    }
+    try {
+        if (roster == gCampaignRoster.end())
+            gCampaignRoster.emplace(personId, std::move(entry));
+        else roster->second = std::move(entry);
+    } catch (...) {
+        if (insertedLedger) gCampaignTotals.erase(ledger);
+        throw;
+    }
+    if (!insertedLedger) ledger->second = std::move(total);
+    TraceLedgerUnlocked(L"roster-join", L"successful-runtime-3B");
+    lock.Unlock();
+}
+
+void SetBattleRosterCapability(bool available, const wchar_t* reason) {
+    ScopedStatsLock lock;
+    const bool changed = gRosterAvailable != available;
+    gRosterAvailable = available;
+    if (!available && reason && *reason) gStatus = reason;
+    if (changed) TraceLedgerUnlocked(available ? L"roster-capability-ready" :
+        L"roster-capability-unavailable", reason ? reason : L"");
+}
+
+bool ReadBattleRosterTrackingIds(std::vector<int>& personIds) {
+    personIds.clear();
+    ScopedStatsLock lock(false);
+    if (!gRosterAvailable || gLoading) return false;
+    personIds.reserve(gCampaignRoster.size());
+    for (const auto& pair : gCampaignRoster) {
+        const BattleRosterEntry& entry = pair.second;
+        if (entry.joined && entry.tracking && !entry.changedFaction)
+            personIds.push_back(pair.first);
+    }
+    return true;
+}
+
+void NotifyBattleRosterCamp(int personId, int camp, ULONGLONG now) {
+    (void)now;
+    if (personId < 0 || personId >= 0xFFFF || camp < 0 || camp > 255) return;
+    ScopedStatsLock lock;
+    if (gLoading) return;
+    MarkRosterCampUnlocked(personId, camp);
+    lock.Unlock();
+}
+
+void NotifyBattleRosterLabel(int personId, const std::wstring& label) {
+    if (personId < 0 || personId >= 1024 || label.empty() || label.size() > 256) return;
+    for (wchar_t ch : label) if (ch < 0x20) return;
+    ScopedStatsLock lock;
+    if (gLoading) return;
+    BattleRosterEntry* entry = FindRosterUnlocked(personId);
+    if (!entry || !entry->joined) return;
+    SetObservedLabelUnlocked(personId, label);
 }
 
 void SetBattleStatsStatus(const std::wstring& status, bool historyIncomplete) {
@@ -1969,11 +2218,10 @@ void ResetBattleStatsForLoadedScenario(const wchar_t* reason, int ordinal) noexc
     // prevent the empty replacement from recording the newly loaded battle.
     try {
         gStatus=L"该存档历史统计无法恢复，从此次载入后继续记录。";
-        if (gActive) {
-            wchar_t scenario[32]={};
-            swprintf_s(scenario,L"S_%02d.eex",gScenarioOrdinal>>1);
-            gScenario=scenario;
-        }
+        wchar_t scenario[32]={};
+        swprintf_s(scenario, gActive ? L"S_%02d.eex" : L"R_%02d.eex",
+            gScenarioOrdinal >= 0 ? gScenarioOrdinal >> 1 : 0);
+        gScenario=scenario;
     } catch (...) {}
     TraceLedgerUnlocked(L"loaded-scenario-fallback",reason);
     lock.Unlock();
@@ -1989,6 +2237,8 @@ void ShutdownBattleStats() {
     gAttackBlockAvailable = false;
     gSpellBlockAvailable = false;
     gPhysicalReceivedAvailable = gStrategyReceivedAvailable = false;
+    gRosterAvailable = false;
+    gDeploymentAvailable = false;
     ClearTotalsUnlocked(L"shutdown");
     if (InterlockedCompareExchange(&gNativeHitActive,0,0)!=0 ||
         InterlockedCompareExchange(&gRecording,FALSE,FALSE)!=FALSE ||
@@ -2030,6 +2280,10 @@ bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
     snapshot.battleInstance = gBattleInstance;
     snapshot.knownMetrics = gKnownMetrics | AvailableMetricsUnlocked();
     snapshot.historyIncomplete = gHistoryIncomplete;
+    snapshot.rosterHistoryIncomplete = gRosterHistoryIncomplete;
+    snapshot.rosterAvailable = gRosterAvailable;
+    snapshot.scenarioIsR = !gActive && gScenarioOrdinal >= 0 &&
+        (gScenarioOrdinal & 1) == 0;
     snapshot.elapsedMilliseconds = ElapsedUnlocked(GetTickCount64());
     snapshot.scenario = gScenario;
     snapshot.status = gStatus;
@@ -2037,6 +2291,10 @@ bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
     for (const auto& pair : gTotals) snapshot.units.push_back(pair.second);
     snapshot.campaignUnits.reserve(gCampaignTotals.size());
     for (const auto& pair : gCampaignTotals) snapshot.campaignUnits.push_back(pair.second);
+    snapshot.currentBattleParticipants.assign(gCurrentBattleParticipants.begin(),
+        gCurrentBattleParticipants.end());
+    snapshot.campaignRoster.reserve(gCampaignRoster.size());
+    for (const auto& pair : gCampaignRoster) snapshot.campaignRoster.push_back(pair.second);
     lock.Unlock();
     std::sort(snapshot.units.begin(), snapshot.units.end(), [](const BattleUnitTotals& left,
         const BattleUnitTotals& right) { return left.personId < right.personId; });
@@ -2051,6 +2309,7 @@ bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now) {
     state.battleInstance = gBattleInstance;
     state.knownMetrics = gKnownMetrics | AvailableMetricsUnlocked();
     state.historyIncomplete = gHistoryIncomplete;
+    state.rosterHistoryIncomplete = gRosterHistoryIncomplete;
     state.status = gStatus;
     state.active = gActive;
     state.elapsedMilliseconds = ElapsedUnlocked(now);
@@ -2059,6 +2318,10 @@ bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now) {
     for (const auto& pair : gTotals) state.units.push_back(pair.second);
     state.campaignUnits.reserve(gCampaignTotals.size());
     for (const auto& pair : gCampaignTotals) state.campaignUnits.push_back(pair.second);
+    state.currentBattleParticipants.assign(gCurrentBattleParticipants.begin(),
+        gCurrentBattleParticipants.end());
+    state.campaignRoster.reserve(gCampaignRoster.size());
+    for (const auto& pair : gCampaignRoster) state.campaignRoster.push_back(pair.second);
     lock.Unlock();
     std::sort(state.units.begin(), state.units.end(), [](const BattleUnitTotals& left,
         const BattleUnitTotals& right) { return left.personId < right.personId; });
@@ -2066,16 +2329,22 @@ bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now) {
 }
 
 bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG now) {
-    if ((state.schemaVersion != 1 && state.schemaVersion != 2 && state.schemaVersion != 3) ||
+    if ((state.schemaVersion != 1 && state.schemaVersion != 2 && state.schemaVersion != 3 &&
+        state.schemaVersion != 4) || state.campaignRoster.size() > 0xFFFF ||
+        state.currentBattleParticipants.size() > kUnitCount ||
         state.units.size() > kUnitCount || state.campaignUnits.size() > 0xFFFF ||
         state.scenario.size() > 1024 || state.status.size() > 4096 ||
-        state.scenarioOrdinal < -1 || state.scenarioOrdinal >= 0xFFFF) return false;
+        state.scenarioOrdinal < -1 || state.scenarioOrdinal >= 0xFFFF ||
+        !ValidateBattleStatsRosterState(state)) return false;
     uintptr_t legacyUnitBase = 0;
+    std::wstring gameRoot;
     {
         ScopedStatsLock lock(false);
         legacyUnitBase = gLayout.unitBase;
+        gameRoot = gRoot;
     }
     std::map<int, BattleUnitTotals> restored, campaign;
+    std::map<int, BattleRosterEntry> roster;
     const bool legacy = state.schemaVersion == 1;
     auto readLedger = [&](const std::vector<BattleUnitTotals>& source,
         std::map<int, BattleUnitTotals>& target) {
@@ -2109,17 +2378,82 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
         return false;
     }
     if (legacy) campaign = restored;
+    for (const BattleRosterEntry& item : state.campaignRoster) {
+        if (item.personId < 0 || item.personId >= 0xFFFF || roster.count(item.personId) ||
+            item.label.size() > 256 || item.lastCamp < -1 || item.lastCamp > 255)
+            return false;
+        roster.emplace(item.personId, item);
+    }
+    // Only legacy formats may infer membership. A schema-4 save is an exact
+    // execution ledger and must never gain rows merely because a script has
+    // an unexecuted 0x3B branch.
+    std::set<int> participants;
+    if (state.schemaVersion < 4) {
+        for (const auto& pair : campaign) {
+            BattleRosterEntry item;
+            item.personId = pair.first;
+            item.label = pair.second.label;
+            item.joined = true;
+            item.tracking = true;
+            item.lastCamp = 0;
+            item.source = BattleRosterSource::ExistingCampaignLedger;
+            roster.emplace(item.personId, std::move(item));
+        }
+        if (state.scenarioOrdinal >= 0 && !gameRoot.empty()) {
+            wchar_t filename[40] = {};
+            swprintf_s(filename, L"\\RS\\R_%02d.eex", state.scenarioOrdinal >> 1);
+            std::vector<int> candidates;
+            std::wstring diagnostics;
+            if (ExtractScenarioJoinCandidates(gameRoot + filename, candidates, diagnostics)) {
+                for (int personId : candidates) {
+                    if (roster.count(personId)) continue;
+                    BattleRosterEntry item;
+                    item.personId = personId;
+                    item.label = L"我方角色 " + std::to_wstring(personId);
+                    item.joined = item.tracking = true;
+                    item.lastCamp = 0;
+                    item.joinScenarioOrdinal = state.scenarioOrdinal & ~1;
+                    item.source = BattleRosterSource::LegacyStaticR;
+                    BattleUnitTotals total;
+                    total.personId = personId;
+                    total.label = item.label;
+                    campaign.emplace(personId, std::move(total));
+                    roster.emplace(personId, std::move(item));
+                }
+            }
+        }
+        if (state.active) {
+            for (const auto& pair : restored) participants.insert(pair.first);
+        } else restored.clear();
+    } else {
+        participants.insert(state.currentBattleParticipants.begin(), state.currentBattleParticipants.end());
+    }
     std::map<int, std::wstring> labels;
     for (const auto& pair : campaign) labels[pair.first] = pair.second.label;
     for (const auto& pair : restored) labels[pair.first] = pair.second.label;
+    // Old ledgers can carry a newer in-battle name than the campaign row.
+    // Normalize display labels before the atomic replacement; counters and
+    // person identities remain unchanged.
+    for (auto& pair : campaign) pair.second.label = labels[pair.first];
+    for (auto& pair : roster) pair.second.label = labels[pair.first];
     std::wstring scenario = state.scenario;
-    std::wstring status = legacy ? L"旧版统计已迁移；此前的全局历史记录不完整。" : state.status;
+    std::wstring status = state.status;
+    if (state.schemaVersion < 4) {
+        const wchar_t* warning = L"旧档加入名单由 R 剧本静态推断，可能包含未执行分支。";
+        if (status.size() + wcslen(warning) + 1 <= 4096) {
+            if (!status.empty()) status += L"\n";
+            status += warning;
+        }
+    }
     // All allocations precede replacement. A failed allocation leaves both
     // live ledgers intact, and every lock releases during stack unwinding.
     ScopedStatsLock lock;
     TraceLedgerUnlocked(L"model_replace_before");
     gTotals = std::move(restored);
     gCampaignTotals = std::move(campaign);
+    gCampaignRoster = std::move(roster);
+    gCurrentBattleParticipants = std::move(participants);
+    gRosterHistoryIncomplete = state.rosterHistoryIncomplete || state.schemaVersion < 4;
     gLabels = std::move(labels);
     ++gDodgeGeneration;
     gPhysicalAction = PhysicalActionState();
@@ -2136,6 +2470,7 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
         BattleStatsPhysicalReceived | BattleStatsStrategyReceived;
     gHistoryIncomplete = state.historyIncomplete || legacy || state.schemaVersion < 3 ||
         (((AvailableMetricsUnlocked() & newMetrics) & ~state.knownMetrics) != 0);
+    gHistoryIncomplete = gHistoryIncomplete || gRosterHistoryIncomplete;
     gStatus = std::move(status);
     gRecordExported = false;
     gAwaitingSceneReady = true;
@@ -2182,7 +2517,7 @@ bool ResolveBattleStatsImageLayoutForTest(const BYTE* image, uintptr_t virtualBa
 }
 
 void InitializeBattleStatsModelForTest(uintptr_t unitBase,
-    uintptr_t strategyBase, unsigned strategyCount) {
+    uintptr_t strategyBase, unsigned strategyCount, const wchar_t* gameRoot) {
     ShutdownBattleStats();
     if (gLayout.recoveryPending) return;
     ScopedStatsLock lock;
@@ -2202,6 +2537,7 @@ void InitializeBattleStatsModelForTest(uintptr_t unitBase,
     gPhysicalReceivedAvailable = gStrategyReceivedAvailable = true;
     InterlockedExchange(&gStatsDetaching,FALSE);
     ClearTotalsUnlocked();
+    if (gameRoot) gRoot = gameRoot;
     lock.Unlock();
 }
 
@@ -2209,6 +2545,11 @@ void SetBattleStatsModelActiveForTest(bool active) {
     ScopedStatsLock lock;
     gActive = active;
     lock.Unlock();
+}
+
+void ObserveBattleStatsSnapshotForTest(const BattleSnapshot& snapshot) {
+    ScopedStatsLock lock;
+    ObserveBattleStatsSnapshotUnlocked(snapshot);
 }
 
 void RecordBattleStatsSettlementForTest(int kind, uintptr_t target,

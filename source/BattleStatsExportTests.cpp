@@ -107,6 +107,14 @@ BattleStatsPersistedState SampleState() {
     unit.physicalReceivedCount = 42;
     unit.strategyReceivedCount = 43;
     state.campaignUnits.push_back(unit);
+    BattleRosterEntry roster;
+    roster.personId = unit.personId;
+    roster.label = unit.label;
+    roster.joined = roster.tracking = true;
+    roster.lastCamp = 0;
+    roster.source = BattleRosterSource::ExistingCampaignLedger;
+    state.campaignRoster.push_back(roster);
+    state.currentBattleParticipants.push_back(unit.personId);
     return state;
 }
 
@@ -168,6 +176,8 @@ void VerifyMigrationAndLoading(const std::wstring& root) {
     BeginCase(root, true);
     auto state = SampleState();
     state.schemaVersion = 2;
+    state.campaignRoster.clear();
+    state.currentBattleParticipants.clear();
     state.knownMetrics = 0xFF;
     Check(RestoreBattleStatsState(state, 1000), "restore schema 2 for production migration export");
     SetBattleStatsLoading(true);
@@ -183,10 +193,10 @@ void VerifyMigrationAndLoading(const std::wstring& root) {
         "old histories retain dodge values, seed received at zero and export incomplete history");
     BattleStatsPersistedState after;
     CaptureBattleStatsState(after, GetTickCount64());
-    Check(after.units.size() == 1 && after.campaignUnits.size() == 1 &&
-        after.units[0].physicalReceivedCount == 0 && after.campaignUnits[0].physicalReceivedCount == 0 &&
-        after.units[0].strategyReceivedCount == 0 && after.campaignUnits[0].strategyReceivedCount == 0,
-        "record export leaves both migrated ledgers intact");
+    Check(after.units.empty() && after.currentBattleParticipants.empty() &&
+        after.campaignUnits.size() == 1 && after.campaignUnits[0].physicalReceivedCount == 0 &&
+        after.campaignUnits[0].strategyReceivedCount == 0,
+        "R scene export clears current participants while preserving migrated campaign totals");
 }
 } // namespace
 

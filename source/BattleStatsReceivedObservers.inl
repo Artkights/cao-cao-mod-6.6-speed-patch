@@ -59,6 +59,10 @@ const ReceivedScope* FindReceivedScope(uintptr_t frame,uintptr_t context,Receive
 }
 void RecordReceivedAttempt(bool strategy,int actorSlot,int targetSlot,uint64_t generation) {
     ScopedStatsLock lock;
+    if (!gLoading) {
+        ObserveSlotCampUnlocked(actorSlot);
+        ObserveSlotCampUnlocked(targetSlot);
+    }
     int actorCamp=-1,targetCamp=-1;
     if (!gActive || gLoading || generation!=gDodgeGeneration ||
         !(strategy ? gStrategyReceivedAvailable : gPhysicalReceivedAvailable) ||

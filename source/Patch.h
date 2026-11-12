@@ -27,7 +27,7 @@ extern uintptr_t gGameBase;
 extern HWND gMainWindow;
 extern HWND gDialog;
 
-bool InitializeEngine();
+bool InitializeEngine(bool allowVersionFallback = false);
 bool ApplyEngineState(const Settings& settings);
 void RestoreEngine();
 void SetNativeToggleHandler(void (__cdecl* handler)());

@@ -1,5 +1,6 @@
 #include "EngineLayout.h"
 #include "InstallCommon.h"
+#include "PeImage.h"
 #include "ResourceIds.h"
 
 #include <stdio.h>
@@ -7,6 +8,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+namespace XiaoAnInstall {
+bool InstallTestRollbackRetry(const std::wstring& root, std::wstring& error);
+}
 
 namespace {
 int failures = 0;
@@ -51,12 +56,22 @@ std::wstring Fixture(const std::wstring& name, const wchar_t* exe, const wchar_t
     return root;
 }
 
-bool Payload(const std::wstring& root, XiaoAnInstall::PackagePayload& payload) {
+bool Payload(const std::wstring& root, XiaoAnInstall::PackagePayload& payload, bool versionFallback = false) {
     std::wstring error;
     EngineDetection engine;
-    if (!DetectEngineProfile(root, engine, error)) return false;
+    if (!(versionFallback ? DetectVersionEngineProfile(root, engine, error) : DetectEngineProfile(root, engine, error))) return false;
     payload.profile = engine.profile;
     payload.expectedExeSha256 = engine.exeSha256;
+    payload.versionFallback = versionFallback;
+    payload.engineVariant = engine.variant.empty() ? L"Standard" : engine.variant;
+    payload.runtimeValidation = engine.requiresRuntimeValidation ? L"Required" : L"NotRequired";
+    payload.status.container = engine.container;
+    payload.status.layout = engine.layoutStatus;
+    payload.status.startup = L"Pending";
+    payload.status.accelerator = L"Pending";
+    payload.status.guide = L"Pending";
+    payload.status.stats = L"Pending";
+    payload.status.detail = engine.evidence;
     const WORD proxy = engine.profile == EngineProfileId::Ccz64 ? IDR_INSTALL_PROXY64 :
         engine.profile == EngineProfileId::Ccz65 ? IDR_INSTALL_PROXY65 : IDR_INSTALL_PROXY;
     return XiaoAnInstall::ReadResourceBytes(installer, proxy, payload.proxy, error) &&
@@ -68,7 +83,7 @@ bool Payload(const std::wstring& root, XiaoAnInstall::PackagePayload& payload) {
 bool Install(const std::wstring& root, const XiaoAnInstall::PackagePayload& payload, std::wstring& error,
     unsigned mask = XiaoAnInstall::FeatureAll) {
     std::wstring detail, report;
-    const auto kind = XiaoAnInstall::DetectTarget(root, detail);
+    const auto kind = XiaoAnInstall::DetectTarget(root, detail, payload.versionFallback, payload.profile);
     return XiaoAnInstall::InstallPatch(root, payload, kind, report, error, mask);
 }
 
@@ -105,69 +120,110 @@ bool ModifiedIdentity(std::vector<unsigned char>& raw) {
     return false;
 }
 
-void ExerciseForcedInstallation(EngineProfileId profile, const wchar_t* exe, const wchar_t* originalAudio) {
+void ExerciseVersionFallback(EngineProfileId profile, const wchar_t* exe, const wchar_t* originalAudio) {
     using namespace XiaoAnInstall;
-    const std::wstring suffix = std::to_wstring(static_cast<unsigned>(profile));
-    const std::wstring root = Fixture(L"forced-" + suffix, exe, originalAudio);
-    PackagePayload payload;
-    std::wstring error, detail, report;
-    if (root.empty() || !Payload(root, payload)) { Check(false, "create forced-install fixture"); return; }
-    const std::wstring audio = JoinPath(root, L"Koeicda.dll");
+    const std::wstring root = Fixture(L"version-fallback-" + std::to_wstring(static_cast<unsigned>(profile)), exe, originalAudio);
+    Check(!root.empty(), "create version-selected fallback fixture");
+    if (root.empty()) return;
     const std::wstring executable = JoinPath(root, L"Ekd5.exe");
-    const std::wstring originalAudioHash = Hash(audio);
-    std::vector<unsigned char> modified = Read(executable);
-    const bool changed = ModifiedIdentity(modified) && Write(executable, modified);
-    EngineDetection automatic, forced;
-    Check(changed && !DetectEngineProfile(root, automatic, error) &&
-        DetectTarget(root, detail) == TargetKind::Invalid && Hash(audio) == originalAudioHash,
-        "modified wait-wrapper identity is rejected by automatic installation without file changes", error);
-    const bool resolved = DetectForcedEngineProfile(root, profile, forced, error);
-    Check(resolved && forced.forced && forced.profile == profile && forced.exeSha256 == Hash(executable) &&
-        !forced.planReport.empty(), "explicit family resolves an auditable forced-install plan", error);
-    if (!resolved) return;
-    payload.forced = true;
-    payload.expectedExeSha256 = forced.exeSha256;
-    const TargetKind kind = DetectTarget(root, detail, profile);
-    Check(kind == TargetKind::Clean && InstallPatch(root, payload, kind, report, error, FeatureAll),
-        "forced installation accepts only the explicitly selected family and matching executable fingerprint", error);
-    Manifest manifest;
+    auto raw = Read(executable);
     const std::wstring privateRoot = PatchPrivatePath(root, profile);
+    const std::wstring config = JoinPath(privateRoot, L"pl_06.ini");
+    const std::wstring features = JoinPath(privateRoot, L"features.ini");
+    const std::wstring guide = JoinPath(privateRoot, L"guide-ui.ini");
+    const std::vector<unsigned char> configSentinel = {'p','r','e','-','c','o','n','f','i','g'};
+    const std::vector<unsigned char> userSentinel = {'k','e','e','p'};
+    Check(ModifiedIdentity(raw) && Write(executable, raw) && Write(config, configSentinel) &&
+        Write(features, configSentinel) && Write(guide, configSentinel) &&
+        Write(JoinPath(privateRoot, L"backup\\unrelated.dat"), userSentinel),
+        "change the signature and seed existing private configuration and backup data");
+    const std::wstring exeHash = Hash(executable);
+    const std::wstring audioHash = Hash(JoinPath(root, L"Koeicda.dll"));
+    std::wstring error, detail, report;
+    EngineDetection automatic;
+    Check(!DetectEngineProfile(root, automatic, error) && DetectTarget(root, detail) == TargetKind::Invalid &&
+        DetectTarget(root, detail, true, profile) == TargetKind::Clean,
+        "explicit version fallback accepts a version-matching layout rejected by automatic scanning", error);
+    PackagePayload payload;
+    Check(Payload(root, payload, true) && payload.profile == profile,
+        "version resources select the matching embedded payload", error);
+    const bool installed = !payload.proxy.empty() && Install(root, payload, error);
+    Check(installed, "install acknowledged version fallback despite an unmatched signature", error);
+    if (!installed) return;
+    Manifest manifest;
     const std::wstring state = JoinPath(privateRoot, L"feature-state.ini");
-    wchar_t mode[32] = {}, stateExe[80] = {};
-    GetPrivateProfileStringW(L"Install", L"EngineMode", L"", mode, static_cast<DWORD>(_countof(mode)), state.c_str());
-    GetPrivateProfileStringW(L"Install", L"ExecutableSha256", L"", stateExe, static_cast<DWORD>(_countof(stateExe)), state.c_str());
-    Check(LoadManifest(root, manifest, error) && manifest.forced && manifest.profile == profile &&
-        manifest.executableSha256 == forced.exeSha256 && manifest.planSha256.size() == 64 &&
-        manifest.planSha256 == Hash(JoinPath(privateRoot, L"engine-plan.txt")) &&
-        !_wcsicmp(mode, L"Forced") && !_wcsicmp(stateExe, forced.exeSha256.c_str()) &&
-        GetPrivateProfileIntW(L"Install", L"EngineProfile", 0, state.c_str()) == static_cast<unsigned>(profile) &&
-        Read(executable) == modified,
-        "forced manifest and runtime state retain family, executable and plan hashes without modifying the executable", error);
-    Check(RestorePatch(root, report, error, true) && Hash(audio) == originalAudioHash &&
-        Read(executable) == modified && !FileExists(ManifestPath(root, profile)) &&
-        !FileExists(JoinPath(root, L"Koeicda_org.dll")) && !FileExists(JoinPath(root, L"GearNtKe.dll")),
-        "forced uninstall restores the original DLL baseline and leaves the executable byte-identical", error);
+    wchar_t mode[64] = {};
+    GetPrivateProfileStringW(L"Install", L"EngineMode", L"", mode, _countof(mode), state.c_str());
+    Check(LoadManifest(root, manifest, error) && manifest.versionFallback && !manifest.forced &&
+        manifest.versionSnapshots.size() == 7 && manifest.restoreVersionConfigs && !wcscmp(mode, L"VersionFallback") &&
+        Hash(executable) == exeHash && Hash(JoinPath(root, manifest.versionSnapshots[0].backup)) == exeHash &&
+        Read(JoinPath(root, manifest.versionSnapshots[1].backup)) == configSentinel,
+        "persist version authorization and verified pre-write executable and configuration snapshots", error);
+    const auto firstSnapshots = manifest.versionSnapshots;
+    Check(RestorePatch(root, report, error, true, FeatureGuide) && Install(root, payload, error) &&
+        LoadManifest(root, manifest, error) && manifest.versionFallback &&
+        manifest.versionSnapshots[0].backup == firstSnapshots[0].backup,
+        "partial uninstall and fallback update preserve the first snapshot", error);
+    Check(RestorePatch(root, report, error, true) && Hash(executable) == exeHash &&
+        Hash(JoinPath(root, L"Koeicda.dll")) == audioHash && Read(config) == configSentinel &&
+        Read(features) == configSentinel && Read(guide) == configSentinel &&
+        Read(JoinPath(privateRoot, L"backup\\unrelated.dat")) == userSentinel &&
+        !FileExists(ManifestPath(root, profile)),
+        "fallback uninstall restores original DLL and existing configuration without touching executable or user backups", error);
+}
 
-    EngineDetection rejected;
-    Check(!DetectForcedEngineProfile(root, EngineProfileId::Unknown, rejected, error),
-        "forced detection rejects an unspecified template family", error);
-    const std::wstring boundary = Fixture(L"forced-boundary-" + suffix, exe, originalAudio);
-    if (boundary.empty()) { Check(false, "create forced boundary fixture"); return; }
-    const std::wstring boundaryExe = JoinPath(boundary, L"Ekd5.exe");
-    std::vector<unsigned char> shortImage(64, 0);
-    Check(Write(boundaryExe, shortImage) && !DetectForcedEngineProfile(boundary, profile, rejected, error) &&
-        DetectTarget(boundary, detail, profile) == TargetKind::Invalid &&
-        Hash(JoinPath(boundary, L"Koeicda.dll")) == originalAudioHash &&
-        !FileExists(ManifestPath(boundary, profile)),
-        "forced mode rejects truncated PE boundaries before creating a manifest or changing DLLs", error);
-    std::vector<unsigned char> nonX86 = Read(exe);
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(nonX86.data());
-    auto nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(nonX86.data() + dos->e_lfanew);
-    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
-    Check(Write(boundaryExe, nonX86) && !DetectForcedEngineProfile(boundary, profile, rejected, error) &&
-        Hash(JoinPath(boundary, L"Koeicda.dll")) == originalAudioHash &&
-        !FileExists(ManifestPath(boundary, profile)),
-        "forced mode rejects non-x86 PE targets without changing the audio baseline", error);
+void ExercisePackedSnapshot(const wchar_t* exe, const wchar_t* originalAudio) {
+    using namespace XiaoAnInstall;
+    const std::wstring root = Fixture(L"packed-auto-recovery", exe, originalAudio);
+    Check(!root.empty(), "create isolated packed-container fixture");
+    if (root.empty()) return;
+    EngineDetection engine;
+    std::wstring error, detail, report;
+    Check(DetectEngineProfile(root, engine, error), "detect packed-snapshot fixture base", error);
+    engine.container = L"Enigma";
+    engine.layoutStatus = L"AutoVerified";
+    engine.packedContainer = true;
+    PackagePayload payload;
+    Check(Payload(root, payload) && payload.profile == engine.profile,
+        "load matching package for packed-container fixture", error);
+    payload.status.container = engine.container;
+    payload.status.layout = engine.layoutStatus;
+    payload.status.startup = L"Pending";
+    payload.expectedExeSha256 = engine.exeSha256;
+    const std::wstring exeHash = Hash(JoinPath(root, L"Ekd5.exe"));
+    {
+        PeFileView lockedImage;
+        const std::wstring exePath = JoinPath(root, L"Ekd5.exe");
+        const bool opened = lockedImage.Open(exePath, error);
+        HANDLE writer = opened ? CreateFileW(exePath.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr) : INVALID_HANDLE_VALUE;
+        Check(opened && writer == INVALID_HANDLE_VALUE,
+            "read-only executable view blocks writers and replacement during final validation", error);
+        if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+    }
+    const TargetKind kind = DetectTarget(root, detail, false, EngineProfileId::Unknown, &engine);
+    const std::wstring executablePath = JoinPath(root, L"Ekd5.exe");
+    const auto executableBytes = Read(executablePath);
+    auto changedExecutable = executableBytes;
+    changedExecutable.push_back(0xA5);
+    const std::wstring audioHash = Hash(JoinPath(root, L"Koeicda.dll"));
+    Check(Write(executablePath, changedExecutable) &&
+        !InstallPatch(root, payload, kind, report, error, FeatureAll, &engine) &&
+        Hash(JoinPath(root, L"Koeicda.dll")) == audioHash && !FileExists(ManifestPath(root, engine.profile)) &&
+        !DirectoryExists(JoinPath(PatchPrivatePath(root, engine.profile), L"backup")),
+        "cached detection cannot authorize commit after the executable changes", error);
+    Check(Write(executablePath, executableBytes), "restore executable fixture after cached-detection conflict");
+    Check(kind == TargetKind::Clean && InstallPatch(root, payload, kind, report, error, FeatureAll, &engine),
+        "install from cached automatic detection while retaining a packed-image recovery snapshot", error);
+    Manifest manifest;
+    Check(LoadManifest(root, manifest, error) && manifest.versionSnapshots.size() == 7 &&
+        manifest.status.container == L"Enigma" && manifest.status.layout == L"AutoVerified" &&
+        manifest.status.startup == L"Pending" &&
+        Hash(JoinPath(root, manifest.versionSnapshots[0].backup)) == exeHash,
+        "record packed metadata and verify the original executable snapshot", error);
+    Check(RestorePatch(root, report, error) && Hash(JoinPath(root, L"Ekd5.exe")) == exeHash,
+        "uninstall packed-container fixture without modifying its executable", error);
 }
 
 void ExerciseFeatureMatrix(EngineProfileId profile, const wchar_t* exe, const wchar_t* originalAudio) {
@@ -242,8 +298,10 @@ void ExerciseFeatureMatrix(EngineProfileId profile, const wchar_t* exe, const wc
         const std::wstring manifest = ManifestPath(historical, profile);
         const bool modified = WritePrivateProfileStringW(L"Install", L"SchemaVersion", L"1", manifest.c_str()) &&
             WritePrivateProfileStringW(L"Install", L"FeatureMask", nullptr, manifest.c_str()) &&
+            WritePrivateProfileStringW(L"Compatibility", nullptr, nullptr, manifest.c_str()) &&
             DeleteFileW(JoinPath(PatchPrivatePath(historical, profile), L"feature-state.ini").c_str());
         Check(modified && LoadManifest(historical, upgraded, error) && upgraded.featureMask == FeatureAll &&
+            upgraded.status.startup == L"Pending" && upgraded.status.accelerator == L"Pending" &&
             Install(historical, historicalPayload, error) && LoadManifest(historical, upgraded, error) &&
             upgraded.schemaVersion == kManifestSchema && upgraded.featureMask == FeatureAll,
             "schema-one installation migrates to an explicit all-feature schema-two manifest", error);
@@ -325,6 +383,21 @@ void ExerciseProfile(EngineProfileId profile, const wchar_t* exe, const wchar_t*
     Manifest first;
     Check(LoadManifest(root, first, error) && first.profile == profile,
           "write a version-specific manifest", error);
+    RuntimeStatus readiness = first.status;
+    readiness.startup = L"LayoutReady";
+    readiness.accelerator = L"Pending";
+    readiness.detail = L"proxy entry not exercised\r\nfeatures remain pending";
+    Check(UpdateRuntimeStatus(root, profile, readiness, error) && LoadManifest(root, first, error) &&
+        first.runtimeValidation == L"NotRequired" && first.status.startup == L"LayoutReady" &&
+        first.status.detail.find(L'\r') == std::wstring::npos && first.status.detail.find(L'\n') == std::wstring::npos,
+        "persist separate readiness metadata without claiming feature success or changing legacy runtime validation", error);
+    Check(WritePrivateProfileStringW(L"Install", L"EngineMode", L"Forced",
+            ManifestPath(root, profile).c_str()) && LoadManifest(root, first, error) && first.forced &&
+        !Install(root, payload, error),
+        "historical forced manifests are readable but cannot be upgraded", error);
+    Check(WritePrivateProfileStringW(L"Install", L"EngineMode", L"Auto",
+            ManifestPath(root, profile).c_str()),
+        "restore automatic mode marker for the remaining transaction checks", error);
     const std::wstring privateRoot = PatchPrivatePath(root, profile);
     const std::wstring configPath = JoinPath(privateRoot, L"pl_06.ini");
     const std::wstring featuresPath = JoinPath(privateRoot, L"features.ini");
@@ -334,13 +407,19 @@ void ExerciseProfile(EngineProfileId profile, const wchar_t* exe, const wchar_t*
     Check(Write(configPath, customConfig) && Write(featuresPath, customFeatures),
           "customize private user configuration");
     const std::wstring backupHash = Hash(JoinPath(root, first.files[0].backup));
+    payload.status.startup = L"Ready";
+    payload.status.accelerator = L"Ready";
+    payload.status.guide = L"Ready";
+    payload.status.stats = L"Ready";
     Check(Install(root, payload, error), "update an installed matching version", error);
     Manifest updated;
     Check(LoadManifest(root, updated, error) && updated.installId == first.installId &&
         Hash(JoinPath(root, updated.files[0].backup)) == backupHash &&
         Read(configPath) == customConfig && Read(featuresPath) == customFeatures &&
-        Read(JoinPath(root, L"patch\\pl_06.ini")) == shared,
-        "update preserves first backup, install identity, and all user configuration", error);
+        Read(JoinPath(root, L"patch\\pl_06.ini")) == shared &&
+        updated.status.startup == L"Pending" && updated.status.accelerator == L"Pending" &&
+        updated.status.guide == L"Pending" && updated.status.stats == L"Pending",
+        "update preserves originals and user settings while invalidating stale runtime readiness", error);
 
     Check(RestorePatch(root, report, error, true, FeatureGuide),
         "partially uninstall the selected guide feature", error);
@@ -496,15 +575,19 @@ int wmain(int argc, wchar_t** argv) {
     installer = LoadLibraryExW(argv[1], nullptr, LOAD_LIBRARY_AS_DATAFILE);
     Check(installer != nullptr, "open installer resources without executing them");
     if (!installer) return 1;
+    std::wstring rollbackError;
+    Check(XiaoAnInstall::InstallTestRollbackRetry(XiaoAnInstall::JoinPath(workspace, L"blocked-rollback"), rollbackError),
+        "blocked rollback preserves original recovery bytes and succeeds after the file lock is released", rollbackError);
     ExerciseProfile(EngineProfileId::Ccz64, argv[2], argv[3], argv[5]);
     ExerciseProfile(EngineProfileId::Ccz65, argv[3], argv[4], argv[5]);
     ExerciseProfile(EngineProfileId::Ccz66, argv[4], argv[3], argv[5]);
     ExerciseFeatureMatrix(EngineProfileId::Ccz64, argv[2], argv[5]);
     ExerciseFeatureMatrix(EngineProfileId::Ccz65, argv[3], argv[5]);
     ExerciseFeatureMatrix(EngineProfileId::Ccz66, argv[4], argv[5]);
-    ExerciseForcedInstallation(EngineProfileId::Ccz64, argv[2], argv[5]);
-    ExerciseForcedInstallation(EngineProfileId::Ccz65, argv[3], argv[5]);
-    ExerciseForcedInstallation(EngineProfileId::Ccz66, argv[4], argv[5]);
+    ExerciseVersionFallback(EngineProfileId::Ccz64, argv[2], argv[5]);
+    ExerciseVersionFallback(EngineProfileId::Ccz65, argv[3], argv[5]);
+    ExerciseVersionFallback(EngineProfileId::Ccz66, argv[4], argv[5]);
+    ExercisePackedSnapshot(argv[4], argv[5]);
     const std::wstring unknown = Fixture(L"unknown-engine", argv[1], argv[4]);
     std::wstring detail;
     Check(!unknown.empty() && XiaoAnInstall::DetectTarget(unknown, detail) == XiaoAnInstall::TargetKind::Invalid &&

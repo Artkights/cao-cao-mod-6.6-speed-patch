@@ -379,6 +379,8 @@ struct ModuleIdentity {
     LONG headerOffset;
 };
 
+bool ReadIdentity(HMODULE module, ModuleIdentity& identity);
+
 struct ModuleCache {
     HMODULE image;
     ModuleIdentity identity;
@@ -390,6 +392,105 @@ struct ModuleCache {
 
 ModuleCache mainCache = {};
 ModuleCache extensionCache = {};
+HMODULE nativeImportsModule = NULL;
+DWORD nativeImportsRva = 0;
+DWORD nativeClockOffsets[2] = {};
+void* nativeClockOriginals[2] = {};
+bool nativeClockExplicit = false;
+
+bool NativeNamedSlot(const BYTE* image, DWORD size, DWORD descriptorRva,
+    const char* library, const char* function, DWORD& slot) {
+    if (!InImage(image, size, descriptorRva, sizeof(IMAGE_IMPORT_DESCRIPTOR))) return false;
+    const auto descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(image + descriptorRva);
+    if (!ImageString(image, size, descriptor->Name) ||
+        _stricmp(reinterpret_cast<const char*>(image + descriptor->Name), library) ||
+        !descriptor->OriginalFirstThunk || !descriptor->FirstThunk) return false;
+    for (DWORD index = 0; index < 4096; ++index) {
+        const DWORD offset = descriptor->OriginalFirstThunk + index * sizeof(DWORD);
+        if (offset < descriptor->OriginalFirstThunk || !InImage(image, size, offset, sizeof(DWORD))) return false;
+        const DWORD name = *reinterpret_cast<const DWORD*>(image + offset);
+        if (!name) return false;
+        if (IMAGE_SNAP_BY_ORDINAL32(name)) continue;
+        if (name > size - sizeof(WORD) || !ImageString(image, size, name + sizeof(WORD))) return false;
+        if (strcmp(reinterpret_cast<const char*>(image + name + sizeof(WORD)), function)) continue;
+        const DWORD displacement = index * sizeof(DWORD);
+        if (displacement > size || descriptor->FirstThunk > size - displacement) return false;
+        slot = descriptor->FirstThunk + displacement;
+        return InImage(image, size, slot, sizeof(DWORD)) &&
+            *reinterpret_cast<const DWORD*>(image + slot) != 0;
+    }
+    return false;
+}
+
+bool NativeClockSlots(HMODULE module, DWORD descriptorRva, DWORD (&slots)[2]) {
+    const BYTE* image = reinterpret_cast<const BYTE*>(module);
+    if (!module || !Readable(image, sizeof(IMAGE_DOS_HEADER))) return false;
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return false;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image + dos->e_lfanew);
+    if (!Readable(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+    const DWORD size = nt->OptionalHeader.SizeOfImage;
+    bool found[2] = {};
+    for (DWORD index = 0; index < 256; ++index) {
+        const DWORD offset = descriptorRva + index * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (offset < descriptorRva || !InImage(image, size, offset, sizeof(IMAGE_IMPORT_DESCRIPTOR))) break;
+        const auto entry = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(image + offset);
+        if (!entry->Name && !entry->FirstThunk && !entry->OriginalFirstThunk) break;
+        if (!found[0]) found[0] = NativeNamedSlot(image, size, offset, "KERNEL32.dll", "GetTickCount", slots[0]);
+        if (!found[1]) found[1] = NativeNamedSlot(image, size, offset, "USER32.dll", "SetTimer", slots[1]);
+        if (found[0] && found[1]) return true;
+    }
+    return false;
+}
+
+bool NativeClockLayoutValid(HMODULE module, DWORD descriptorRva) {
+    DWORD slots[2] = {};
+    return NativeClockSlots(module, descriptorRva, slots);
+}
+
+bool HookNativeClockSlots(HMODULE module, HookRecord* additions, size_t* additionCount) {
+    DWORD slots[2] = {};
+    if (hookCount > maxHooks - 2) return false;
+    if (nativeClockExplicit) {
+        memcpy(slots, nativeClockOffsets, sizeof(slots));
+    } else if (!NativeClockSlots(module, nativeImportsRva, slots)) return false;
+    BYTE* image = reinterpret_cast<BYTE*>(module);
+    void* replacements[] = {reinterpret_cast<void*>(AcceleratedTick), reinterpret_cast<void*>(AcceleratedTimer)};
+    HookRecord pending[2] = {};
+    size_t pendingCount = 0;
+    ModuleIdentity identity = {};
+    if (!ReadIdentity(module, identity)) return false;
+    for (size_t i = 0; i < 2; ++i) {
+        void** slot = reinterpret_cast<void**>(image + slots[i]);
+        if (!InImage(image, identity.imageSize, slots[i], sizeof(void*)) ||
+            !Readable(slot, sizeof(void*))) {
+            for (size_t j = 0; j < pendingCount; ++j)
+                ChangeSlot(pending[j].slot, pending[j].replacement, pending[j].original);
+            return false;
+        }
+        void* observed = *slot;
+        if (observed == replacements[i]) continue;
+        if (nativeClockExplicit && observed != nativeClockOriginals[i]) {
+            for (size_t j = 0; j < pendingCount; ++j)
+                ChangeSlot(pending[j].slot, pending[j].replacement, pending[j].original);
+            return false;
+        }
+        pending[pendingCount] = {module, slot, observed, replacements[i]};
+        if (!ChangeSlot(slot, pending[pendingCount].original, replacements[i])) {
+            for (size_t j = 0; j < pendingCount; ++j)
+                ChangeSlot(pending[j].slot, pending[j].replacement, pending[j].original);
+            return false;
+        }
+        ++pendingCount;
+    }
+    for (size_t i = 0; i < pendingCount; ++i) {
+        hooks[hookCount++] = pending[i];
+        if (additions && additionCount) additions[(*additionCount)++] = pending[i];
+    }
+    return true;
+}
 
 bool ReadIdentity(HMODULE module, ModuleIdentity& identity) {
     BYTE* image = reinterpret_cast<BYTE*>(module);
@@ -485,6 +586,8 @@ bool HookKnownImagesFor(HMODULE main, HMODULE extension) {
     HookRecord additions[maxHooks];
     size_t additionCount = 0;
     bool succeeded = mainCached || HookImage(main, additions, &additionCount);
+    if (succeeded && !mainCached && main == nativeImportsModule && (nativeImportsRva || nativeClockExplicit))
+        succeeded = HookNativeClockSlots(main, additions, &additionCount);
     if (succeeded && extension && !extensionCached)
         succeeded = HookImage(extension, additions, &additionCount);
     if (!succeeded) {
@@ -518,7 +621,69 @@ void RestoreHooks() {
     extensionCache = {};
 }
 
+bool ConfigureNativeImportsCore(HMODULE module, DWORD descriptorRva) {
+    if (!module || !NativeClockLayoutValid(module, descriptorRva)) return false;
+    if (nativeImportsModule == module && nativeImportsRva == descriptorRva) return true;
+    if (intercepting || hookCount) return false;
+    nativeImportsModule = module;
+    nativeImportsRva = descriptorRva;
+    nativeClockExplicit = false;
+    mainCache.valid = false;
+    return true;
+}
+
+bool ConfigureNativeClockSlotsCore(HMODULE module, DWORD tickOffset, DWORD timerOffset,
+    void* tickOriginal, void* timerOriginal) {
+    ModuleIdentity identity = {};
+    if (!module || !ReadIdentity(module, identity) || !tickOriginal || !timerOriginal ||
+        tickOriginal != reinterpret_cast<void*>(realTick) ||
+        timerOriginal != reinterpret_cast<void*>(realTimer) ||
+        tickOffset == timerOffset || tickOffset % sizeof(DWORD) || timerOffset % sizeof(DWORD)) return false;
+    DWORD offsets[2] = {tickOffset, timerOffset};
+    void* originals[2] = {tickOriginal, timerOriginal};
+    const auto image = reinterpret_cast<BYTE*>(module);
+    for (size_t i = 0; i < 2; ++i) {
+        if (!InImage(image, identity.imageSize, offsets[i], sizeof(void*))) return false;
+        const auto slot = reinterpret_cast<void* const*>(image + offsets[i]);
+        if (!Readable(slot, sizeof(void*)) || *slot != originals[i]) return false;
+    }
+    if (intercepting || hookCount) return false;
+    nativeImportsModule = module;
+    nativeImportsRva = 0;
+    memcpy(nativeClockOffsets, offsets, sizeof(offsets));
+    memcpy(nativeClockOriginals, originals, sizeof(originals));
+    nativeClockExplicit = true;
+    mainCache.valid = false;
+    return true;
+}
+
 } // namespace
+
+extern "C" BOOL __cdecl ConfigureNativeImports(HMODULE module, DWORD descriptorRva) {
+    if (!module || module != GetModuleHandleW(NULL) || !EnsureInitialized()) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    AcquireSRWLockExclusive(&hookLock);
+    const bool configured = ConfigureNativeImportsCore(module, descriptorRva);
+    ReleaseSRWLockExclusive(&hookLock);
+    SetLastError(configured ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    return configured ? TRUE : FALSE;
+}
+
+extern "C" BOOL __cdecl ConfigureNativeClockSlots(HMODULE module, DWORD tickOffset,
+    DWORD timerOffset, void* tickOriginal, void* timerOriginal) {
+    if (!module || module != GetModuleHandleW(NULL) || !EnsureInitialized()) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    AcquireSRWLockExclusive(&hookLock);
+    const bool configured = ConfigureNativeClockSlotsCore(module, tickOffset, timerOffset,
+        tickOriginal, timerOriginal);
+    ReleaseSRWLockExclusive(&hookLock);
+    SetLastError(configured ? ERROR_SUCCESS : ERROR_INVALID_DATA);
+    return configured ? TRUE : FALSE;
+}
 
 extern "C" BOOL __cdecl AddProcess(HANDLE process) {
     if (GetProcessId(process) != GetCurrentProcessId()) {
@@ -572,6 +737,11 @@ extern "C" void __cdecl UnIntercept() {
     AcquireSRWLockExclusive(&hookLock);
     RestoreHooks();
     intercepting = false;
+    nativeImportsModule = NULL;
+    nativeImportsRva = 0;
+    nativeClockExplicit = false;
+    memset(nativeClockOffsets, 0, sizeof(nativeClockOffsets));
+    memset(nativeClockOriginals, 0, sizeof(nativeClockOriginals));
     ReleaseSRWLockExclusive(&hookLock);
 }
 

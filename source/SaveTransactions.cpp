@@ -1,6 +1,7 @@
 #include "SaveTransactions.h"
 #include "BattleStatsPersistence.h"
 #include "EngineProfile.h"
+#include "StatsDiagnostics.h"
 #include <algorithm>
 #include <filesystem>
 #include <vector>
@@ -11,21 +12,41 @@
 #include <bcrypt.h>
 
 namespace {
-struct SavedFile { std::wstring path, backup; bool existed = false; };
+enum class JournalState { Prepared, Committed, Restored };
+struct SavedFile {
+    std::wstring path, backup, restore;
+    bool existed = false, backupTouched = false;
+};
 struct Transaction {
+    uint64_t operation = 0;
     bool active = false, failed = false, closed = false;
     bool extensionRequired = false, extensionObserved = false;
     unsigned writes = 0;
     unsigned long long bytes = 0;
-    std::wstring root, temporary, journal, nativeExtension, targetExtension, extensionError;
+    std::wstring root, temporary, journal, journalTemporary, nativeExtension, targetExtension, extensionError;
+    JournalState state = JournalState::Prepared;
     HANDLE rootLock = INVALID_HANDLE_VALUE;
     BattleStatsPersistedState stats;
     std::vector<SavedFile> originals;
 };
+#ifdef XA66_TEST
+int gFault = 0;
+#endif
+void CrashAt(int point) noexcept {
+#ifdef XA66_TEST
+    if (gFault == point) ExitProcess(91);
+#else
+    (void)point;
+#endif
+}
 thread_local Transaction gTransaction;
 thread_local HANDLE gGroupReadLock = INVALID_HANDLE_VALUE;
 volatile LONG gTransactionOwner = 0;
+volatile LONG gRecoveryStatus = static_cast<LONG>(SaveRecoveryStatus::Ready);
 volatile LONG gSequence = 0;
+void SetRecoveryStatus(SaveRecoveryStatus status) noexcept {
+    InterlockedExchange(&gRecoveryStatus, static_cast<LONG>(status));
+}
 struct OwnerGuard {
     bool held = true;
     ~OwnerGuard() { if (held) InterlockedExchange(&gTransactionOwner, 0); }
@@ -37,6 +58,23 @@ struct HandleGuard {
     ~HandleGuard() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
     HANDLE Detach() noexcept { const HANDLE value = handle; handle = INVALID_HANDLE_VALUE; return value; }
 };
+struct SearchGuard {
+    HANDLE handle;
+    explicit SearchGuard(HANDLE value) noexcept : handle(value) {}
+    ~SearchGuard() { if (handle != INVALID_HANDLE_VALUE) FindClose(handle); }
+};
+void Diagnose(const Transaction& t, const wchar_t* stage, const wchar_t* reason = L"",
+    DWORD systemError = ERROR_SUCCESS) noexcept {
+    try {
+        const std::wstring detail = std::wstring(reason) + L" writes=" + std::to_wstring(t.writes) +
+            L" bytes=" + std::to_wstring(t.bytes) + L" closed=" + std::to_wstring(t.closed) +
+            L" failed=" + std::to_wstring(t.failed) + L" extensionRequired=" +
+            std::to_wstring(t.extensionRequired) + L" extensionObserved=" +
+            std::to_wstring(t.extensionObserved) + L" win32=" + std::to_wstring(systemError);
+        const std::wstring& path = t.originals.empty() ? t.root : t.originals.front().path;
+        RecordStatsDiagnostic(t.operation, stage, path, &t.stats, detail);
+    } catch (...) {}
+}
 void SetErrorNoThrow(std::wstring& error, const wchar_t* message) noexcept {
     try { error = message; } catch (...) { error.clear(); }
 }
@@ -114,9 +152,6 @@ bool ValidateNativeExtension(uintptr_t nativeWriter, const std::wstring& path, s
     }
     return true;
 }
-#ifdef XA66_TEST
-int gFault = 0;
-#endif
 bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 bool Flush(const std::wstring& p) {
     HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -148,43 +183,107 @@ HANDLE LockRoot(const std::wstring& root, std::wstring& error) {
         error = L"另一游戏实例正在操作此目录的存档，或事务锁无法打开。请稍后重试。";
     return result;
 }
-bool WriteJournal(const Transaction& t, bool committed) {
-    std::wstring text = L"[Transaction]\r\nCommitted=" + std::to_wstring(committed ? 1 : 0) +
+bool WriteJournal(const Transaction& t, JournalState state) {
+#ifdef XA66_TEST
+    if ((gFault == 10 && state == JournalState::Restored) ||
+        (gFault == 14 && state == JournalState::Committed)) return false;
+#endif
+    const wchar_t* name = state == JournalState::Prepared ? L"Prepared" :
+        state == JournalState::Committed ? L"Committed" : L"Restored";
+    // Legacy readers interpret Committed=1 as cleanup-only. A restored group
+    // must also set this bit before any backup is deleted.
+    std::wstring text = L"[Transaction]\r\nSchemaVersion=2\r\nState=" + std::wstring(name) +
+        L"\r\nCommitted=" + std::to_wstring(state == JournalState::Prepared ? 0 : 1) +
         L"\r\nTemporary=" + t.temporary + L"\r\nCount=" + std::to_wstring(t.originals.size()) + L"\r\n";
     for (size_t i = 0; i < t.originals.size(); ++i) {
         const auto& f = t.originals[i];
         text += L"Path" + std::to_wstring(i) + L"=" + f.path + L"\r\nBackup" + std::to_wstring(i) +
             L"=" + f.backup + L"\r\nExisted" + std::to_wstring(i) + L"=" + std::to_wstring(f.existed ? 1 : 0) + L"\r\n";
     }
-    const std::wstring temp = t.journal + L".tmp";
-    HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    HANDLE h = CreateFileW(t.journalTemporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0; const wchar_t bom = 0xfeff;
     bool ok = WriteFile(h, &bom, 2, &written, nullptr) && written == 2;
     DWORD size = static_cast<DWORD>(text.size() * sizeof(wchar_t));
     ok = ok && WriteFile(h, text.data(), size, &written, nullptr) && written == size && FlushFileBuffers(h);
     ok = CloseHandle(h) != FALSE && ok;
-    return ok && MoveFileExW(temp.c_str(), t.journal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    return ok && MoveFileExW(t.journalTemporary.c_str(), t.journal.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
-bool Restore(const Transaction& t) {
+bool Restore(const Transaction& t) noexcept {
+    // A damaged legacy journal must not restore only the members whose
+    // backups happen to remain. Validate the complete backup set first.
+    for (const auto& f : t.originals) if (f.existed) {
+        const DWORD attributes = GetFileAttributesW(f.backup.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+        HandleGuard backup(CreateFileW(f.backup.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, 0, nullptr));
+        if (backup.handle == INVALID_HANDLE_VALUE) return false;
+    }
     bool ok = true;
+    int index = 0;
     for (const auto& f : t.originals) {
         if (f.existed) {
             // Keep the backup until every member is restored, including on a
             // second crash during recovery. Never rename away the only backup.
-            const std::wstring restore = f.path + L".xa-restore";
-            bool member = CopyFileW(f.backup.c_str(), restore.c_str(), FALSE) && Flush(restore) &&
-                MoveFileExW(restore.c_str(), f.path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            bool member = CopyFileW(f.backup.c_str(), f.restore.c_str(), FALSE) && Flush(f.restore) &&
+                MoveFileExW(f.restore.c_str(), f.path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
             ok = member && ok;
         } else if (!DeleteFileW(f.path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) ok = false;
+        CrashAt(200 + index++);
     }
+    if (ok) CrashAt(21);
     return ok;
 }
-void Cleanup(const Transaction& t) {
-    DeleteFileW(t.temporary.c_str());
-    for (const auto& f : t.originals) { DeleteFileW(f.backup.c_str()); DeleteFileW((f.path + L".xa-restore").c_str()); }
-    DeleteFileW(t.journal.c_str()); DeleteFileW((t.journal + L".tmp").c_str());
+bool DeleteIfPresent(const std::wstring& path) noexcept {
+    return path.empty() || DeleteFileW(path.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
 }
+bool Cleanup(const Transaction& t) noexcept {
+    // Paths were allocated during preparation/recovery. Cleanup must not
+    // allocate after deleting any backup, and must leave its cleanup-only
+    // journal if an operation fails.
+    SetRecoveryStatus(SaveRecoveryStatus::CleanupPending);
+    bool ok = DeleteIfPresent(t.temporary);
+    int index = 0;
+    for (const auto& f : t.originals) {
+#ifdef XA66_TEST
+        if (gFault == 11) return false;
+#endif
+        ok = DeleteIfPresent(f.backup) && ok;
+        CrashAt(230 + index++);
+        ok = DeleteIfPresent(f.restore) && ok;
+    }
+    ok = DeleteIfPresent(t.journalTemporary) && ok;
+    if (!ok) return false;
+    CrashAt(24);
+    const bool cleaned = DeleteIfPresent(t.journal);
+    if (cleaned) SetRecoveryStatus(SaveRecoveryStatus::Ready);
+    return cleaned;
+}
+bool RestoreAndSeal(Transaction& t) {
+    SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
+    if (!Restore(t)) { Diagnose(t, L"restore_failed", L"保留全部备份，等待再次恢复", GetLastError()); return false; }
+    if (!WriteJournal(t, JournalState::Restored)) {
+        Diagnose(t, L"restore_marker_failed", L"原数据已恢复，恢复完成标记未持久化；备份全部保留", GetLastError());
+        return false;
+    }
+    t.state = JournalState::Restored;
+    SetRecoveryStatus(SaveRecoveryStatus::CleanupPending);
+    Diagnose(t, L"restored", L"旧保存组完整恢复并已持久化确认");
+    CrashAt(22);
+    return true;
+}
+struct PreparationGuard {
+    Transaction& transaction;
+    bool durable = false;
+    explicit PreparationGuard(Transaction& value) noexcept : transaction(value) {}
+    ~PreparationGuard() {
+        if (durable) return;
+        DeleteIfPresent(transaction.temporary);
+        for (const auto& f : transaction.originals) if (f.backupTouched) DeleteIfPresent(f.backup);
+        DeleteIfPresent(transaction.journalTemporary);
+    }
+};
 std::wstring Ini(const std::wstring& p, const std::wstring& key) {
     std::vector<wchar_t> b(32768);
     GetPrivateProfileStringW(L"Transaction", key.c_str(), L"", b.data(), static_cast<DWORD>(b.size()), p.c_str());
@@ -196,25 +295,53 @@ bool ReadBoolean(const std::wstring& p, const std::wstring& key, bool& result) {
     result = value == L"1";
     return true;
 }
+bool ReadState(const std::wstring& path, JournalState& state) {
+    bool cleanupOnly = false;
+    if (!ReadBoolean(path, L"Committed", cleanupOnly)) return false;
+    const std::wstring schema = Ini(path, L"SchemaVersion"), name = Ini(path, L"State");
+    if (schema.empty() && name.empty()) {
+        state = cleanupOnly ? JournalState::Committed : JournalState::Prepared;
+        return true;
+    }
+    if (schema != L"2") return false;
+    if (name == L"Prepared" && !cleanupOnly) state = JournalState::Prepared;
+    else if (name == L"Committed" && cleanupOnly) state = JournalState::Committed;
+    else if (name == L"Restored" && cleanupOnly) state = JournalState::Restored;
+    else return false;
+    return true;
+}
 bool RecoverUnlocked(const std::wstring& root, std::wstring& error) {
+    SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
     const std::wstring folder = PatchPrivatePath(root, CompiledEngineProfile()) + L"\\transactions";
-    WIN32_FIND_DATAW data = {}; HANDLE search = FindFirstFileW((folder + L"\\*.ini").c_str(), &data);
-    if (search == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND;
+    WIN32_FIND_DATAW data = {}; SearchGuard search(FindFirstFileW((folder + L"\\*.ini").c_str(), &data));
+    if (search.handle == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+            SetRecoveryStatus(SaveRecoveryStatus::Ready); return true;
+        }
+        error = L"无法枚举上次存档事务，原恢复材料已保留。"; return false;
+    }
+#ifdef XA66_TEST
+    if (gFault == 12) throw std::bad_alloc();
+#endif
     bool ok = true;
-    do {
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    for (;;) {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
         Transaction t; t.root = root; t.journal = folder + L"\\" + data.cFileName;
+        t.journalTemporary = t.journal + L".tmp";
+        t.operation = BeginStatsOperation(L"save-recovery", t.journal);
         t.temporary = Ini(t.journal, L"Temporary");
         const std::wstring count = Ini(t.journal, L"Count");
-        bool committed = false;
         if (count.size() != 1 || count[0] < L'1' || count[0] > L'3' ||
-            !ReadBoolean(t.journal, L"Committed", committed) || !InRoot(root, t.temporary)) {
+            !ReadState(t.journal, t.state) || !InRoot(root, t.temporary)) {
+            Diagnose(t, L"journal_invalid", L"状态、成员数或临时路径无效");
             ok = false; break;
         }
         const int n = count[0] - L'0';
         for (int i = 0; i < n; ++i) {
             SavedFile f; f.path = Ini(t.journal, L"Path" + std::to_wstring(i));
             f.backup = Ini(t.journal, L"Backup" + std::to_wstring(i));
+            f.restore = f.path + L".xa-restore";
             if (!ReadBoolean(t.journal, L"Existed" + std::to_wstring(i), f.existed) ||
                 !InRoot(root, f.path) || f.backup != f.path + L".xa-old" ||
                 !_wcsicmp(t.temporary.c_str(), f.path.c_str()) ||
@@ -224,13 +351,27 @@ bool RecoverUnlocked(const std::wstring& root, std::wstring& error) {
             t.originals.push_back(f);
         }
         if (!ok) break;
-        if (!committed && !Restore(t)) { ok = false; break; }
-        Cleanup(t);
-    } while (FindNextFileW(search, &data));
-    FindClose(search);
-    if (!ok) error = L"上次存档事务尚未完整恢复，请保留 transactions 目录和 .xa-old 备份。";
+        if (t.state == JournalState::Prepared && !RestoreAndSeal(t)) { ok = false; break; }
+        if (!Cleanup(t)) { Diagnose(t, L"cleanup_pending", L"保存组已确认，清理待重试", GetLastError()); ok = false; break; }
+        Diagnose(t, L"recovery_complete");
+        }
+#ifdef XA66_TEST
+        if (gFault == 13) { ok = false; SetLastError(ERROR_READ_FAULT); break; }
+#endif
+        if (!FindNextFileW(search.handle, &data)) { ok = GetLastError() == ERROR_NO_MORE_FILES; break; }
+    }
+    if (!ok) {
+        if (ReadSaveRecoveryStatus() != SaveRecoveryStatus::CleanupPending)
+            SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
+        error = ReadSaveRecoveryStatus() == SaveRecoveryStatus::CleanupPending ?
+            L"保存组已确认，事务清理尚未完成。请保留 transactions 目录和剩余备份后重试。" :
+            L"上次存档事务尚未完整恢复，请保留 transactions 目录和 .xa-old 备份。";
+    } else SetRecoveryStatus(SaveRecoveryStatus::Ready);
     return ok;
 }
+}
+SaveRecoveryStatus ReadSaveRecoveryStatus() noexcept {
+    return static_cast<SaveRecoveryStatus>(InterlockedCompareExchange(&gRecoveryStatus, 0, 0));
 }
 bool RecoverSaveTransactionsImpl(const std::wstring& root, std::wstring& error) {
     if (InterlockedCompareExchange(&gTransactionOwner, 1, 0)) { error = L"存档事务正在进行。"; return false; }
@@ -239,7 +380,8 @@ bool RecoverSaveTransactionsImpl(const std::wstring& root, std::wstring& error) 
 #ifdef XA66_TEST
     if (gFault == 6) throw std::bad_alloc();
 #endif
-    return rootLock.handle != INVALID_HANDLE_VALUE && RecoverUnlocked(root, error);
+    if (rootLock.handle == INVALID_HANDLE_VALUE) { SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending); return false; }
+    return RecoverUnlocked(root, error);
 }
 bool BeginSaveGroupReadImpl(const std::wstring& root, std::wstring& error) {
     if (gGroupReadLock != INVALID_HANDLE_VALUE ||
@@ -251,7 +393,8 @@ bool BeginSaveGroupReadImpl(const std::wstring& root, std::wstring& error) {
 #ifdef XA66_TEST
     if (gFault == 7) throw std::bad_alloc();
 #endif
-    if (rootLock.handle == INVALID_HANDLE_VALUE || !RecoverUnlocked(root, error)) return false;
+    if (rootLock.handle == INVALID_HANDLE_VALUE) { SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending); return false; }
+    if (!RecoverUnlocked(root, error)) return false;
     gGroupReadLock = rootLock.Detach();
     owner.ReleaseOwnership();
     return true;
@@ -271,20 +414,28 @@ bool BeginSaveTransactionImpl(const std::wstring& root, const std::wstring& targ
     }
     OwnerGuard owner;
     Transaction t; t.root = root; t.nativeExtension = nativeExtension; t.targetExtension = targetExtension;
+    t.operation = BeginStatsOperation(L"save", target);
     t.extensionRequired = requireNativeExtension;
     t.rootLock = LockRoot(root, error);
     HandleGuard rootLock(t.rootLock);
-    if (t.rootLock == INVALID_HANDLE_VALUE) return false;
+    if (t.rootLock == INVALID_HANDLE_VALUE) { SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending); return false; }
     if (!RecoverUnlocked(root,error)) {
         // This journal belongs to an earlier interrupted transaction. Never
         // let cleanup of a new attempt destroy its recovery information.
         return false;
     }
-    bool ok = InRoot(root, target) && InRoot(root, nativeExtension) && InRoot(root, targetExtension);
+    PreparationGuard preparation(t);
+    bool ok = InRoot(root, target) && (!requireNativeExtension ||
+        (InRoot(root, nativeExtension) && InRoot(root, targetExtension)));
     std::error_code ec;
     const std::wstring folder = PatchPrivatePath(root, CompiledEngineProfile()) + L"\\transactions";
+    t.journal = folder + L"\\active.ini";
+    t.journalTemporary = t.journal + L".tmp";
     if (ok) { std::filesystem::create_directories(folder, ec); ok = !ec; }
     if (ok) { std::filesystem::create_directories(std::filesystem::path(target).parent_path(), ec); ok = !ec; }
+    // Private autosaves live elsewhere, but the native writer's short staging
+    // path always uses SV. A first autosave must not require a prior manual save.
+    if (ok) { std::filesystem::create_directories(std::filesystem::path(root) / L"SV", ec); ok = !ec; }
     char name[16] = {};
     for (int attempt = 0; ok && attempt < 256; ++attempt) {
         unsigned sequence = static_cast<unsigned>(InterlockedIncrement(&gSequence)) ^ GetCurrentProcessId() ^ GetTickCount();
@@ -294,18 +445,38 @@ bool BeginSaveTransactionImpl(const std::wstring& root, const std::wstring& targ
         if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); break; }
         t.temporary.clear();
     }
+#ifdef XA66_TEST
+    if (gFault == 8) throw std::bad_alloc();
+#endif
     ok = ok && !t.temporary.empty() && CaptureBattleStatsState(t.stats, GetTickCount64());
-    for (const auto& p : {target, nativeExtension, targetExtension}) {
+    if (ok) Diagnose(t, L"captured", requireNativeExtension ? L"E5S+EXS" : L"E5S only");
+    const std::wstring* affected[] = {&target, &nativeExtension, &targetExtension};
+    const size_t affectedCount = requireNativeExtension ? _countof(affected) : 1;
+    // E5S-only graphs must not inspect even a locked or unrelated EXS.
+    // Allocate the complete member list before touching any backup.
+    for (size_t index = 0; ok && index < affectedCount; ++index) {
+        const auto& p = *affected[index];
         if (!ok) break;
         if (std::any_of(t.originals.begin(), t.originals.end(), [&](const SavedFile& f) {
             return !_wcsicmp(f.path.c_str(), p.c_str());
         })) continue;
-        SavedFile f; f.path = p; f.backup = p + L".xa-old"; f.existed = Exists(p);
-        if (f.existed && (!CopyFileW(p.c_str(), f.backup.c_str(), FALSE) || !Flush(f.backup))) ok = false;
+        SavedFile f; f.path = p; f.backup = p + L".xa-old"; f.restore = p + L".xa-restore";
+        f.existed = Exists(p);
         t.originals.push_back(f);
     }
-    t.journal = folder + L"\\active.ini";
-    const bool journalReady = ok && WriteJournal(t, false);
+    for (auto& f : t.originals) {
+        if (!ok) break;
+        if (f.existed) {
+            f.backupTouched = true;
+            ok = CopyFileW(f.path.c_str(), f.backup.c_str(), FALSE) && Flush(f.backup);
+        }
+#ifdef XA66_TEST
+        if (gFault == 9) throw std::bad_alloc();
+#endif
+    }
+    const bool journalReady = ok && WriteJournal(t, JournalState::Prepared);
+    preparation.durable = journalReady;
+    if (journalReady) SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
     ok = journalReady;
     if (ok && requireNativeExtension) {
         // The next extension callback must create a fresh file. Keeping an
@@ -317,12 +488,18 @@ bool BeginSaveTransactionImpl(const std::wstring& root, const std::wstring& targ
     if (ok && gFault == 4) throw std::bad_alloc();
 #endif
     if (!ok) {
-        if (!journalReady || Restore(t)) Cleanup(t);
-        else error = L"无法启动保存，原扩展存档恢复尚未完成。已保留事务日志和备份。";
+        if (journalReady) {
+            if (RestoreAndSeal(t)) {
+                if (!Cleanup(t)) Diagnose(t, L"cleanup_pending", L"原保存组已恢复，清理待重试", GetLastError());
+            } else error = L"无法启动保存，原保存组恢复尚未确认。已保留事务日志和备份。";
+        }
         if (error.empty()) error = L"无法建立完整的存档临时文件和恢复备份。";
+        Diagnose(t, L"save_begin_failed", error.c_str(), GetLastError());
+        SetStatsLastSave(false, target, error);
         return false;
     }
     t.active = true; gTransaction = std::move(t); strcpy_s(shortFilename, 16, name);
+    SetRecoveryStatus(SaveRecoveryStatus::Ready);
     rootLock.Detach(); owner.ReleaseOwnership(); return true;
 }
 void ObserveSaveWrite(unsigned requested, unsigned written) {
@@ -355,22 +532,34 @@ bool SaveTransactionHealthy() { return gTransaction.active && !gTransaction.fail
 bool FinishSaveTransactionImpl(std::wstring& error) {
     if (!gTransaction.active) { error = L"存档事务未启动，原存档未被替换。"; return false; }
     auto& t = gTransaction;
-    if (t.failed && !t.extensionError.empty()) error = t.extensionError;
+    if (t.failed) error = t.extensionError.empty() ?
+        L"原生存档写入、关闭或扩展回调失败，正在恢复上一份完整存档。" : t.extensionError;
+    else if (!t.closed) error = L"未收到原生存档关闭确认，正在恢复上一份完整存档。";
+    else if (t.writes != 4) error = L"原生存档写入段数不完整，正在恢复上一份完整存档。";
     bool ok = !t.failed && t.closed && t.writes == 4;
+    Diagnose(t, L"native_io_verified", ok ? L"原生四段写入和关闭已确认" : error.c_str());
     WIN32_FILE_ATTRIBUTE_DATA info = {};
-    ok = ok && GetFileAttributesExW(t.temporary.c_str(), GetFileExInfoStandard, &info) &&
-        ((static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow) == t.bytes;
+    if (ok && (!GetFileAttributesExW(t.temporary.c_str(), GetFileExInfoStandard, &info) ||
+        ((static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow) != t.bytes)) {
+        ok = false; error = L"原生临时存档长度与实际写入字节数不符。";
+    }
     ok = ok && WriteBattleStatsEmbedded(t.temporary, t.stats, error);
+    if (ok) Diagnose(t, L"embedded_verified", L"统计尾部已写入并复读确认");
     if (ok && t.extensionRequired) {
         ok = t.extensionObserved && Exists(t.nativeExtension) && Flush(t.nativeExtension);
+        if (!ok) error = L"所需的原生扩展存档回调未完成，或新 EXS 不存在、刷新失败。";
         if (ok && t.nativeExtension != t.targetExtension) {
             ok = CopyFileW(t.nativeExtension.c_str(), t.targetExtension.c_str(), FALSE) && Flush(t.targetExtension);
+            if (!ok) error = L"无法复制或刷新本次自动存档的原生扩展文件。";
         }
     }
 #ifdef XA66_TEST
     if (gFault == 1) ok = false;
 #endif
-    if (ok) ok = MoveFileExW(t.temporary.c_str(), t.originals.front().path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (ok) {
+        ok = MoveFileExW(t.temporary.c_str(), t.originals.front().path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+        if (!ok) error = L"无法原子替换目标存档。";
+    }
 #ifdef XA66_TEST
     if (gFault == 2) ok = false;
     if (gFault == 3) ExitProcess(91);
@@ -384,28 +573,56 @@ bool FinishSaveTransactionImpl(std::wstring& error) {
             else ok = DeleteFileW(f.path.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
         }
     }
-    ok = ok && WriteJournal(t, true);
-    if (ok || Restore(t)) Cleanup(t);
-    else error = L"保存失败，恢复尚未完成。已保留事务日志和原始备份，禁止读取不完整存档。";
+    if (ok && !WriteJournal(t, JournalState::Committed)) {
+        ok = false; error = L"无法持久化存档提交确认，正在恢复上一份完整存档。";
+    }
+    if (ok) {
+        t.state = JournalState::Committed;
+        Diagnose(t, L"target_committed", L"新保存组已提交");
+        CrashAt(25);
+        const bool cleaned = Cleanup(t);
+        Diagnose(t, cleaned ? L"cleanup_complete" : L"cleanup_pending",
+            cleaned ? L"统计已随存档保存并校验" : L"保存成功，清理待重试", GetLastError());
+        SetStatsLastSave(true, t.originals.front().path,
+            cleaned ? L"统计已随存档保存并校验。" : L"保存已成功；事务清理待重试。");
+        error.clear();
+    } else {
+        if (error.empty()) error = L"存档写入或校验失败。";
+        Diagnose(t, L"save_commit_failed", error.c_str(), GetLastError());
+        if (RestoreAndSeal(t)) {
+            if (!Cleanup(t)) Diagnose(t, L"cleanup_pending", L"旧保存组已恢复，清理待重试", GetLastError());
+            error += L" 已恢复上一份完整存档。";
+            Diagnose(t, L"rollback", error.c_str());
+        } else error += L" 恢复尚未完成或未持久化确认。已保留事务日志和原始备份。";
+        SetStatsLastSave(false, t.originals.front().path, error);
+    }
     ReleaseFailedTransaction();
-    if (!ok && error.empty()) error = L"存档写入或校验失败，已恢复上一份完整存档。";
     return ok;
 }
 void AbortSaveTransactionImpl() {
     if (!gTransaction.active) return;
-    if (Restore(gTransaction)) Cleanup(gTransaction);
+    const bool restored = RestoreAndSeal(gTransaction);
+    if (restored && !Cleanup(gTransaction)) Diagnose(gTransaction, L"cleanup_pending", L"原生保存中止，旧保存组已恢复，清理待重试", GetLastError());
+    const wchar_t* detail = restored ? L"原生保存未完成，已恢复上一份完整存档。" :
+        L"原生保存未完成，恢复尚未确认。事务日志和备份已保留。";
+    Diagnose(gTransaction, L"save_aborted", detail);
+    SetStatsLastSave(false, gTransaction.originals.front().path, detail);
     ReleaseFailedTransaction();
 }
 bool RecoverSaveTransactions(const std::wstring& root, std::wstring& error) noexcept {
+    error.clear();
     try { return RecoverSaveTransactionsImpl(root, error); }
     catch (...) {
+        SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
         SetErrorNoThrow(error, L"存档恢复遇到内存或文件处理异常。恢复日志和备份已保留，请稍后重试。");
         return false;
     }
 }
 bool BeginSaveGroupRead(const std::wstring& root, std::wstring& error) noexcept {
+    error.clear();
     try { return BeginSaveGroupReadImpl(root, error); }
     catch (...) {
+        SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
         SetErrorNoThrow(error, L"无法准备读取存档，恢复日志和备份已保留。");
         return false;
     }
@@ -413,21 +630,30 @@ bool BeginSaveGroupRead(const std::wstring& root, std::wstring& error) noexcept 
 bool BeginSaveTransaction(const std::wstring& root, const std::wstring& target,
     const std::wstring& nativeExtension, const std::wstring& targetExtension, char* shortFilename,
     std::wstring& error, bool requireNativeExtension) noexcept {
+    error.clear();
     try {
         return BeginSaveTransactionImpl(root, target, nativeExtension, targetExtension,
             shortFilename, error, requireNativeExtension);
     } catch (...) {
         SetErrorNoThrow(error, L"无法准备保存，原存档未被提交覆盖。若已有事务，其日志和备份已保留。");
+        RecordStatsDiagnostic(0, L"save_begin_exception", target, nullptr, error);
+        SetStatsLastSave(false, target, error);
         return false;
     }
 }
 bool FinishSaveTransaction(std::wstring& error) noexcept {
+    error.clear();
     try { return FinishSaveTransactionImpl(error); }
     catch (...) {
         // Do not allocate or attempt a second potentially throwing recovery.
         // The durable journal describes the previous complete save group;
         // the next read/save recovers it while holding the same root lock.
-        if (gTransaction.active) ReleaseFailedTransaction();
+        if (gTransaction.active) {
+            if (gTransaction.state == JournalState::Prepared) SetRecoveryStatus(SaveRecoveryStatus::RecoveryPending);
+            Diagnose(gTransaction, L"save_commit_exception", L"事务日志和备份已保留，等待恢复");
+            SetStatsLastSave(false, gTransaction.originals.front().path, L"存档提交异常；重新读档前将恢复。");
+            ReleaseFailedTransaction();
+        }
         SetErrorNoThrow(error, L"保存遇到内存或文件处理异常，事务日志和原始备份已保留，重新读档前将恢复。");
         return false;
     }
