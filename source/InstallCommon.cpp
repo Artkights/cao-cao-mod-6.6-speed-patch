@@ -455,17 +455,17 @@ bool ValidateGearBytesInternal(const std::vector<unsigned char>& bytes, std::wst
         return false;
     }
     const auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(image.At(exportOffset));
-    const bool currentGear = exports->NumberOfFunctions == 6 && exports->NumberOfNames == 6;
-    const bool legacyGear = exports->NumberOfFunctions == 5 && exports->NumberOfNames == 5;
+    const bool currentGear = exports->NumberOfFunctions == 7 && exports->NumberOfNames == 7;
+    const bool legacyGear = (exports->NumberOfFunctions == 5 || exports->NumberOfFunctions == 6) &&
+        exports->NumberOfFunctions == exports->NumberOfNames;
     if (exports->Base != 1 || (!currentGear && (!legacyGear || requireCurrent))) {
-        error = requireCurrent ? L"安装器的齿轮模块缺少当前版本所需的 6 个导出。" :
-            L"齿轮 DLL 导出数量无效，必须是当前 6 个导出或旧版 5 个导出。";
+        error = requireCurrent ? L"安装器的齿轮模块缺少当前版本所需的 7 个导出。" :
+            L"齿轮 DLL 导出数量无效，必须是当前 7 个导出或旧版 5、6 个导出。";
         return false;
     }
-    constexpr const char* expectedLegacy[] = {"AddProcess", "GetSpeed", "OldSetTimer", "SetSpeed", "UnIntercept"};
-    constexpr const char* expectedCurrent[] = {"AddProcess", "GetSpeed", "OldSetTimer", "SetSpeed", "UnIntercept", "ConfigureNativeImports"};
-    const char* const* expected = currentGear ? expectedCurrent : expectedLegacy;
-    const size_t expectedCount = currentGear ? 6 : 5;
+    constexpr const char* expected[] = {"AddProcess", "GetSpeed", "OldSetTimer", "SetSpeed", "UnIntercept",
+        "ConfigureNativeImports", "ConfigureNativeClockSlots"};
+    const size_t expectedCount = exports->NumberOfFunctions;
     size_t namesOffset = 0, ordinalsOffset = 0, functionsOffset = 0;
     if (!image.Rva(exports->AddressOfNames, expectedCount * sizeof(DWORD), namesOffset) ||
         !image.Rva(exports->AddressOfNameOrdinals, expectedCount * sizeof(WORD), ordinalsOffset) ||
