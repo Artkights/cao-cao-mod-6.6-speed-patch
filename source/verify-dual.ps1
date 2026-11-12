@@ -1,6 +1,6 @@
 ﻿param([string]$OutputDirectory, [string]$GameRoot64, [string]$GameRoot65, [string]$GameRoot66,
     [string]$BuildDirectory, [string]$GameRootPacked, [string]$GameRootNobuna, [string]$GameRootNobuna12,
-    [string]$GameRoot220, [string]$RuntimeImage220)
+    [string]$GameRoot220, [string]$RuntimeImage220, [string]$OriginalAudio)
 $ErrorActionPreference = 'Stop'
 $sourceRoot = $PSScriptRoot
 # The repository is kept beside the three local game fixtures under the
@@ -25,7 +25,9 @@ $runtime220 = if ($RuntimeImage220) { [IO.Path]::GetFullPath($RuntimeImage220) }
 $exe64 = Join-Path $fixture64 'Ekd5.exe'
 $exe65 = Join-Path $fixture65 'Ekd5.exe'
 $exe66 = Join-Path $fixture66 'Ekd5.exe'
-$originalAudio = Join-Path $fixture65 'Koeicda_org.dll'
+$originalAudio = if ($OriginalAudio) { [IO.Path]::GetFullPath($OriginalAudio) }
+    elseif (Test-Path -LiteralPath (Join-Path $fixture65 'Koeicda_org.dll')) { Join-Path $fixture65 'Koeicda_org.dll' }
+    else { Join-Path $fixture65 'Koeicda.dll' }
 $installer = Join-Path $buildRoot 'package\加速补丁安装器.exe'
 $script:results = @()
 function Invoke-Check([string]$Label, [string]$Program, [string[]]$TestArguments) {
