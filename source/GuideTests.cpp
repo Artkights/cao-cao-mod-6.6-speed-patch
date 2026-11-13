@@ -81,11 +81,12 @@ bool ValidateAbilityCommands() {
     std::wstring text, diagnostics;
     if (!BuildGuideScriptTextForTest(ScriptEex(actions), {L"曹操", L"吕布", L"张飞", L"诸葛亮"},
         text, diagnostics)) return false;
-    for (const wchar_t* expected : {L"曹操攻击力提升 50 点", L"吕布精神力下降 800 点",
-        L"张飞HP上限提升 300 点", L"诸葛亮MP上限下降 20 点", L"曹操攻击力设为 0 点",
-        L"武将 123能力码 17 操作码 4 变化 50", L"曹操能力码 15 操作码 1 变化 50",
-        L"曹操攻击力操作码 3 变化 50"})
+    for (const wchar_t* expected : {L"曹操攻击提升 50 点", L"吕布精神下降 800 点",
+        L"张飞当前HP提升 300 点", L"诸葛亮当前MP下降 20 点", L"曹操攻击设为 0 点",
+        L"武将 123能力码 17 操作码 4 变化 50",
+        L"曹操攻击操作码 3 变化 50"})
         if (text.find(expected) == std::wstring::npos) return false;
+    if (text.find(L"能力码 15") != std::wstring::npos || text.find(L"头像") != std::wstring::npos) return false;
     if (text.find(L"当前 HP") != std::wstring::npos || text.find(L"当前 MP") != std::wstring::npos ||
         diagnostics.find(L"person-name-missing: id=123") == std::wstring::npos ||
         diagnostics.find(L"section=0 offset=") == std::wstring::npos) return false;
@@ -97,7 +98,7 @@ bool ValidateAbilityCommands() {
     ScriptWord(conditions, 0); ScriptWord(conditions, 0);
     ScriptWord(conditions, 3); // structurally valid but unknown condition
     if (!BuildGuideScriptTextForTest(ScriptEex(actions, conditions), {L"曹操", L"吕布", L"张飞", L"诸葛亮"},
-        text, diagnostics) || text.find(L"张飞HP上限") == std::wstring::npos ||
+        text, diagnostics) || text.find(L"张飞当前HP") == std::wstring::npos ||
         text.find(L"满足其他事件条件后") == std::wstring::npos ||
         diagnostics.find(L"condition-unresolved") == std::wstring::npos) return false;
     // A malformed section is skipped without discarding a later valid section.
@@ -110,7 +111,7 @@ bool ValidateAbilityCommands() {
     malformed[14] = 2;
     malformed.insert(malformed.end(), valid.begin() + 16, valid.end());
     return BuildGuideScriptTextForTest(malformed, {L"曹操"}, text, diagnostics) &&
-        text.find(L"曹操攻击力提升 50 点") != std::wstring::npos &&
+        text.find(L"曹操攻击提升 50 点") != std::wstring::npos &&
         diagnostics.find(L"malformed-section") != std::wstring::npos;
 }
 
@@ -136,10 +137,10 @@ bool ValidateConditionalExtension() {
         {L"曹操"}, text, diagnostics);
     ConfigureGuideConditionalExtension(false);
     if (!parsed || text.find(L"曹操已加入我军") == std::wstring::npos ||
-        text.find(L"曹操攻击力提升 25 点") == std::wstring::npos) return false;
+        text.find(L"曹操攻击提升 25 点") == std::wstring::npos) return false;
     if (!BuildGuideScriptTextForTest(ScriptEex(action, condition), {L"曹操"}, text, diagnostics) ||
         text.find(L"尚未解析的扩展条件（0x7B）") == std::wstring::npos ||
-        text.find(L"曹操攻击力提升 25 点") == std::wstring::npos ||
+        text.find(L"曹操攻击提升 25 点") == std::wstring::npos ||
         diagnostics.find(L"condition-unresolved: id=123") == std::wstring::npos) return false;
     ConfigureGuideConditionalExtension(true);
     const int branches[] = {1, 3, 4, 5};
@@ -156,7 +157,7 @@ bool ValidateConditionalExtension() {
     ScriptConditional(condition, 5, "0,0,99,1");
     okay = BuildGuideScriptTextForTest(ScriptEex(action, condition), {L"曹操"}, text, diagnostics) &&
         text.find(L"尚未解析的扩展条件（0x7B）") != std::wstring::npos &&
-        text.find(L"曹操攻击力提升 25 点") != std::wstring::npos && okay;
+        text.find(L"曹操攻击提升 25 点") != std::wstring::npos && okay;
     ConfigureGuideConditionalExtension(false);
     return okay;
 }
@@ -169,7 +170,11 @@ bool ValidateGuideResourceReadiness() {
     std::vector<BYTE> data(396 + 1024 * 32 + 104 * 25, 0);
     const BYTE diskPerson[] = {0xB2,0xDC,0xB2,0xD9};
     const BYTE diskItem[] = {0xCC,0xFA,0xBD,0xA3};
+    // 陆逊: valid CP936 bytes that also happen to form valid UTF-8; the name
+    // table must decode Data.e5 as GBK instead of the general text heuristic.
+    const BYTE gbkUtf8CollisionPerson[] = {0xC2,0xBD,0xD1,0xB7};
     for (size_t i = 0; i < 1024; ++i) memcpy(data.data() + 396 + i * 32, diskPerson, sizeof(diskPerson));
+    memcpy(data.data() + 396 + 81 * 32, gbkUtf8CollisionPerson, sizeof(gbkUtf8CollisionPerson));
     for (size_t i = 0; i < 104; ++i) memcpy(data.data() + 33164 + i * 25, diskItem, sizeof(diskItem));
     FILE* file = nullptr;
     const auto dataPath = root / L"Data.e5";
@@ -199,7 +204,8 @@ bool ValidateGuideResourceReadiness() {
     const ULONGLONG elapsed = GetTickCount64() - started;
     const bool okay = captured && elapsed >= 450 && elapsed < 5000 &&
         snapshot.peopleReady && snapshot.itemsReady && snapshot.people[0] != L"曹操" &&
-        snapshot.people[1] == L"曹操" && snapshot.items[0] == L"短剑" && snapshot.items[1] == L"铁剑" &&
+        snapshot.people[1] == L"曹操" && snapshot.people[81] == L"陆逊" &&
+        snapshot.items[0] == L"短剑" && snapshot.items[1] == L"铁剑" &&
         snapshot.peopleOrigin == BattleResourceOrigin::RuntimeWithDiskFallback &&
         snapshot.itemOrigin == BattleResourceOrigin::RuntimeWithDiskFallback && IsBattleResourceSnapshotCurrent(snapshot);
     ResetBattleRuntime();
@@ -233,7 +239,7 @@ bool ValidateRWithoutBattlefield() {
     std::vector<int> joins;
     std::wstring diagnostics;
     const bool okay = wrote && BuildGuideTextForTest(path.c_str(), root.c_str(), text) &&
-        text.find(L"武将 123HP上限提升 300 点") != std::wstring::npos &&
+        text.find(L"武将 123当前HP提升 300 点") != std::wstring::npos &&
         ExtractScenarioJoinCandidates(path, joins, diagnostics) && joins == std::vector<int>({7, 9});
     DeleteFileW(path.c_str());
     for (const wchar_t* generation : {L"64", L"65", L"66"}) {
@@ -424,16 +430,16 @@ size_t CountOccurrences(const std::wstring& value, const std::wstring& needle) {
 bool ValidateShanZeiS00(const std::wstring& value, const GuideTestStats& stats) {
     static const wchar_t* required[] = {
         L"第 00 关简易攻略",
-        L"刘备与裴元绍相邻且裴元绍HP上限低于 100时，刘备与裴元绍触发对话并且获得精壮果。",
+        L"刘备与裴元绍相邻且裴元绍当前HP低于 100时，刘备与裴元绍触发对话并且获得精壮果。",
         L"第 13 回合",
         L"6 支隐藏敌军",
         L"完成本关后，获得 20000 金钱",
         L"我方部队到达（9，17）",
         L"关羽撤退时，触发对话并且失去 500 金钱。",
         L"击退邓茂时，邓茂触发对话并且获得时空遗枝。",
-        L"刘备HP上限低于 80时，刘备触发对话并且刘备全能力上升并解除异常。",
-        L"关羽HP上限低于 80时，关羽触发对话并且关羽全能力上升并解除异常。",
-        L"张飞HP上限低于 80时，张飞触发对话并且张飞全能力上升并解除异常。"
+        L"刘备当前HP低于 80时，刘备触发对话并且刘备全能力上升并解除异常。",
+        L"关羽当前HP低于 80时，关羽触发对话并且关羽全能力上升并解除异常。",
+        L"张飞当前HP低于 80时，张飞触发对话并且张飞全能力上升并解除异常。"
     };
     static const wchar_t* forbidden[] = {
         L"第 13 回合时，裴元绍、黄巾兵8等人触发对话。",
@@ -456,12 +462,12 @@ bool ValidateShanZeiS00(const std::wstring& value, const GuideTestStats& stats) 
 bool ValidateShanZeiS85(const std::wstring& value, const GuideTestStats& stats) {
     static const wchar_t* required[] = {
         L"第 85 关简易攻略",
-        L"程远志HP上限低于 200且关羽与程远志相邻时，程远志与关羽触发对话；关羽与程远志单挑，并且程远志死亡。",
+        L"程远志当前HP低于 200且关羽与程远志相邻时，程远志与关羽触发对话；关羽与程远志单挑，并且程远志死亡。",
         L"（5，3）至（15，10）区域内的敌军攻防下降",
         L"（1，2）至（2，3）区域内的敌军防御上升",
         L"（5，3）至（19，11）区域内的敌军防御上升",
         L"（6，8）至（8，10）区域内的敌军攻击上升",
-        L"刘备HP上限低于 80时，刘备触发对话并且刘备全能力上升并解除异常",
+        L"刘备当前HP低于 80时，刘备触发对话并且刘备全能力上升并解除异常",
         L"完成本关后，获得 30000 金钱"
     };
     if (!ValidatePlayerText(value) || value.find(L"本关暂无可整理的攻略信息") != std::wstring::npos)
@@ -531,7 +537,7 @@ bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool 
     static const wchar_t* last[] = {
         L"第 61 关简易攻略",
         L"杨双与杜伏威相邻后，触发对话并且杜伏威爆发下降。",
-        L"武将 2与夏溪相邻后，触发对话；武将 2精神上升，并且夏溪攻击上升。",
+        L"谢一与夏溪相邻后，触发对话；谢一精神上升，并且夏溪攻击上升。",
         L"普罗与苗海潮相邻后，触发对话；触发单挑；苗海潮防御下降、陷入麻痹并HP减少 200，并且获得将军印。",
         L"击退辅公祏时，辅公祏触发对话并且获得腾蛇越涧。",
         L"完成本关后，获得将军印并且获得 5000 金钱。",
@@ -539,8 +545,8 @@ bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool 
     };
     if (finalStage) {
         for (const wchar_t* item : last) if (value.find(item) == std::wstring::npos) return false;
-        // Person 2 has no physical name in this fixture. Retain its adjacent
-        // dialogue and state-change event through the explicit ID fallback.
+        // Person 2 has a CP936 name in the 6.4 fixture; the guide must use the
+        // decoded name rather than the former "武将 2" ID fallback.
         return stats.commands == 1198 && stats.dialogEntries > 0 && stats.ambushEntries == 0 &&
             stats.aiEntries > 0 && stats.rewardEntries > 0 &&
             GuideAiFixtures::LineHas(GuideAiFixtures::Ai(value), L"（13，9）", L"主动出击") &&
@@ -652,7 +658,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!ValidateScenarioSelection(argv[2])) return 10;
         std::wstring fromR;
         if (!BuildGuideTextForTest(r00.c_str(), argv[2], fromR) ||
-            fromR.find(L"刘备HP上限低于 80时，刘备触发对话并且刘备全能力上升并解除异常") ==
+            fromR.find(L"刘备当前HP低于 80时，刘备触发对话并且刘备全能力上升并解除异常") ==
                 std::wstring::npos)
             return 9;
     } else if (argc == 4 && (wcscmp(argv[3], L"--standard65-s00") == 0 ||

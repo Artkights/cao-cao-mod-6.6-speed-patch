@@ -74,6 +74,7 @@ struct GuideEntry {
     size_t narrativeGroup = SIZE_MAX;
     bool keepWithoutResult = false;
     bool hideInAll = false;
+    bool preserveText = false;
 };
 
 struct GuideUnit {
@@ -133,6 +134,7 @@ struct GuideContext {
     std::wstring* diagnostics = nullptr;
     mutable std::unordered_map<int, bool> reportedMissingPeople;
     mutable std::unordered_map<int, bool> reportedMissingItems;
+    mutable std::unordered_map<std::wstring, bool> reportedPointerTokens;
     mutable bool narrativesReady = false;
     mutable std::vector<GuideNarrativeGroup> narratives;
     mutable std::unordered_map<size_t, size_t> narrativeOwners;
@@ -426,13 +428,29 @@ std::wstring TrimNull(const unsigned char* data, size_t length) {
     return DecodeGbk(data, used);
 }
 
+// Person/item name tables in Data.e5 and Star.e5 are always GBK. A GBK byte
+// pair can accidentally form a valid UTF-8 sequence, so the general
+// UTF-8-first heuristic would silently drop names such as 陆逊 (C2 BD D1 B7).
+std::wstring TrimNullGbk(const unsigned char* data, size_t length) {
+    size_t used = 0;
+    while (used < length && data[used]) ++used;
+    if (!used) return {};
+    const int required = MultiByteToWideChar(936, 0,
+        reinterpret_cast<const char*>(data), static_cast<int>(used), nullptr, 0);
+    if (required <= 0) return {};
+    std::wstring result(static_cast<size_t>(required), L'\0');
+    MultiByteToWideChar(936, 0, reinterpret_cast<const char*>(data),
+        static_cast<int>(used), result.data(), required);
+    return result;
+}
+
 bool LoadTableNames(const std::wstring& path, size_t offset, size_t count, size_t rowSize,
     size_t nameBytes, int firstId, std::unordered_map<int, std::wstring>& result) {
     std::vector<unsigned char> bytes;
     if (!ReadFileBytes(path, bytes) || offset > bytes.size() || count > (bytes.size() - offset) / rowSize) return false;
     std::unordered_map<int, std::wstring> candidate;
     for (size_t index = 0; index < count; ++index) {
-        const std::wstring name = TrimNull(bytes.data() + offset + index * rowSize, nameBytes);
+        const std::wstring name = TrimNullGbk(bytes.data() + offset + index * rowSize, nameBytes);
         if (HasPlayerText(name)) candidate[firstId + static_cast<int>(index)] = name;
     }
     if (candidate.size() < count / 5) return false;
@@ -507,6 +525,58 @@ std::wstring PersonName(const GuideContext& context, int id) {
     return found == context.people.end() ? std::wstring() : found->second;
 }
 
+// A script text/parameter may reference a character by pointer notation
+// "*.xx", where xx is the person data number in Data.e5. Resolve only a
+// numeric data number and never guess an unknown pointer encoding.
+std::wstring ResolvePersonToken(const GuideContext& context, const std::wstring& token) {
+    if (token.size() < 3 || token[0] != L'*' || token[1] != L'.') return {};
+    int id = 0;
+    for (size_t i = 2; i < token.size(); ++i) {
+        if (!iswdigit(token[i])) return {};
+        id = id * 10 + (token[i] - L'0');
+        if (id > 1023) return {};
+    }
+    const std::wstring name = PersonName(context, id);
+    return name == L"空" ? std::wstring() : name;
+}
+
+std::wstring ResolvePersonTokens(const GuideContext& context, const std::wstring& text) {
+    std::wstring result;
+    for (size_t i = 0; i < text.size();) {
+        if (i + 1 < text.size() && text[i] == L'*' && text[i + 1] == L'.') {
+            size_t end = i + 2;
+            while (end < text.size() && iswdigit(text[end])) ++end;
+            if (end > i + 2) {
+                const std::wstring token = text.substr(i, end - i);
+                const std::wstring name = ResolvePersonToken(context, token);
+                if (!name.empty()) {
+                    result += name;
+                    i = end;
+                    continue;
+                }
+                if (context.diagnostics &&
+                    context.reportedPointerTokens.emplace(token, true).second)
+                    *context.diagnostics += context.sourcePath +
+                        L": person-pointer-unresolved: token=" + token + L"\n";
+            }
+        }
+        result += text[i++];
+    }
+    return result;
+}
+
+std::wstring FirstPersonTokenName(const GuideContext& context, const std::wstring& text) {
+    for (size_t i = 0; i + 2 < text.size(); ++i) {
+        if (text[i] != L'*' || text[i + 1] != L'.') continue;
+        size_t end = i + 2;
+        while (end < text.size() && iswdigit(text[end])) ++end;
+        if (end == i + 2) continue;
+        const std::wstring name = ResolvePersonToken(context, text.substr(i, end - i));
+        if (!name.empty()) return name;
+    }
+    return {};
+}
+
 std::wstring ConditionPersonName(const GuideContext& context, int id);
 
 const GuideUnit* UnitByBattlefieldNumber(const GuideContext& context, int number) {
@@ -556,6 +626,34 @@ std::wstring ConditionPersonName(const GuideContext& context, int id) {
     return {};
 }
 
+std::wstring PersonReferenceName(const GuideContext& context,
+    const GuideCommand& command, size_t valueIndex, int32_t value) {
+    (void)valueIndex;
+    if (value >= 0 && value < 1024) {
+        const std::wstring name = PersonName(context, static_cast<int>(value));
+        if (!name.empty() && name != L"空") return name;
+    }
+    for (const std::wstring& text : command.texts) {
+        const std::wstring name = FirstPersonTokenName(context, text);
+        if (!name.empty()) return name;
+    }
+    return ConditionPersonName(context, static_cast<int>(value));
+}
+
+std::wstring PersonReferenceName(const GuideContext& context,
+    const GuideCondition& condition, size_t valueIndex, int32_t value) {
+    (void)valueIndex;
+    if (value >= 0 && value < 1024) {
+        const std::wstring name = PersonName(context, static_cast<int>(value));
+        if (!name.empty() && name != L"空") return name;
+    }
+    for (const std::wstring& text : condition.texts) {
+        const std::wstring name = FirstPersonTokenName(context, text);
+        if (!name.empty()) return name;
+    }
+    return ConditionPersonName(context, static_cast<int>(value));
+}
+
 std::wstring ItemName(const GuideContext& context, int id) {
     const auto found = context.items.find(id);
     return found == context.items.end() ? std::wstring() : found->second;
@@ -597,7 +695,8 @@ std::vector<std::wstring> ExtractSpeakers(const GuideContext& context, const Gui
                 ++end;
             }
             if (end > start) {
-                const std::wstring name = text.substr(start, end - start);
+                const std::wstring raw = text.substr(start, end - start);
+                const std::wstring name = ResolvePersonTokens(context, raw);
                 // Dialogue text carries its speaker label independently from
                 // the person table. Keep it when the protected runtime table
                 // is not ready; dropping the whole dialogue would make a
@@ -704,7 +803,7 @@ bool RenderConditionalExtension(const GuideContext& context, const GuideConditio
         } else return false;
     } else if (branch == 2) {
         if (!parse(2) || fields[0] > 1023 || fields[1] > 1) return false;
-        text = ConditionPersonName(context, static_cast<int>(fields[0])) +
+        text = PersonReferenceName(context, condition, 0, static_cast<int32_t>(fields[0])) +
             (fields[1] ? L"已加入我军" : L"尚未加入我军");
     } else if (branch == 3) {
         if (!parse(3) || fields[0] > 1 || fields[2] >= 255) return false;
@@ -743,18 +842,18 @@ bool RenderConditions(const GuideContext& context, const std::vector<GuideCondit
             }
             parts.push_back(std::move(extended));
         } else if (condition.id == 0x2E && values.size() >= 2) {
-            const std::wstring first = ConditionPersonName(context, values[0]);
-            const std::wstring second = ConditionPersonName(context, values[1]);
+            const std::wstring first = PersonReferenceName(context, condition, 0, values[0]);
+            const std::wstring second = PersonReferenceName(context, condition, 1, values[1]);
             if (first.empty() || second.empty()) return false;
             parts.push_back(first + L"与" + second + L"相邻");
             adjacentPeople = {values[0], values[1]};
         } else if (condition.id == 0x25 && values.size() >= 3) {
-            const std::wstring person = ConditionPersonName(context, values[0]);
+            const std::wstring person = PersonReferenceName(context, condition, 0, values[0]);
             if (person.empty() || values[1] < 0 || values[2] < 0) return false;
             parts.push_back(person + L"到达（" + std::to_wstring(values[1]) + L"，" +
                 std::to_wstring(values[2]) + L"）");
         } else if (condition.id == 0x26 && values.size() >= 5) {
-            const std::wstring person = ConditionPersonName(context, values[0]);
+            const std::wstring person = PersonReferenceName(context, condition, 0, values[0]);
             if (person.empty()) return false;
             for (size_t i = 1; i < 5; ++i) if (values[i] < 0) return false;
             if (values[1] == 0 && values[2] == 0 && values[3] == 99 && values[4] == 99)
@@ -764,7 +863,7 @@ bool RenderConditions(const GuideContext& context, const std::vector<GuideCondit
                     std::to_wstring(values[2]) + L"）至（" + std::to_wstring(values[3]) + L"，" +
                     std::to_wstring(values[4]) + L"）区域");
         } else if (condition.id == 0x36 && values.size() >= 4) {
-            const std::wstring person = ConditionPersonName(context, values[0]);
+            const std::wstring person = PersonReferenceName(context, condition, 0, values[0]);
             const int attribute = values[1], amount = values[2], comparison = values[3];
             const wchar_t* attributeName = GuideAbilityName(attribute);
             if (person.empty() || !attributeName ||
@@ -1038,8 +1137,8 @@ void EnsureGuideNarratives(const GuideContext& context) {
             if (dialogue) {
                 group.hasDialog = true;
                 if (command.id == 0x15 && command.values.size() >= 2) {
-                    AddUnique(group.speakers, ConditionPersonName(context, command.values[0]));
-                    AddUnique(group.speakers, ConditionPersonName(context, command.values[1]));
+                    AddUnique(group.speakers, PersonReferenceName(context, command, 0, command.values[0]));
+                    AddUnique(group.speakers, PersonReferenceName(context, command, 1, command.values[1]));
                 }
                 for (const auto& name : ExtractSpeakers(context, command))
                     AddUnique(group.speakers, name);
@@ -1089,8 +1188,8 @@ void AddDialogEntries(const GuideContext& context, GuideResult& result) {
         if (group.hasDialog) entry.actions.push_back(simpleAdjacent ? L"触发对话" :
             (group.speakers.empty() ? L"触发对话" : JoinNames(group.speakers) + L"触发对话"));
         for (const GuideCommand* duel : group.duels) {
-            const std::wstring left = ConditionPersonName(context, duel->values[0]);
-            const std::wstring right = ConditionPersonName(context, duel->values[1]);
+            const std::wstring left = PersonReferenceName(context, *duel, 0, duel->values[0]);
+            const std::wstring right = PersonReferenceName(context, *duel, 1, duel->values[1]);
             if (left.empty() || right.empty()) continue;
             const bool matching = simpleAdjacent &&
                 ((adjacent.first == duel->values[0] && adjacent.second == duel->values[1]) ||
@@ -1165,11 +1264,12 @@ std::wstring GuideAiRawCommand(const GuideCommand& command) {
     return result + L"]";
 }
 
-std::wstring GuideAiPerson(const GuideContext& context, int32_t value, bool& resolved) {
+std::wstring GuideAiPerson(const GuideContext& context, const GuideCommand& command,
+    size_t valueIndex, int32_t value, bool& resolved) {
     resolved = false;
     if (value >= 0 && value < 1024) {
         resolved = true;
-        const std::wstring name = ConditionPersonName(context, value);
+        const std::wstring name = PersonReferenceName(context, command, valueIndex, value);
         std::wstring side;
         bool ambiguous = false;
         // 4B describes a deployment slot, not a literal person. Only explicit
@@ -1224,7 +1324,7 @@ GuideAiChange DecodeGuidePolicyChange(const GuideContext& context, const GuideCo
     // Native 4E normalizes the WORD mode FFFF to zero before dispatching
     // its single-person branch (6.4/6.5/6.6: 00414726..00414744).
     if (values[0] == 0 || values[0] == -1) {
-        target = GuideAiPerson(context, values[1], result.targetResolved);
+        target = GuideAiPerson(context, command, 1, values[1], result.targetResolved);
     } else if (values[0] == 1 && values[6] >= 0 && values[6] <= 6) {
         static const wchar_t* camps[] = {L"我军", L"友军", L"敌军", L"援军",
             L"我军及友军", L"敌军及援军", L"全部部队"};
@@ -1251,7 +1351,7 @@ GuideAiChange DecodeGuidePolicyChange(const GuideContext& context, const GuideCo
             (policyName.empty() ? L"未知方针码 " + std::to_wstring(policy) : policyName);
         if (policy == 3 || policy == 5) {
             bool referenceResolved = false;
-            const std::wstring reference = GuideAiPerson(context, values[8], referenceResolved);
+            const std::wstring reference = GuideAiPerson(context, command, 8, values[8], referenceResolved);
             result.targetResolved = result.targetResolved && referenceResolved;
             result.action += L"（目标：" + reference + L"）";
         } else if (policy == 4 || policy == 6) {
@@ -1344,7 +1444,7 @@ std::vector<GuideAiChange> CollectGuideAiChanges(const GuideContext& context) {
                 } else if (values[1] == 1) {
                     if (values[3] == 32) {
                         bool resolved = false;
-                        const std::wstring target = GuideAiPerson(context, values[2], resolved);
+                        const std::wstring target = GuideAiPerson(context, command, 2, values[2], resolved);
                         const auto known = state.find(values[0]);
                         std::wstring action;
                         if (values[0] >= 0 && known != state.end()) {
@@ -1412,8 +1512,8 @@ void AddAiEntries(const GuideContext& context, GuideResult& result) {
 
 const wchar_t* GuideAbilityName(int attribute) {
     static const wchar_t* names[] = {
-        L"攻击力", L"防御力", L"精神力", L"爆发力", L"士气", L"HP", L"MP",
-        L"HP上限", L"MP上限", L"等级", L"武力", L"统率", L"智力", L"敏捷", L"运气", L"头像"
+        L"攻击", L"防御", L"精神", L"爆发", L"士气", L"HP", L"MP",
+        L"当前HP", L"当前MP", L"等级", L"武力", L"统帅", L"智力", L"敏捷", L"运气", L"头像"
     };
     return attribute >= 0 && attribute < static_cast<int>(_countof(names)) ?
         names[attribute] : nullptr;
@@ -1480,8 +1580,10 @@ bool IsBestEffortRewardCommand(int commandId) {
 }
 
 std::wstring FormatAbilityChange(const GuideContext& context,
-    const GuideAbilityChange& change) {
-    std::wstring person = PersonName(context, change.personId);
+    const GuideAbilityChange& change, const GuideCommand* command = nullptr) {
+    std::wstring person = command ?
+        PersonReferenceName(context, *command, 0, change.personId) :
+        PersonName(context, change.personId);
     if (person.empty()) person = L"武将 " + std::to_wstring(change.personId);
     const wchar_t* attribute = change.attribute >= 0 && change.attribute <= 14 ?
         GuideAbilityName(change.attribute) : nullptr;
@@ -1515,8 +1617,8 @@ std::wstring RewardPrefix(const GuideContext& context, const GuideCommand& comma
     // still be rendered, including unresolved-condition diagnostics.
     if (duel && duel->values.size() >= 2 &&
         ConditionKey(command.event, command.conditions) == ConditionKey(duel->event, duel->conditions)) {
-        const std::wstring first = ConditionPersonName(context, duel->values[0]);
-        const std::wstring second = ConditionPersonName(context, duel->values[1]);
+        const std::wstring first = PersonReferenceName(context, *duel, 0, duel->values[0]);
+        const std::wstring second = PersonReferenceName(context, *duel, 1, duel->values[1]);
         if (!first.empty() && !second.empty()) return L"完成" + first + L"与" + second + L"的单挑后，";
     }
     std::wstring conditions;
@@ -1623,12 +1725,12 @@ std::wstring CampTargetName(int camp) {
 bool StateTargetText(const GuideContext& context, const GuideCommand& command, std::wstring& text) {
     if (command.values.size() < 13) return false;
     if (command.values[0] == 0) {
-        text = ConditionPersonName(context, command.values[1]);
+        text = PersonReferenceName(context, command, 1, command.values[1]);
         return !text.empty();
     }
     if (command.values[0] == 1) {
         const GuideUnit* unit = UnitByBattlefieldNumber(context, command.values[2]);
-        text = unit ? ConditionPersonName(context, unit->id) : std::wstring();
+        text = unit ? PersonReferenceName(context, command, 2, unit->id) : std::wstring();
         if (text.empty()) text = L"战场编号 " + std::to_wstring(command.values[2]) + L" 的部队";
         return true;
     }
@@ -1707,7 +1809,7 @@ bool SingleRetreatTarget(const GuideContext& context, const GuideCommand& comman
     if (command.values.size() < 3) return false;
     if (command.values[0] == 0) {
         id = command.values[1];
-        person = ConditionPersonName(context, id);
+        person = PersonReferenceName(context, command, 1, id);
         side = SideForPerson(context, id);
         if (id == 1025) side = PersonSide::Friendly;
         if (id == 1026) side = PersonSide::Enemy;
@@ -1799,6 +1901,10 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
                 GuideDiagnostic(context, command, L"ability-command-invalid");
                 continue;
             }
+            if (change.attribute == 15) {
+                GuideDiagnostic(context, command, L"ability-code-excluded: id=15");
+                continue;
+            }
             if (PersonName(context, change.personId).empty())
                 GuideDiagnostic(context, command, L"person-name-missing: id=" + std::to_wstring(change.personId));
             if (change.attribute < 0 || change.attribute > 14)
@@ -1806,7 +1912,7 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
             if (change.operation == GuideAbilityOperation::Unknown)
                 GuideDiagnostic(context, command, L"ability-operation-unknown: id=" + std::to_wstring(change.rawOperation));
             AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
-                FormatAbilityChange(context, change), &context, &command);
+                FormatAbilityChange(context, change, &command), &context, &command);
         } else if (command.id == 0x3A && command.values.size() >= 3 && command.values[0] == 0 &&
             (command.values[1] == 1 || command.values[1] == 2) && command.values[2] > 0) {
             AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
@@ -1818,11 +1924,11 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
                 GuideDiagnostic(context, command, L"join-dynamic-or-unknown-parameters");
                 continue;
             }
-            std::wstring person = PersonName(context, command.values[0]);
+            std::wstring person = PersonReferenceName(context, command, 0, command.values[0]);
             if (person.empty()) person = L"武将 " + std::to_wstring(command.values[0]);
             AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"加入队伍", &context, &command);
         } else if (command.id == 0x39 && command.values.size() >= 2 && command.values[1] > 0) {
-            const std::wstring person = ConditionPersonName(context, command.values[0]);
+            const std::wstring person = PersonReferenceName(context, command, 0, command.values[0]);
             if (!person.empty()) AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
                 person + L"提升 " + std::to_wstring(command.values[1]) + L" 级", &context, &command);
         } else if (command.id == 0x53 && command.values.size() >= 8) {
@@ -1838,6 +1944,46 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
                 AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"撤退", &context, &command);
         }
     }
+}
+
+std::wstring EntryConsolidationKey(const GuideEntry& entry) {
+    if (entry.preserveText || entry.prefix.empty() || entry.actions.empty() ||
+        entry.sourceActions.empty() || entry.hideInAll) return {};
+    const GuideActionOrigin& origin = entry.sourceActions.front().origin;
+    std::wstring key = std::to_wstring(static_cast<int>(entry.filter)) + L"|" +
+        origin.source + L"|" + std::to_wstring(origin.scene) + L"|" +
+        ConditionKey(origin.event, origin.conditions);
+    // Dialogue branches stay separate; effect summaries may combine equal
+    // event/condition entries even when they originated in sibling blocks.
+    if (entry.filter == GuideFilter::Dialog)
+        key += L"|block:" + std::to_wstring(origin.block);
+    return key;
+}
+
+void ConsolidateEquivalentEntries(GuideResult& result) {
+    std::vector<GuideEntry> entries;
+    std::unordered_map<std::wstring, size_t> positions;
+    for (GuideEntry& entry : result.entries) {
+        const std::wstring key = EntryConsolidationKey(entry);
+        if (key.empty()) {
+            entries.push_back(std::move(entry));
+            continue;
+        }
+        auto found = positions.find(key);
+        if (found == positions.end()) {
+            positions.emplace(key, entries.size());
+            entries.push_back(std::move(entry));
+            continue;
+        }
+        GuideEntry& target = entries[found->second];
+        for (const std::wstring& action : entry.actions)
+            if (std::find(target.actions.begin(), target.actions.end(), action) == target.actions.end())
+                target.actions.push_back(action);
+        target.sourceActions.insert(target.sourceActions.end(),
+            entry.sourceActions.begin(), entry.sourceActions.end());
+        target.text = target.prefix + JoinGuideActions(target.actions) + L"。";
+    }
+    result.entries = std::move(entries);
 }
 
 void MergeAndPruneNarrativeEntries(GuideResult& result) {
@@ -1893,6 +2039,7 @@ void MergeAndPruneNarrativeEntries(GuideResult& result) {
             if (branch.conditional) {
                 // The parent dialogue runs before this child test. Never move
                 // the child's condition to the dialogue's own trigger.
+                entry.preserveText = true;
                 entry.text = original.prefix + JoinGuideActions(original.actions) +
                     L"；随后，" + branch.outcomePrefix + JoinGuideActions(branch.outcomes) + L"。";
             } else {
@@ -1932,6 +2079,7 @@ void MergeAndPruneNarrativeEntries(GuideResult& result) {
         }
     }
     result.entries = std::move(entries);
+    ConsolidateEquivalentEntries(result);
 }
 
 std::wstring FileTitle(const std::wstring& path, int number);

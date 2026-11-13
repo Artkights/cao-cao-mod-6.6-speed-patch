@@ -129,7 +129,7 @@ inline std::wstring Section(const std::wstring& text, const wchar_t* heading,
     const wchar_t* next) {
     const size_t begin = text.find(heading);
     if (begin == std::wstring::npos) return {};
-    const size_t end = text.find(next, begin);
+    const size_t end = next && *next ? text.find(next, begin) : std::wstring::npos;
     return text.substr(begin, end == std::wstring::npos ? end : end - begin);
 }
 inline std::wstring Dialogues(const std::wstring& text) {
@@ -375,10 +375,82 @@ inline bool Run(Build build, Check check) {
     run("dialogue owns both later ability reward and control while AI stays visible", Scenario(actions, Adjacent()),
         [](const auto& t, const auto&) {
             const auto d = Dialogues(t);
-            const size_t reward = d.find(L"主角攻击力提升 50 点");
+            const size_t reward = d.find(L"主角攻击提升 50 点");
             const size_t control = d.find(L"可由玩家控制");
-            return LineHas(d, L"主角攻击力提升 50 点", L"可由玩家控制") &&
+            return LineHas(d, L"主角攻击提升 50 点", L"可由玩家控制") &&
                 reward < control && LineHas(Ai(t), L"友军甲", L"可由玩家控制");
+        });
+    first.clear(); Dialogue(first, "SiblingA");
+    second.clear(); Dialogue(second, "SiblingB");
+    actions.clear(); Child(actions, first, Turn(3)); Child(actions, second, Turn(3));
+    run("same event and condition keep sibling dialogues separate", Scenario(actions),
+        [](const auto& t, const auto&) {
+            const auto d = Dialogues(t);
+            return !LineHas(d, L"SiblingA", L"SiblingB");
+        });
+    first.clear();
+    Command(first, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{0, 0, 1, 10}, 8);
+    second.clear();
+    Command(second, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{1, 0, 1, 20}, 8);
+    actions.clear(); Child(actions, first, Turn(3)); Child(actions, second, Turn(3));
+    run("same event and condition merge sibling reward effects", Scenario(actions),
+        [](const auto& t, const auto&) {
+            const auto rewards = Section(t, L"四、状态与奖惩", L"");
+            return LineHas(rewards, L"主角攻击提升 10 点", L"友军甲攻击提升 20 点");
+        });
+    first.clear(); Policy(first, 1, 7);
+    second.clear(); Policy(second, 2, 2);
+    actions.clear(); Child(actions, first, Turn(3)); Child(actions, second, Turn(3));
+    run("same event and condition merge sibling AI effects", Scenario(actions),
+        [](const auto& t, const auto&) {
+            const auto ai = Ai(t);
+            return LineHas(ai, L"友军甲", L"目标乙");
+        });
+    first.clear();
+    Command(first, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{0, 0, 1, 10}, 8);
+    second.clear();
+    Command(second, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{1, 0, 1, 20}, 8);
+    actions.clear();
+    run("same prefix in different events stays separate",
+        Scenario({Event(first, Turn(3)), Event(second, Turn(3))}),
+        [](const auto& t, const auto&) {
+            const auto rewards = Section(t, L"四、状态与奖惩", L"");
+            return !LineHas(rewards, L"主角攻击提升 10 点", L"友军甲攻击提升 20 点");
+        });
+    actions.clear(); Dialogue(actions, "*.1");
+    Command(actions, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{1, 0, 1, 10}, 8);
+    run("dialogue speaker pointer resolves to the person name", Scenario(actions),
+        [](const auto& t, const auto&) {
+            const auto d = Dialogues(t);
+            return LineHas(d, L"友军甲", L"触发对话") && !Has(d, L"*.1");
+        });
+    actions.clear();
+    static const wchar_t* abilityNames[] = {
+        L"攻击", L"防御", L"精神", L"爆发", L"士气", L"HP", L"MP",
+        L"当前HP", L"当前MP", L"等级", L"武力", L"统帅", L"智力", L"敏捷", L"运气"
+    };
+    for (int code = 0; code <= 14; ++code)
+        Command(actions, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+            std::array<int, 4>{0, code, 1, 10 + code}, 8);
+    Command(actions, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{0, 15, 1, 50}, 8);
+    Command(actions, 0x38, std::array<unsigned, 4>{2, 0x23, 0x34, 4},
+        std::array<int, 4>{0, 17, 4, 50}, 8);
+    run("ability codes use the full name map and exclude portrait code 15", Scenario(actions),
+        [&](const auto& t, const auto&) {
+            const auto rewards = Section(t, L"四、状态与奖惩", L"");
+            for (int code = 0; code <= 14; ++code) {
+                const std::wstring expected = L"主角" + std::wstring(abilityNames[code]) +
+                    L"提升 " + std::to_wstring(10 + code) + L" 点";
+                if (!Has(rewards, expected.c_str())) return false;
+            }
+            return !Has(rewards, L"头像") && !Has(rewards, L"能力码 15") &&
+                Has(rewards, L"能力码 17");
         });
     return okay;
 }

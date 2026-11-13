@@ -158,7 +158,7 @@ std::vector<unsigned char> ResourceGateScenario() {
 bool GuideConditionalExtensionMatches(bool enabled) {
     std::wstring text, diagnostics;
     if (!BuildGuideScriptTextForTest(ResourceGateScenario(), {L"曹操"}, text, diagnostics) ||
-        text.find(L"曹操攻击力提升 25 点") == std::wstring::npos) return false;
+        text.find(L"曹操攻击提升 25 点") == std::wstring::npos) return false;
     if (enabled) return text.find(L"曹操已加入我军") != std::wstring::npos &&
         text.find(L"尚未解析的扩展条件（0x7B）") == std::wstring::npos &&
         diagnostics.find(L"condition-unresolved") == std::wstring::npos;
