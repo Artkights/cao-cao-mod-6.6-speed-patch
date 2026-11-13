@@ -96,6 +96,12 @@ int main() {
     invalid.rejected = true;
     Check(rejected.Observe(50000, invalid) == RuntimeStartupStage::Failed && rejected.Finished(),
         "invalid runtime evidence terminates startup safely");
+    Check(!ShouldShowStartupReadinessNotice(true, 1, 4, 7),
+        "packed or version-selected installs do not repeat the readiness notice at startup");
+    Check(ShouldShowStartupReadinessNotice(false, 1, 4, 7),
+        "ordinary installs keep the partial-readiness startup notice");
+    Check(!ShouldShowStartupReadinessNotice(false, 7, 0, 7),
+        "fully ready ordinary installs show no startup notice");
     std::printf("RuntimeStartupTests: %u failures\n", failures);
     return failures ? 1 : 0;
 }

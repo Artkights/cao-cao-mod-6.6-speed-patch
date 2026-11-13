@@ -81,10 +81,12 @@ bool Payload(const std::wstring& root, XiaoAnInstall::PackagePayload& payload, b
 }
 
 bool Install(const std::wstring& root, const XiaoAnInstall::PackagePayload& payload, std::wstring& error,
-    unsigned mask = XiaoAnInstall::FeatureAll) {
+    unsigned mask = XiaoAnInstall::FeatureAll, std::wstring* reportOut = nullptr) {
     std::wstring detail, report;
     const auto kind = XiaoAnInstall::DetectTarget(root, detail, payload.versionFallback, payload.profile);
-    return XiaoAnInstall::InstallPatch(root, payload, kind, report, error, mask);
+    const bool installed = XiaoAnInstall::InstallPatch(root, payload, kind, report, error, mask);
+    if (reportOut) *reportOut = report;
+    return installed;
 }
 
 bool ModifiedIdentity(std::vector<unsigned char>& raw) {
@@ -147,9 +149,12 @@ void ExerciseVersionFallback(EngineProfileId profile, const wchar_t* exe, const 
     PackagePayload payload;
     Check(Payload(root, payload, true) && payload.profile == profile,
         "version resources select the matching embedded payload", error);
-    const bool installed = !payload.proxy.empty() && Install(root, payload, error);
+    std::wstring installReport;
+    const bool installed = !payload.proxy.empty() && Install(root, payload, error, FeatureAll, &installReport);
     Check(installed, "install acknowledged version fallback despite an unmatched signature", error);
     if (!installed) return;
+    Check(installReport.find(L"【一次性提示】") != std::wstring::npos,
+        "version-selected install reports its one-time notice", error);
     Manifest manifest;
     const std::wstring state = JoinPath(privateRoot, L"feature-state.ini");
     wchar_t mode[64] = {};
@@ -214,8 +219,11 @@ void ExercisePackedSnapshot(const wchar_t* exe, const wchar_t* originalAudio) {
         !DirectoryExists(JoinPath(PatchPrivatePath(root, engine.profile), L"backup")),
         "cached detection cannot authorize commit after the executable changes", error);
     Check(Write(executablePath, executableBytes), "restore executable fixture after cached-detection conflict");
-    Check(kind == TargetKind::Clean && InstallPatch(root, payload, kind, report, error, FeatureAll, &engine),
-        "install from cached automatic detection while retaining a packed-image recovery snapshot", error);
+    std::wstring packedReport;
+    Check(kind == TargetKind::Clean &&
+        InstallPatch(root, payload, kind, packedReport, error, FeatureAll, &engine) &&
+        packedReport.find(L"【一次性提示】") != std::wstring::npos,
+        "packed install reports its one-time notice while retaining a packed-image recovery snapshot", error);
     Manifest manifest;
     Check(LoadManifest(root, manifest, error) && manifest.versionSnapshots.size() == 7 &&
         manifest.status.container == L"Enigma" && manifest.status.layout == L"AutoVerified" &&
@@ -248,9 +256,13 @@ void ExerciseFeatureMatrix(EngineProfileId profile, const wchar_t* exe, const wc
                 "zero-feature installation is rejected without changing original files", error);
             continue;
         }
-        const bool installed = Install(root, payload, error, mask);
+        std::wstring installReport;
+        const bool installed = Install(root, payload, error, mask, &installReport);
         Check(installed, "install each of the seven nonzero feature combinations", error);
         if (!installed) continue;
+        if (mask == FeatureAll)
+            Check(installReport.find(L"【一次性提示】") == std::wstring::npos,
+                "standard installs do not report packed-only limitations", error);
         Manifest manifest;
         const std::wstring privateRoot = PatchPrivatePath(root, profile);
         const std::wstring config = JoinPath(privateRoot, L"pl_06.ini");

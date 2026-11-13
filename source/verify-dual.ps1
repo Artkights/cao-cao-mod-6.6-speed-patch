@@ -75,6 +75,7 @@ foreach ($generation in @('64','65','66')) {
         Invoke-Check "$generation-EngineProfileTests" (Join-Path $targetRoot 'EngineProfileTests.exe') @($exe64,$exe65,$exe66)
         if ($generation -eq '66' -and (Test-Path -LiteralPath (Join-Path $fixturePacked 'Ekd5.exe'))) {
             Invoke-Check '66-PackedEnigmaEngineProfile' (Join-Path $targetRoot 'EngineProfileTests.exe') @('--packed',(Join-Path $fixturePacked 'Ekd5.exe'))
+            Invoke-Check '66-DamingGuideControlChanges' (Join-Path $targetRoot 'GuideTests.exe') @('--daming-s01',(Join-Path $fixturePacked 'RS\S_01.eex'))
         }
         Invoke-Check "$generation-BattleRuntimeTests" (Join-Path $targetRoot 'BattleRuntimeTests.exe') @($exe,$fixture)
         Invoke-Check "$generation-BattleStatsTests" (Join-Path $targetRoot 'BattleStatsTests.exe') @($exe)
@@ -114,11 +115,14 @@ $required = @('66-NoExtensionSaveTransactions-Nobuna15','66-NoExtensionSaveTrans
     '64-PeImageTests','65-PeImageTests','66-PeImageTests',
     '64-ProtectedRuntimeTests','65-ProtectedRuntimeTests','66-ProtectedRuntimeTests',
     '64-RuntimeStartupTests','65-RuntimeStartupTests','66-RuntimeStartupTests',
-    '66-PackedEnigmaEngineProfile')
+    '66-PackedEnigmaEngineProfile','66-DamingGuideControlChanges')
 foreach ($contract in $required) {
     $rows = @($script:results | Where-Object { $_.Test -eq $contract })
     if ($rows.Count -ne 1 -or $rows[0].ExitCode -ne 0) { throw "Required release contract missing or failed: $contract" }
 }
-@{PackageVersion='1.4.0';Validation='OfflineOnly';GameAcceptance='UserPending';Required=$required;Passed=$true} | ConvertTo-Json -Depth 4 |
+$versionMatch = [regex]::Match((Get-Content -LiteralPath (Join-Path $sourceRoot 'Version.h') -Raw),
+    '#define\s+XIAOAN_VERSION_STRING\s+"([^"]+)"')
+if (!$versionMatch.Success) { throw 'Unable to read package version for validation evidence.' }
+@{PackageVersion=$versionMatch.Groups[1].Value;Validation='OfflineOnly';GameAcceptance='UserPending';Required=$required;Passed=$true} | ConvertTo-Json -Depth 4 |
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'required-contracts.json') -Encoding utf8
 Write-Output "All $($script:results.Count) test groups passed. Evidence: $OutputDirectory"

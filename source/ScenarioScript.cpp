@@ -185,6 +185,8 @@ bool ParseBlock(const std::vector<unsigned char>& bytes, size_t start, size_t le
         size_t end = 0;
         size_t block = 0;
         size_t event = 0;
+        size_t parentBlock = SIZE_MAX;
+        size_t blockOwnerOrdinal = SIZE_MAX;
         bool head = false;
         bool pendingSubEvent = false;
         std::vector<ScenarioCondition> conditions;
@@ -192,7 +194,8 @@ bool ParseBlock(const std::vector<unsigned char>& bytes, size_t start, size_t le
     };
     std::vector<BlockFrame> stack;
     const size_t rootBlock = nextBlock++;
-    stack.push_back({start, start + length, rootBlock, rootBlock, root, false, inherited, {}});
+    stack.push_back({start, start + length, rootBlock, rootBlock, SIZE_MAX, SIZE_MAX,
+        root, false, inherited, {}});
     while (!stack.empty()) {
         if (cancelled && cancelled->load()) return false;
         BlockFrame& frame = stack.back();
@@ -207,6 +210,8 @@ bool ParseBlock(const std::vector<unsigned char>& bytes, size_t start, size_t le
         command.offset = commandOffset;
         command.ordinal = output.size();
         command.block = frame.block;
+        command.parentBlock = frame.parentBlock;
+        command.blockOwnerOrdinal = frame.blockOwnerOrdinal;
         command.event = frame.event;
         command.conditions = frame.conditions;
         output.push_back(command);
@@ -224,7 +229,7 @@ bool ParseBlock(const std::vector<unsigned char>& bytes, size_t start, size_t le
             childConditions.insert(childConditions.end(), frame.headerConditions.begin(),
                 frame.headerConditions.end());
             stack.push_back({childStart, childStart + childLength, nextBlock++, frame.event,
-                false, false, std::move(childConditions), {}});
+                frame.block, command.ordinal, false, false, std::move(childConditions), {}});
         } else if (frame.pendingSubEvent && command.id < _countof(kCanOpenSubEvent) &&
             kCanOpenSubEvent[command.id]) {
             uint16_t childLength = 0;
@@ -245,7 +250,7 @@ bool ParseBlock(const std::vector<unsigned char>& bytes, size_t start, size_t le
             frame.cursor = childStart + childLength;
             frame.pendingSubEvent = false;
             stack.push_back({childStart, childStart + childLength, nextBlock++, frame.event,
-                false, false, std::move(conditions), {}});
+                frame.block, command.ordinal, false, false, std::move(conditions), {}});
         } else if (frame.head) {
             if (ShouldInheritCondition(command))
                 frame.headerConditions.push_back({command.id, command.values, command.texts});

@@ -3,6 +3,15 @@
 #include <windows.h>
 #include <cstdint>
 
+// Packed/protected and version-selected builds receive their known early
+// limitations once in the installer report. Startup must not repeat that
+// acknowledgement; ordinary installs keep the existing partial notice.
+inline bool ShouldShowStartupReadinessNotice(bool noticeHandledAtInstall,
+    unsigned readyFeatures, unsigned partialFeatures, unsigned requestedFeatures) {
+    return !noticeHandledAtInstall &&
+        (partialFeatures != 0 || readyFeatures != requestedFeatures);
+}
+
 enum class RuntimeStartupStage {
     WaitingForImage, ImportsReady, LayoutReady, FeaturesReady, Partial, Failed, TimedOut
 };

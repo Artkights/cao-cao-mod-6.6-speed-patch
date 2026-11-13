@@ -17,7 +17,7 @@ BEGIN
     BEGIN
         BLOCK "080404b0"
         BEGIN
-            VALUE "FileDescription", "曹操传加速补丁 1.4 Release\0"
+            VALUE "FileDescription", "曹操传加速补丁 1.4.1 Release\0"
             VALUE "FileVersion", XIAOAN_VERSION_STRING "\0"
             VALUE "ProductName", "曹操传加速补丁\0"
             VALUE "ProductVersion", XIAOAN_VERSION_STRING "\0"

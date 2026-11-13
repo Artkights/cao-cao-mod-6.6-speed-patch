@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Patch.h"
 #include <cstddef>
@@ -83,8 +83,8 @@ struct GuideTestStats {
 bool BuildGuideStatsForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot, GuideTestStats& stats);
 
 
-// Synthetic EEX regression entry point: exercises the shared parser and reward
-// renderer without depending on a particular game's Data.e5 name table.
+// Synthetic EEX regression entry point: exercises the shared parser and full guide
+// analysis without depending on a particular game's Data.e5 name table.
 bool BuildGuideScriptTextForTest(const std::vector<unsigned char>& bytes,
     const std::vector<std::wstring>& people, std::wstring& text, std::wstring& diagnostics);
 

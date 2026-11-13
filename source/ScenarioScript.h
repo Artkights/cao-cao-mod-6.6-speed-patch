@@ -23,6 +23,11 @@ struct ScenarioCommand {
     std::vector<ScenarioCondition> conditions;
     size_t ordinal = 0;
     size_t block = 0;
+    // Structural ancestry, rather than matching condition text, identifies
+    // commands that can follow a narrative trigger on the same script path.
+    // A section root has neither a parent block nor an opening command.
+    size_t parentBlock = SIZE_MAX;
+    size_t blockOwnerOrdinal = SIZE_MAX;
     size_t event = 0;
     size_t offset = 0;
     size_t section = 0;

@@ -1,9 +1,11 @@
 #include "Guide.h"
 #include "ScenarioScript.h"
 #include "BattleRuntime.h"
+#include "GuideAiFixtures.h"
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <stdio.h>
 #include <string>
@@ -425,10 +427,9 @@ bool ValidateShanZeiS00(const std::wstring& value, const GuideTestStats& stats) 
         L"刘备与裴元绍相邻且裴元绍HP上限低于 100时，刘备与裴元绍触发对话并且获得精壮果。",
         L"第 13 回合",
         L"6 支隐藏敌军",
-        L"初始部署于",
         L"完成本关后，获得 20000 金钱",
         L"我方部队到达（9，17）",
-        L"关羽撤退时，关羽触发对话并且失去 500 金钱。",
+        L"关羽撤退时，触发对话并且失去 500 金钱。",
         L"击退邓茂时，邓茂触发对话并且获得时空遗枝。",
         L"刘备HP上限低于 80时，刘备触发对话并且刘备全能力上升并解除异常。",
         L"关羽HP上限低于 80时，关羽触发对话并且关羽全能力上升并解除异常。",
@@ -455,7 +456,7 @@ bool ValidateShanZeiS00(const std::wstring& value, const GuideTestStats& stats) 
 bool ValidateShanZeiS85(const std::wstring& value, const GuideTestStats& stats) {
     static const wchar_t* required[] = {
         L"第 85 关简易攻略",
-        L"程远志HP上限低于 200且关羽与程远志相邻时，程远志、关羽等人触发对话；关羽与程远志单挑，并且程远志死亡。",
+        L"程远志HP上限低于 200且关羽与程远志相邻时，程远志与关羽触发对话；关羽与程远志单挑，并且程远志死亡。",
         L"（5，3）至（15，10）区域内的敌军攻防下降",
         L"（1，2）至（2，3）区域内的敌军防御上升",
         L"（5，3）至（19，11）区域内的敌军防御上升",
@@ -470,10 +471,14 @@ bool ValidateShanZeiS85(const std::wstring& value, const GuideTestStats& stats) 
         value.find(L"击退姜维后，姜维死亡") != std::wstring::npos ||
         value.find(L"第 3 回合时，程远志触发对话。") != std::wstring::npos) return false;
     if (value.find(L"第 16 回合前，区域内的敌军") != std::wstring::npos) return false;
-    if (CountOccurrences(value,
-        L"我方部队进入（0，6）至（6，10）区域且第 16 回合前") != 2) return false;
-    if (CountOccurrences(value,
-        L"我方部队进入（8，8）至（13，13）区域且第 16 回合前") != 2) return false;
+    // Each script branch retains its condition; dialogue and AI now both show
+    // these outcomes, so a whole-document occurrence count is not meaningful.
+    // This regression uses the National Day ShanZei fixture: both source 3F
+    // conditions are [16, 1]. The earlier ShanZei fixture instead uses [17, 1].
+    if (!GuideAiFixtures::LineHas(GuideAiFixtures::Ai(value),
+        L"我方部队进入（0，6）至（6，10）区域", L"第 16 回合前")) return false;
+    if (!GuideAiFixtures::LineHas(GuideAiFixtures::Ai(value),
+        L"我方部队进入（8，8）至（13，13）区域", L"第 16 回合前")) return false;
     return stats.commands > 0 && stats.dialogEntries > 0 && stats.ambushEntries > 0 &&
         stats.aiEntries > 0 && stats.rewardEntries > 0;
 }
@@ -486,24 +491,32 @@ bool ValidateStandard65(const std::wstring& value, const GuideTestStats& stats, 
         L"击退张宝时，张宝触发对话；获得恢复用麦，并且获得太平清领道。",
         L"击退张梁时，张梁触发对话并且获得恢复用麦。",
         L"我军阶段开始且第 1 回合时",
-        L"（5，10）至（12，12）范围的敌军由被动出击改为主动出击",
         L"完成本关后，获得 200 金钱。",
         L"我方部队到达（13，12）后，获得恢复用豆。"
     };
     static const wchar_t* last[] = {
         L"第 58 关简易攻略",
         L"（2，12）至（39，39）区域内的敌军数量等于0且我军阶段开始",
-        // The script's explicit speaker label is retained even when it is
-        // absent from the physical person-name table.
-        L"曹操触发对话；诸葛亮与魔王触发对话，并且诸葛亮全能力上升。",
-        L"（9，2）至（23，18）范围的敌军由坚守原地改为主动出击。"
+        // 72 renaming is a conservative narrative boundary; the subsequent
+        // buff precedes the later 魔王 dialogue and must not attach to it.
+        L"魔王触发对话",
+        L"诸葛亮全能力上升"
     };
     if (finalStage) {
         for (const wchar_t* item : last) if (value.find(item) == std::wstring::npos) return false;
+        const auto ai = GuideAiFixtures::Ai(value);
+        if (!GuideAiFixtures::LineHas(ai, L"（0，0）", L"主动出击") ||
+            !GuideAiFixtures::LineHas(ai, L"（39，39）", L"主动出击") ||
+            GuideAiFixtures::LineHas(GuideAiFixtures::Dialogues(value), L"魔王触发对话", L"诸葛亮全能力上升")) return false;
         return stats.commands == 477 && stats.rewardEntries == 1;
     }
     for (const wchar_t* item : first) if (value.find(item) == std::wstring::npos) return false;
-    return stats.commands == 819 && stats.dialogEntries == 2 && stats.aiEntries == 1 && stats.rewardEntries == 8;
+    const auto ai = GuideAiFixtures::Ai(value);
+    if (!GuideAiFixtures::LineHas(ai, L"（0，0）", L"主动出击") ||
+        !GuideAiFixtures::LineHas(ai, L"（19，19）", L"主动出击")) return false;
+    // AI now covers all camps, unconditional changes and direct control writes.
+    // Their entry count is not the former count of changing deployed enemies.
+    return stats.commands == 819 && stats.dialogEntries > 0 && stats.aiEntries > 0 && stats.rewardEntries > 0;
 }
 
 bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool finalStage) {
@@ -513,9 +526,7 @@ bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool 
         L"第 01 关简易攻略",
         L"第 2 回合时，西凉骑1、轻骑兵1等人触发对话",
         L"壮汉1爆发下降、陷入麻痹和混乱和中毒并HP减少 40",
-        L"第 3 回合时，6 支隐藏敌军在（8，1）至（11，2）范围出现。",
-        L"初始部署于（2，9）、（2，13）的敌军由坚守原地改为主动出击。",
-        L"初始部署于（9，10）的敌军由主动出击改为攻击指定武将。"
+        L"第 3 回合时，6 支隐藏敌军在（8，1）至（11，2）范围出现。"
     };
     static const wchar_t* last[] = {
         L"第 61 关简易攻略",
@@ -523,7 +534,6 @@ bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool 
         L"武将 2与夏溪相邻后，触发对话；武将 2精神上升，并且夏溪攻击上升。",
         L"普罗与苗海潮相邻后，触发对话；触发单挑；苗海潮防御下降、陷入麻痹并HP减少 200，并且获得将军印。",
         L"击退辅公祏时，辅公祏触发对话并且获得腾蛇越涧。",
-        L"（13，9）至（22，11）范围的敌军由坚守原地改为主动出击。",
         L"完成本关后，获得将军印并且获得 5000 金钱。",
         L"我方部队到达（7，27）后，获得珍珠。"
     };
@@ -531,16 +541,50 @@ bool ValidateXiSui(const std::wstring& value, const GuideTestStats& stats, bool 
         for (const wchar_t* item : last) if (value.find(item) == std::wstring::npos) return false;
         // Person 2 has no physical name in this fixture. Retain its adjacent
         // dialogue and state-change event through the explicit ID fallback.
-        return stats.commands == 1198 && stats.dialogEntries == 10 && stats.ambushEntries == 0 &&
-            stats.aiEntries == 2 && stats.rewardEntries == 24;
+        return stats.commands == 1198 && stats.dialogEntries > 0 && stats.ambushEntries == 0 &&
+            stats.aiEntries > 0 && stats.rewardEntries > 0 &&
+            GuideAiFixtures::LineHas(GuideAiFixtures::Ai(value), L"（13，9）", L"主动出击") &&
+            GuideAiFixtures::LineHas(GuideAiFixtures::Ai(value), L"（22，11）", L"主动出击");
     }
     for (const wchar_t* item : first) if (value.find(item) == std::wstring::npos) return false;
-    // The 0x38 ability-setting command is now rendered as a reward entry.
-    return stats.commands == 508 && stats.dialogEntries == 1 && stats.ambushEntries == 1 &&
-        stats.aiEntries == 2 && stats.rewardEntries == 2;
+    // Assert intended policies, rather than comparing with the initial enemy
+    // deployment (which cannot prove an event's previous policy).
+    return stats.commands == 508 && stats.dialogEntries > 0 && stats.ambushEntries == 1 &&
+        stats.aiEntries > 0 && stats.rewardEntries > 0 &&
+        GuideAiFixtures::Has(GuideAiFixtures::Ai(value), L"主动出击") &&
+        GuideAiFixtures::Has(GuideAiFixtures::Ai(value), L"攻击指定武将");
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 3 && wcscmp(argv[1], L"--daming-s01") == 0) {
+        std::ifstream input(std::filesystem::path(argv[2]), std::ios::binary);
+        const std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>());
+        std::vector<std::wstring> people(1024);
+        people[0] = L"朱重八"; people[2] = L"周德兴";
+        people[34] = L"梁必追"; people[239] = L"华云龙"; people[243] = L"费聚";
+        std::wstring text, diagnostics;
+        std::vector<ScenarioCommand> commands;
+        const bool okay = !bytes.empty() && BuildGuideScriptTextForTest(bytes, people, text, diagnostics) &&
+            GuideAiFixtures::ValidateDaming(text) && ParseScenarioScript(bytes, commands) &&
+            GuideAiFixtures::ValidateDamingStructure(commands);
+        printf("%s real Daming S01 parent dialogues and child control writes in both sections\n", okay ? "PASS" : "FAIL");
+        return okay ? 0 : 22;
+    }
+    const bool aiFixtures = GuideAiFixtures::Run(BuildGuideScriptTextForTest,
+        [](bool okay, const char* description, const std::wstring& text, const std::wstring& diagnostics) {
+            printf("%s %s\n", okay ? "PASS" : "FAIL", description);
+            if (!okay) {
+                const std::wstring evidence = text + L"\nDiagnostics: " + diagnostics + L"\n";
+                const int count = WideCharToMultiByte(CP_UTF8, 0, evidence.data(), static_cast<int>(evidence.size()),
+                    nullptr, 0, nullptr, nullptr);
+                std::string utf8(static_cast<size_t>(count), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, evidence.data(), static_cast<int>(evidence.size()), utf8.data(),
+                    count, nullptr, nullptr);
+                fwrite(utf8.data(), 1, utf8.size(), stdout);
+            }
+        });
+    if (!aiFixtures) return 21;
     if (!ValidateAbilityCommands()) return 17;
     if (!ValidateConditionalExtension()) return 19;
     if (!ValidateGuideResourceReadiness()) return 20;

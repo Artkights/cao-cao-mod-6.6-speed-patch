@@ -1707,6 +1707,12 @@ bool InstallPatch(const std::wstring& rootValue, const PackagePayload& payload,
     else if (engine.packedContainer)
         report += L"\r\n已识别容器中的自动验证布局，并保存主程序恢复快照；各功能仍待游戏启动时确认。";
     report += L"\r\n文件安装完成；启动、加速、攻略和统计的实际可用状态将在游戏运行时分别记录。";
+    if (preserveInstallSnapshot) {
+        report += L"\r\n\r\n【一次性提示】加壳、受保护或按版本模板安装的构建：此说明仅在安装或更新补丁时显示一次，之后启动游戏不再重复。"
+            L"\r\n保护层展开前的战场事件无法追溯，统计历史可能标记为不完整；攻略名称表在资源就绪前使用磁盘名称和人物编号回退。"
+            L"\r\n若某功能在启动后未就绪，状态和原因写入 " + paths.directory +
+            L"\\install.ini 与 " + paths.directory + L"\\diagnostics，不再弹窗。";
+    }
     return true;
 }
 

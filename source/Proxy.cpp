@@ -1254,9 +1254,12 @@ DWORD InitializeWorker() {
     CompleteScenarioCapture(HasFeature(XiaoAnInstall::FeatureGuide) || HasFeature(XiaoAnInstall::FeatureBattleStats));
     InterlockedExchange(&gStartupAccepted, readyFeatures ? TRUE : FALSE);
     CompleteStartup();
-    if (partialFeatures || readyFeatures != gRequestedFeatures)
+    if (ShouldShowStartupReadinessNotice(runtimeRequired, readyFeatures, partialFeatures, gRequestedFeatures))
         MessageBoxW(nullptr, (L"补丁已按实际能力启用，以下项目尚未完全就绪：\r\n" + summary +
             L"\r\n详细结果见补丁 diagnostics\\runtime.log。").c_str(), L"加速补丁", MB_ICONWARNING);
+    else if (partialFeatures || readyFeatures != gRequestedFeatures)
+        RecordRuntimeStartup(L"startup-notice-install-only",
+            L"加壳、受保护或版本回退构建的未就绪提示已在安装/更新补丁时显示一次；本次启动仅记录诊断，不再弹窗。");
     if (!HasFeature(XiaoAnInstall::FeatureAccelerator)) return 0;
     gKeyboardThread = GetCurrentThreadId();
     MSG bootstrap = {};

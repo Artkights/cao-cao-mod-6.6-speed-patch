@@ -41,12 +41,38 @@ struct GuideFile {
     bool isBattlefield = true;
 };
 
+struct GuideActionOrigin {
+    std::wstring source;
+    size_t scene = 0;
+    size_t event = 0;
+    size_t block = 0;
+    size_t ordinal = SIZE_MAX;
+    size_t offset = 0;
+    size_t narrativeGroup = SIZE_MAX;
+    std::vector<ScenarioCondition> conditions;
+};
+
+struct GuideAction {
+    std::wstring text;
+    GuideActionOrigin origin;
+};
+
+struct GuideNarrativeGroup {
+    const ScenarioCommand* first = nullptr;
+    std::vector<std::wstring> speakers;
+    std::vector<const ScenarioCommand*> duels;
+    bool hasDialog = false;
+};
+
 struct GuideEntry {
     GuideFilter filter = GuideFilter::All;
     std::wstring text;
     std::wstring conditionKey;
     std::wstring prefix;
     std::vector<std::wstring> actions;
+    std::vector<GuideAction> sourceActions;
+    size_t narrativeGroup = SIZE_MAX;
+    bool keepWithoutResult = false;
     bool hideInAll = false;
 };
 
@@ -107,6 +133,9 @@ struct GuideContext {
     std::wstring* diagnostics = nullptr;
     mutable std::unordered_map<int, bool> reportedMissingPeople;
     mutable std::unordered_map<int, bool> reportedMissingItems;
+    mutable bool narrativesReady = false;
+    mutable std::vector<GuideNarrativeGroup> narratives;
+    mutable std::unordered_map<size_t, size_t> narrativeOwners;
 };
 
 enum class GuideAbilityOperation {
@@ -614,7 +643,7 @@ std::wstring AfterLead(const std::wstring& conditions) {
 std::wstring PolicyName(int value) {
     static const wchar_t* names[] = {
         L"被动出击", L"主动出击", L"坚守原地", L"攻击指定武将",
-        L"前往指定地点", L"跟随指定武将", L"撤往指定地点"
+        L"前往指定地点", L"跟随指定武将", L"撤往指定地点", L"玩家可控"
     };
     return value >= 0 && value < static_cast<int>(_countof(names)) ? names[value] : L"";
 }
@@ -864,10 +893,21 @@ std::wstring JoinGuideActions(const std::vector<std::wstring>& actions) {
     return text;
 }
 
+GuideActionOrigin GuideOrigin(const GuideContext& context, const GuideCommand& command) {
+    const auto owner = context.narrativeOwners.find(command.ordinal);
+    return {context.sourcePath, command.scene, command.event, command.block,
+        command.ordinal, command.offset,
+        owner == context.narrativeOwners.end() ? SIZE_MAX : owner->second, command.conditions};
+}
+
 void AddActionEntry(GuideResult& result, GuideFilter filter, const std::wstring& conditionKey,
-    const std::wstring& prefix, const std::wstring& action) {
+    const std::wstring& prefix, const std::wstring& action,
+    const GuideContext* context = nullptr, const GuideCommand* command = nullptr) {
     if (conditionKey.empty() || prefix.empty() || action.empty()) return;
+    // Source actions stay separate until dialogue ownership is known. Equal
+    // condition text does not establish execution order or branch identity.
     for (GuideEntry& entry : result.entries) {
+        if (command || !entry.sourceActions.empty()) continue;
         if (entry.filter != filter || entry.conditionKey != conditionKey || entry.prefix != prefix) continue;
         if (std::find(entry.actions.begin(), entry.actions.end(), action) == entry.actions.end())
             entry.actions.push_back(action);
@@ -879,6 +919,7 @@ void AddActionEntry(GuideResult& result, GuideFilter filter, const std::wstring&
     entry.conditionKey = conditionKey;
     entry.prefix = prefix;
     entry.actions.push_back(action);
+    if (context && command) entry.sourceActions.push_back({action, GuideOrigin(*context, *command)});
     entry.text = prefix + action + L"。";
     result.entries.push_back(std::move(entry));
 }
@@ -893,8 +934,7 @@ void CollectDeployments(const GuideContext& context, std::vector<GuideUnit>& uni
                 const int x = command.values[base + 2];
                 const int y = command.values[base + 3];
                 const int policy = command.values[base + 7];
-                if (id < 0 || id >= 1024 || x < 0 || y < 0 || x >= 256 || y >= 256 ||
-                    policy < 0 || policy > 6) continue;
+                if (id < 0 || id >= 1024 || x < 0 || y < 0 || x >= 256 || y >= 256) continue;
                 units.push_back({id, 20 + static_cast<int>(i), x, y, policy,
                     command.values[base + 1] != 0, false, GuideUnit::Camp::Friend});
             }
@@ -905,8 +945,7 @@ void CollectDeployments(const GuideContext& context, std::vector<GuideUnit>& uni
                 const int x = command.values[base + 3];
                 const int y = command.values[base + 4];
                 const int policy = command.values[base + 8];
-                if (id < 0 || id >= 1024 || x < 0 || y < 0 || x >= 256 || y >= 256 ||
-                    policy < 0 || policy > 6) continue;
+                if (id < 0 || id >= 1024 || x < 0 || y < 0 || x >= 256 || y >= 256) continue;
                 units.push_back({id, 60 + static_cast<int>(i), x, y, policy,
                     command.values[base + 2] != 0, command.values[base + 1] != 0,
                     GuideUnit::Camp::Enemy});
@@ -923,65 +962,145 @@ void CollectDeployments(const GuideContext& context, std::vector<GuideUnit>& uni
     }
 }
 
-std::vector<const GuideCommand*> CommandsInBlock(const GuideContext& context, size_t block) {
-    std::vector<const GuideCommand*> result;
-    for (const GuideCommand& command : context.commands) if (command.block == block) result.push_back(&command);
-    return result;
+void GuideDiagnostic(const GuideContext& context, const GuideCommand& command,
+    const std::wstring& detail);
+std::wstring RewardPrefix(const GuideContext& context, const GuideCommand& command,
+    bool allowBestEffort);
+
+bool IsGuideDialogue(unsigned id) {
+    return id == 0x14 || id == 0x15 || id == 0x16 || id == 0x63 || id == 0x69;
 }
 
-const GuideCommand* DuelInBlock(const GuideContext& context, size_t block, size_t beforeOrdinal = SIZE_MAX) {
-    const GuideCommand* result = nullptr;
-    for (const GuideCommand& command : context.commands)
-        if (command.block == block && command.ordinal < beforeOrdinal && command.id == 0x68 &&
-            command.values.size() >= 2) result = &command;
-    return result;
+bool IsGuideNarrativeEffect(const GuideCommand& command) {
+    switch (command.id) {
+    case 0x38: case 0x39: case 0x3A: case 0x3B: case 0x3D:
+    case 0x4D: case 0x4E: case 0x53: case 0x59: return true;
+    case 0x78: return command.values.size() == 4 && command.values[1] == 1 &&
+        command.values[3] == 32;
+    default: return false;
+    }
+}
+
+bool IsGuideNarrativeBoundary(unsigned id) {
+    return id == 0x0C || id == 0x0D || id == 0x0E || id == 0x11 || id == 0x12 || id == 0x13 ||
+        id == 0x49 || id == 0x6A || id == 0x72 || id == 0x76;
+}
+
+void EnsureGuideNarratives(const GuideContext& context) {
+    if (context.narrativesReady) return;
+    context.narrativesReady = true;
+    struct Frame {
+        size_t parent = SIZE_MAX;
+        size_t group = SIZE_MAX;
+        bool local = false;
+        bool afterEffect = false;
+    };
+    std::unordered_map<size_t, Frame> frames;
+    for (const GuideCommand& command : context.commands) {
+        auto found = frames.find(command.block);
+        if (found == frames.end()) {
+            Frame frame;
+            frame.parent = command.parentBlock;
+            const auto parent = frames.find(command.parentBlock);
+            if (parent != frames.end()) {
+                frame.group = parent->second.group;
+                frame.afterEffect = parent->second.afterEffect;
+            }
+            // An unpaired else/selection is not proof that the parent dialogue
+            // dominates this branch. Its own dialogue may establish a new group.
+            if (command.blockOwnerOrdinal < context.commands.size()) {
+                const unsigned opener = context.commands[command.blockOwnerOrdinal].id;
+                if (opener == 0x03 || opener == 0x12 || opener == 0x13)
+                    frame.group = SIZE_MAX;
+            }
+            found = frames.emplace(command.block, frame).first;
+        }
+        Frame& frame = found->second;
+        const bool dialogue = IsGuideDialogue(command.id);
+        const bool duel = command.id == 0x68 && command.values.size() >= 2;
+        if (dialogue || duel) {
+            const bool inheritedDuel = duel && frame.group != SIZE_MAX && !frame.afterEffect &&
+                ConditionKey(command.event, command.conditions) ==
+                ConditionKey(context.narratives[frame.group].first->event,
+                    context.narratives[frame.group].first->conditions);
+            // A duel performance in an unconditional child belongs to the
+            // preceding parent dialogue. A child dialogue still starts its
+            // own group and never flows back into the parent or a sibling.
+            if ((!frame.local && !inheritedDuel) || frame.group == SIZE_MAX || frame.afterEffect) {
+                frame.group = context.narratives.size();
+                GuideNarrativeGroup group;
+                group.first = &command;
+                context.narratives.push_back(std::move(group));
+                frame.local = true;
+                frame.afterEffect = false;
+            }
+            GuideNarrativeGroup& group = context.narratives[frame.group];
+            if (dialogue) {
+                group.hasDialog = true;
+                if (command.id == 0x15 && command.values.size() >= 2) {
+                    AddUnique(group.speakers, ConditionPersonName(context, command.values[0]));
+                    AddUnique(group.speakers, ConditionPersonName(context, command.values[1]));
+                }
+                for (const auto& name : ExtractSpeakers(context, command))
+                    AddUnique(group.speakers, name);
+            }
+            if (duel) group.duels.push_back(&command);
+        }
+        if (frame.group != SIZE_MAX) context.narrativeOwners[command.ordinal] = frame.group;
+        if (IsGuideNarrativeEffect(command)) {
+            size_t block = command.block;
+            while (block != SIZE_MAX) {
+                const auto ancestor = frames.find(block);
+                if (ancestor == frames.end()) break;
+                ancestor->second.afterEffect = true;
+                block = ancestor->second.parent;
+            }
+        }
+        if (IsGuideNarrativeBoundary(command.id)) {
+            size_t block = command.block;
+            while (block != SIZE_MAX) {
+                const auto ancestor = frames.find(block);
+                if (ancestor == frames.end()) break;
+                ancestor->second.group = SIZE_MAX;
+                ancestor->second.local = false;
+                block = ancestor->second.parent;
+            }
+        }
+    }
 }
 
 void AddDialogEntries(const GuideContext& context, GuideResult& result) {
-    std::vector<size_t> visited;
-    for (const GuideCommand& seed : context.commands) {
-        if (std::find(visited.begin(), visited.end(), seed.block) != visited.end()) continue;
-        visited.push_back(seed.block);
-        const std::vector<const GuideCommand*> commands = CommandsInBlock(context, seed.block);
-        const GuideCommand* duel = DuelInBlock(context, seed.block);
-        std::vector<std::wstring> speakers;
-        const GuideCommand* representative = nullptr;
-        for (const GuideCommand* command : commands) {
-            if (command->id != 0x14 && command->id != 0x15 && command->id != 0x16 &&
-                command->id != 0x63 && command->id != 0x69) continue;
-            if (!representative) representative = command;
-            if (command->id == 0x15 && command->values.size() >= 2) {
-                AddUnique(speakers, ConditionPersonName(context, command->values[0]));
-                AddUnique(speakers, ConditionPersonName(context, command->values[1]));
-            }
-            for (const std::wstring& name : ExtractSpeakers(context, *command)) AddUnique(speakers, name);
-        }
-        if (representative && !speakers.empty()) {
-            std::wstring conditions;
-            bool simpleAdjacent = false;
-            std::pair<int, int> adjacent;
-            if (RenderConditions(context, representative->conditions, conditions, simpleAdjacent, adjacent)) {
-                const std::wstring prefix = simpleAdjacent ? conditions + L"后，" : WhenLead(conditions);
-                const std::wstring action = simpleAdjacent ? L"触发对话" : JoinNames(speakers) + L"触发对话";
-                AddActionEntry(result, GuideFilter::Dialog,
-                    ConditionKey(representative->event, representative->conditions), prefix, action);
-            }
-        }
-        if (!duel || duel->values.size() < 2) continue;
-        const std::wstring first = ConditionPersonName(context, duel->values[0]);
-        const std::wstring second = ConditionPersonName(context, duel->values[1]);
-        if (first.empty() || second.empty()) continue;
+    EnsureGuideNarratives(context);
+    for (size_t index = 0; index < context.narratives.size(); ++index) {
+        const GuideNarrativeGroup& group = context.narratives[index];
+        if (!group.first) continue;
+        const GuideCommand& first = *group.first;
         std::wstring conditions;
         bool simpleAdjacent = false;
         std::pair<int, int> adjacent;
-        if (!RenderConditions(context, duel->conditions, conditions, simpleAdjacent, adjacent)) continue;
-        const bool matchingAdjacent = simpleAdjacent &&
-            ((adjacent.first == duel->values[0] && adjacent.second == duel->values[1]) ||
-                (adjacent.first == duel->values[1] && adjacent.second == duel->values[0]));
-        const std::wstring prefix = matchingAdjacent ? conditions + L"后，" : WhenLead(conditions);
-        const std::wstring action = matchingAdjacent ? L"触发单挑" : first + L"与" + second + L"单挑";
-        AddActionEntry(result, GuideFilter::Dialog,
-            ConditionKey(duel->event, duel->conditions), prefix, action);
+        const bool rendered = RenderConditions(context, first.conditions, conditions, simpleAdjacent, adjacent);
+        GuideEntry entry;
+        entry.filter = GuideFilter::Dialog;
+        entry.narrativeGroup = index;
+        entry.keepWithoutResult = !group.duels.empty();
+        entry.conditionKey = ConditionKey(first.event, first.conditions);
+        entry.prefix = rendered ? (simpleAdjacent ? conditions + L"后，" : WhenLead(conditions)) :
+            RewardPrefix(context, first, true);
+        if (group.hasDialog) entry.actions.push_back(simpleAdjacent ? L"触发对话" :
+            (group.speakers.empty() ? L"触发对话" : JoinNames(group.speakers) + L"触发对话"));
+        for (const GuideCommand* duel : group.duels) {
+            const std::wstring left = ConditionPersonName(context, duel->values[0]);
+            const std::wstring right = ConditionPersonName(context, duel->values[1]);
+            if (left.empty() || right.empty()) continue;
+            const bool matching = simpleAdjacent &&
+                ((adjacent.first == duel->values[0] && adjacent.second == duel->values[1]) ||
+                 (adjacent.first == duel->values[1] && adjacent.second == duel->values[0]));
+            entry.actions.push_back(matching ? L"触发单挑" : left + L"与" + right + L"单挑");
+        }
+        if (entry.actions.empty()) continue;
+        entry.sourceActions.push_back({entry.actions.front(), GuideOrigin(context, first)});
+        entry.text = entry.prefix + JoinGuideActions(entry.actions) + L"。";
+        result.entries.push_back(std::move(entry));
     }
 }
 
@@ -1026,41 +1145,268 @@ void AddAmbushEntries(const GuideContext& context, GuideResult& result) {
     }
 }
 
-void AddAiEntries(const GuideContext& context, GuideResult& result) {
-    for (const GuideCommand& command : context.commands) {
-        if (command.id != 0x4E || command.values.size() < 8) continue;
-        std::wstring conditions;
-        bool simpleAdjacent = false;
-        std::pair<int, int> adjacent;
-        if (!RenderConditions(context, command.conditions, conditions, simpleAdjacent, adjacent)) continue;
-        const int newPolicy = command.values[7];
-        const std::wstring newName = PolicyName(newPolicy);
-        if (newName.empty()) continue;
-        std::vector<const GuideUnit*> targets;
-        if (command.values[0] == 0) {
-            for (const GuideUnit& unit : context.units)
-                if (unit.camp == GuideUnit::Camp::Enemy && unit.id == command.values[1]) targets.push_back(&unit);
-        } else if (command.values[0] == 1) {
-            const int camp = command.values[6];
-            if (camp != 2 && camp != 5 && camp != 6) continue;
-            const int x1 = std::min(command.values[2], command.values[4]);
-            const int x2 = std::max(command.values[2], command.values[4]);
-            const int y1 = std::min(command.values[3], command.values[5]);
-            const int y2 = std::max(command.values[3], command.values[5]);
-            for (const GuideUnit& unit : context.units)
-                if (unit.camp == GuideUnit::Camp::Enemy && unit.x >= x1 && unit.x <= x2 &&
-                    unit.y >= y1 && unit.y <= y2) targets.push_back(&unit);
-        } else continue;
-        for (int oldPolicy = 0; oldPolicy <= 6; ++oldPolicy) {
-            std::vector<const GuideUnit*> group;
-            for (const GuideUnit* unit : targets) if (unit->policy == oldPolicy && oldPolicy != newPolicy) group.push_back(unit);
-            const std::wstring positions = PositionSummary(group);
-            const std::wstring oldName = PolicyName(oldPolicy);
-            if (positions.empty() || oldName.empty()) continue;
-            AddActionEntry(result, GuideFilter::Ai,
-                ConditionKey(command.event, command.conditions), WhenLead(conditions),
-                L"初始部署于" + positions + L"的敌军由" + oldName + L"改为" + newName);
+struct GuideAiChange {
+    const GuideCommand* command = nullptr;
+    std::wstring action;
+    bool targetResolved = false;
+};
+
+std::wstring GuideAiRawCommand(const GuideCommand& command) {
+    std::wstring result = L"原始指令 " + std::to_wstring(command.id) + L" 参数[";
+    for (size_t i = 0; i < command.values.size(); ++i) {
+        if (i) result += L",";
+        result += std::to_wstring(command.values[i]);
+    }
+    result += L"] 标签[";
+    for (size_t i = 0; i < command.parameterTags.size(); ++i) {
+        if (i) result += L",";
+        result += std::to_wstring(command.parameterTags[i]);
+    }
+    return result + L"]";
+}
+
+std::wstring GuideAiPerson(const GuideContext& context, int32_t value, bool& resolved) {
+    resolved = false;
+    if (value >= 0 && value < 1024) {
+        resolved = true;
+        const std::wstring name = ConditionPersonName(context, value);
+        std::wstring side;
+        bool ambiguous = false;
+        // 4B describes a deployment slot, not a literal person. Only explicit
+        // 46/47 person fields establish an initial side for this description.
+        for (const auto& deployment : context.commands) {
+            const size_t stride = deployment.id == 0x46 ? 11u : deployment.id == 0x47 ? 12u : 0u;
+            if (!stride || deployment.values.size() % stride != 0) continue;
+            for (size_t base = 0; base < deployment.values.size(); base += stride) {
+                if (deployment.values[base] != value || base >= deployment.parameterTags.size() ||
+                    deployment.parameterTags[base] != 2) continue;
+                const std::wstring candidate = deployment.id == 0x46 ? L"友军" :
+                    deployment.values[base + 1] != 0 ? L"援军" : L"敌军";
+                if (!side.empty() && side != candidate) ambiguous = true;
+                side = candidate;
+            }
         }
+        return (ambiguous ? std::wstring() : side) + name;
+    }
+    if (value >= 1024 && value <= 1027)
+        return L"特殊人物选择器 " + std::to_wstring(value) + L" 指定的部队";
+    if (value >= 1028 && value <= 1277) {
+        resolved = true;
+        return L"战场编号 " + std::to_wstring(value - 1028) + L" 的部队";
+    }
+    if (value <= -2)
+        return L"由脚本变量 " + std::to_wstring(-static_cast<int64_t>(value) - 2) + L" 指定的部队";
+    return L"人物参数 " + std::to_wstring(value) + L" 指定的部队";
+}
+
+std::wstring GuideAiCoordinate(int32_t value, bool& resolved) {
+    if (value < 0) {
+        resolved = false;
+        // Type 04 dereferences a numeric variable for negative parameters;
+        // its encoding is not the tag-02 (-2-N) person encoding.
+        return L"数值变量引用 " + std::to_wstring(value);
+    }
+    return std::to_wstring(value);
+}
+
+GuideAiChange DecodeGuidePolicyChange(const GuideContext& context, const GuideCommand& command) {
+    GuideAiChange result;
+    result.command = &command;
+    static const std::vector<uint16_t> tags = {0x2C,2,4,4,4,4,3,7,2,4,4};
+    if (command.values.size() != 11 || command.parameterTags != tags) {
+        result.action = L"部队 AI／控制状态变更（" + GuideAiRawCommand(command) + L"）";
+        GuideDiagnostic(context, command, L"ai-command-layout-unresolved: " + GuideAiRawCommand(command));
+        return result;
+    }
+    const auto& values = command.values;
+    std::wstring target;
+    result.targetResolved = true;
+    // Native 4E normalizes the WORD mode FFFF to zero before dispatching
+    // its single-person branch (6.4/6.5/6.6: 00414726..00414744).
+    if (values[0] == 0 || values[0] == -1) {
+        target = GuideAiPerson(context, values[1], result.targetResolved);
+    } else if (values[0] == 1 && values[6] >= 0 && values[6] <= 6) {
+        static const wchar_t* camps[] = {L"我军", L"友军", L"敌军", L"援军",
+            L"我军及友军", L"敌军及援军", L"全部部队"};
+        int32_t x1 = values[2], y1 = values[3], x2 = values[4], y2 = values[5];
+        if (x1 >= 0 && x2 >= 0 && y1 >= 0 && y2 >= 0) {
+            if (x1 > x2) std::swap(x1, x2);
+            if (y1 > y2) std::swap(y1, y2);
+        }
+        target = L"（" + GuideAiCoordinate(x1, result.targetResolved) + L"，" +
+            GuideAiCoordinate(y1, result.targetResolved) + L"）至（" +
+            GuideAiCoordinate(x2, result.targetResolved) + L"，" +
+            GuideAiCoordinate(y2, result.targetResolved) + L"）区域内的" + camps[values[6]];
+    } else {
+        result.targetResolved = false;
+        result.action = L"部队 AI／控制状态变更（" + GuideAiRawCommand(command) + L"）";
+        GuideDiagnostic(context, command, L"ai-target-unresolved: " + GuideAiRawCommand(command));
+        return result;
+    }
+    const int policy = values[7];
+    if (policy == 7) result.action = target + L"可由玩家控制";
+    else {
+        const std::wstring policyName = PolicyName(policy);
+        result.action = target + L"的行动方针设为" +
+            (policyName.empty() ? L"未知方针码 " + std::to_wstring(policy) : policyName);
+        if (policy == 3 || policy == 5) {
+            bool referenceResolved = false;
+            const std::wstring reference = GuideAiPerson(context, values[8], referenceResolved);
+            result.targetResolved = result.targetResolved && referenceResolved;
+            result.action += L"（目标：" + reference + L"）";
+        } else if (policy == 4 || policy == 6) {
+            result.action += L"（目标地点：" + GuideAiCoordinate(values[9], result.targetResolved) +
+                L"，" + GuideAiCoordinate(values[10], result.targetResolved) + L"）";
+        }
+        if (policyName.empty())
+            GuideDiagnostic(context, command, L"ai-policy-unresolved: " + GuideAiRawCommand(command));
+    }
+    return result;
+}
+
+bool GuideAiKeepsIntegerConstants(unsigned id) {
+    // These commands have no integer-variable write side effect. Everything
+    // else ends the small constant-propagation window, including script calls,
+    // jumps, arbitrary memory operations, and unaudited extension commands.
+    switch (id) {
+    case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+    case 0x09: case 0x0B:
+    case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A:
+    case 0x25: case 0x26: case 0x2D: case 0x2E: case 0x36: case 0x3C:
+    case 0x3F: case 0x40: case 0x41: case 0x42: case 0x43:
+    case 0x63: case 0x68: case 0x69: case 0x79: case 0x7B:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::vector<GuideAiChange> CollectGuideAiChanges(const GuideContext& context) {
+    using Constants = std::unordered_map<int32_t, int32_t>;
+    struct Block {
+        size_t id = 0;
+        size_t parent = SIZE_MAX;
+        size_t owner = SIZE_MAX;
+        std::vector<const GuideCommand*> commands;
+    };
+    std::vector<Block> blocks;
+    std::unordered_map<size_t, size_t> blockIndex;
+    std::unordered_map<size_t, std::vector<size_t>> children;
+    for (const auto& command : context.commands) {
+        auto inserted = blockIndex.emplace(command.block, blocks.size());
+        if (inserted.second) {
+            blocks.push_back({command.block, command.parentBlock, command.blockOwnerOrdinal, {}});
+            if (command.parentBlock != SIZE_MAX) children[command.blockOwnerOrdinal].push_back(inserted.first->second);
+        }
+        blocks[inserted.first->second].commands.push_back(&command);
+    }
+    std::vector<GuideAiChange> changes;
+    auto intersect = [](Constants& entry, const Constants& exit) {
+        for (auto it = entry.begin(); it != entry.end();) {
+            const auto found = exit.find(it->first);
+            if (found == exit.end() || found->second != it->second) it = entry.erase(it);
+            else ++it;
+        }
+    };
+    auto walk = [&](auto&& self, size_t index, Constants state, size_t depth) -> Constants {
+        if (depth > 512) { state.clear(); return state; }
+        const Block& block = blocks[index];
+        for (const GuideCommand* pointer : block.commands) {
+            const GuideCommand& command = *pointer;
+            const auto& values = command.values;
+            if (command.id == 0x4E) {
+                changes.push_back(DecodeGuidePolicyChange(context, command));
+                if (values.size() != 11 || command.parameterTags !=
+                    std::vector<uint16_t>({0x2C,2,4,4,4,4,3,7,2,4,4})) state.clear();
+            } else if (command.id == 0x77) {
+                const bool standard = values.size() == 5 && command.parameterTags ==
+                    std::vector<uint16_t>({0x51,4,0x53,0x52,4});
+                if (!standard || values[0] != 2 || values[1] < 0 || values[1] >= 4096) {
+                    state.clear();
+                } else if (values[2] == 2 && values[3] == 0) {
+                    state[values[1]] = values[4];
+                } else {
+                    state.erase(values[1]);
+                }
+            } else if (command.id == 0x78) {
+                const bool standard = values.size() == 4 && command.parameterTags ==
+                    std::vector<uint16_t>({4,0x54,2,0x55});
+                if (!standard) {
+                    // A nonstandard 78 layout cannot be ruled out as a control
+                    // write. Retain its raw action rather than silently drop it.
+                    changes.push_back({&command, L"行动方针／控制状态变更（" +
+                        GuideAiRawCommand(command) + L"）", false});
+                    GuideDiagnostic(context, command, L"ai-variable-layout-unresolved: " + GuideAiRawCommand(command));
+                    state.clear();
+                } else if (values[1] == 0) {
+                    if (values[0] >= 0) state.erase(values[0]);
+                    else state.clear();
+                } else if (values[1] == 1) {
+                    if (values[3] == 32) {
+                        bool resolved = false;
+                        const std::wstring target = GuideAiPerson(context, values[2], resolved);
+                        const auto known = state.find(values[0]);
+                        std::wstring action;
+                        if (values[0] >= 0 && known != state.end()) {
+                            const unsigned byte = static_cast<unsigned char>(static_cast<uint32_t>(known->second));
+                            if (byte == 7) action = target + L"可由玩家控制";
+                            else if (byte == 8) action = target + L"设为不可控";
+                            else action = target + L"的行动方针／控制状态原始字节设为 " + std::to_wstring(byte);
+                            GuideDiagnostic(context, command, L"ai-variable-constant: variable=" +
+                                std::to_wstring(values[0]) + L" raw=" + std::to_wstring(known->second) +
+                                L" byte=" + std::to_wstring(byte));
+                        } else {
+                            action = target + L"的行动方针／控制状态由脚本变量 " +
+                                std::to_wstring(values[0]) + L" 决定";
+                            GuideDiagnostic(context, command, L"ai-variable-unresolved: " + GuideAiRawCommand(command));
+                        }
+                        changes.push_back({&command, std::move(action), resolved});
+                    }
+                } else {
+                    state.clear();
+                    if (values[3] == 32) {
+                        changes.push_back({&command, L"行动方针／控制状态变更（" +
+                            GuideAiRawCommand(command) + L"）", false});
+                        GuideDiagnostic(context, command, L"ai-variable-direction-unresolved: " + GuideAiRawCommand(command));
+                    }
+                }
+            } else if (!GuideAiKeepsIntegerConstants(command.id)) {
+                state.clear();
+            }
+            const auto found = children.find(command.ordinal);
+            if (found == children.end()) continue;
+            for (size_t childIndex : found->second) {
+                if (blocks[childIndex].parent != block.id) continue;
+                const Constants exit = self(self, childIndex, state, depth + 1);
+                // A section body is unconditional. Other subevents may not
+                // execute; keep only facts true both on entry and on exit.
+                if (command.id == 0 && block.parent == SIZE_MAX) state = exit;
+                else intersect(state, exit);
+            }
+        }
+        return state;
+    };
+    for (size_t index = 0; index < blocks.size(); ++index)
+        if (blocks[index].parent == SIZE_MAX) walk(walk, index, Constants{}, 0);
+    std::stable_sort(changes.begin(), changes.end(), [](const GuideAiChange& left, const GuideAiChange& right) {
+        return left.command->ordinal < right.command->ordinal;
+    });
+    return changes;
+}
+void AddAiEntries(const GuideContext& context, GuideResult& result) {
+    EnsureGuideNarratives(context);
+    for (const GuideAiChange& change : CollectGuideAiChanges(context)) {
+        const GuideCommand& command = *change.command;
+        if (context.narrativeOwners.find(command.ordinal) == context.narrativeOwners.end()) {
+            const bool priorDialogue = std::any_of(context.narratives.begin(), context.narratives.end(),
+                [&](const GuideNarrativeGroup& group) {
+                    return group.first && group.first->event == command.event &&
+                        group.first->ordinal < command.ordinal;
+                });
+            if (priorDialogue) GuideDiagnostic(context, command, L"ai-narrative-order-or-path-unproven");
+        }
+        AddActionEntry(result, GuideFilter::Ai, ConditionKey(command.event, command.conditions),
+            RewardPrefix(context, command, true), change.action, &context, &command);
     }
 }
 
@@ -1158,8 +1504,17 @@ std::wstring FormatAbilityChange(const GuideContext& context,
 
 std::wstring RewardPrefix(const GuideContext& context, const GuideCommand& command,
     bool allowBestEffort = false) {
-    const GuideCommand* duel = DuelInBlock(context, command.block, command.ordinal);
-    if (duel && duel->values.size() >= 2) {
+    EnsureGuideNarratives(context);
+    const GuideCommand* duel = nullptr;
+    const auto owner = context.narrativeOwners.find(command.ordinal);
+    if (owner != context.narrativeOwners.end()) {
+        for (const GuideCommand* candidate : context.narratives[owner->second].duels)
+            if (candidate->ordinal < command.ordinal) duel = candidate;
+    }
+    // A later child may add conditions after the duel. Its own trigger must
+    // still be rendered, including unresolved-condition diagnostics.
+    if (duel && duel->values.size() >= 2 &&
+        ConditionKey(command.event, command.conditions) == ConditionKey(duel->event, duel->conditions)) {
         const std::wstring first = ConditionPersonName(context, duel->values[0]);
         const std::wstring second = ConditionPersonName(context, duel->values[1]);
         if (!first.empty() && !second.empty()) return L"完成" + first + L"与" + second + L"的单挑后，";
@@ -1303,6 +1658,7 @@ void AddStateChangeEntries(const GuideContext& context, GuideResult& result) {
         int hpLoss = 0;
         int mpLoss = 0;
         size_t lastOrdinal = 0;
+        const GuideCommand* first = nullptr;
     };
     std::vector<Group> groups;
     for (const GuideCommand& command : context.commands) {
@@ -1321,6 +1677,7 @@ void AddStateChangeEntries(const GuideContext& context, GuideResult& result) {
             found = groups.end() - 1;
         }
         found->lastOrdinal = command.ordinal;
+        if (!found->first) found->first = &command;
         const int attribute = command.values[8];
         const int change = command.values[9];
         if (attribute >= 0 && attribute <= 5 && change >= 0 && change <= 2)
@@ -1339,7 +1696,7 @@ void AddStateChangeEntries(const GuideContext& context, GuideResult& result) {
             group.changes[2], group.abnormalApply, group.abnormalClear, group.hpLoss, group.mpLoss);
         if (!summary.empty())
             AddActionEntry(result, GuideFilter::Rewards, group.conditionKey, group.prefix,
-                group.target + summary);
+                group.target + summary, &context, group.first);
     }
 }
 
@@ -1375,12 +1732,10 @@ bool HasMatchingRetreatCondition(const GuideCommand& command, int personId) {
 }
 
 bool HasNarrativeTriggerBefore(const GuideContext& context, const GuideCommand& command) {
-    for (const GuideCommand& candidate : context.commands) {
-        if (candidate.event != command.event || candidate.ordinal >= command.ordinal) continue;
-        if (candidate.id == 0x14 || candidate.id == 0x15 || candidate.id == 0x16 ||
-            candidate.id == 0x63 || candidate.id == 0x68 || candidate.id == 0x69) return true;
-    }
-    return false;
+    EnsureGuideNarratives(context);
+    const auto owner = context.narrativeOwners.find(command.ordinal);
+    return owner != context.narrativeOwners.end() &&
+        context.narratives[owner->second].first->ordinal < command.ordinal;
 }
 
 void AddRewardEntries(const GuideContext& context, GuideResult& result) {
@@ -1436,7 +1791,7 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
                     GuideDiagnostic(context, command, L"item-name-missing: id=" +
                         std::to_wstring(command.values[0]));
                 AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
-                    L"获得" + item);
+                    L"获得" + item, &context, &command);
             }
         } else if (command.id == 0x38) {
             GuideAbilityChange change;
@@ -1451,12 +1806,12 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
             if (change.operation == GuideAbilityOperation::Unknown)
                 GuideDiagnostic(context, command, L"ability-operation-unknown: id=" + std::to_wstring(change.rawOperation));
             AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
-                FormatAbilityChange(context, change));
+                FormatAbilityChange(context, change), &context, &command);
         } else if (command.id == 0x3A && command.values.size() >= 3 && command.values[0] == 0 &&
             (command.values[1] == 1 || command.values[1] == 2) && command.values[2] > 0) {
             AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
                 (command.values[1] == 1 ? L"获得 " : L"失去 ") +
-                std::to_wstring(command.values[2]) + L" 金钱");
+                std::to_wstring(command.values[2]) + L" 金钱", &context, &command);
         } else if (command.id == 0x3B && command.values.size() == 3 && command.values[1] == 0) {
             if (command.parameterTags != std::vector<uint16_t>({0x02, 0x0E, 0x3E}) ||
                 command.values[0] < 0 || command.values[0] >= 1024) {
@@ -1465,11 +1820,11 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
             }
             std::wstring person = PersonName(context, command.values[0]);
             if (person.empty()) person = L"武将 " + std::to_wstring(command.values[0]);
-            AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"加入队伍");
+            AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"加入队伍", &context, &command);
         } else if (command.id == 0x39 && command.values.size() >= 2 && command.values[1] > 0) {
             const std::wstring person = ConditionPersonName(context, command.values[0]);
             if (!person.empty()) AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix,
-                person + L"提升 " + std::to_wstring(command.values[1]) + L" 级");
+                person + L"提升 " + std::to_wstring(command.values[1]) + L" 级", &context, &command);
         } else if (command.id == 0x53 && command.values.size() >= 8) {
             int personId = -1;
             PersonSide side = PersonSide::Unknown;
@@ -1478,35 +1833,105 @@ void AddRewardEntries(const GuideContext& context, GuideResult& result) {
             if (HasMatchingRetreatCondition(command, personId) ||
                 !HasNarrativeTriggerBefore(context, command)) continue;
             if (command.values[7] != 0)
-                AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"死亡");
+                AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"死亡", &context, &command);
             else
-                AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"撤退");
+                AddActionEntry(result, GuideFilter::Rewards, conditionKey, prefix, person + L"撤退", &context, &command);
         }
     }
 }
 
 void MergeAndPruneNarrativeEntries(GuideResult& result) {
-    std::vector<bool> keep(result.entries.size(), true);
-    for (size_t dialogIndex = 0; dialogIndex < result.entries.size(); ++dialogIndex) {
-        GuideEntry& dialog = result.entries[dialogIndex];
-        if (dialog.filter != GuideFilter::Dialog) continue;
-        bool hasUsefulResult = false;
-        for (GuideEntry& reward : result.entries) {
-            if (reward.filter != GuideFilter::Rewards ||
-                reward.conditionKey != dialog.conditionKey) continue;
-            for (const std::wstring& action : reward.actions) {
-                if (std::find(dialog.actions.begin(), dialog.actions.end(), action) == dialog.actions.end())
-                    dialog.actions.push_back(action);
+    std::vector<GuideEntry*> effects;
+    for (auto& entry : result.entries)
+        if ((entry.filter == GuideFilter::Rewards || entry.filter == GuideFilter::Ai) &&
+            !entry.sourceActions.empty()) effects.push_back(&entry);
+    std::stable_sort(effects.begin(), effects.end(), [](const GuideEntry* left, const GuideEntry* right) {
+        const auto& a = left->sourceActions.front().origin;
+        const auto& b = right->sourceActions.front().origin;
+        return a.source == b.source ? a.ordinal < b.ordinal : a.source < b.source;
+    });
+    std::vector<GuideEntry> dialogues;
+    for (const GuideEntry& original : result.entries) {
+        if (original.filter != GuideFilter::Dialog || original.sourceActions.empty()) continue;
+        const GuideActionOrigin& trigger = original.sourceActions.front().origin;
+        struct Branch {
+            GuideEntry entry;
+            std::vector<std::wstring> outcomes;
+            std::wstring outcomePrefix;
+            bool conditional = false;
+        };
+        std::vector<Branch> variants;
+        for (GuideEntry* pointer : effects) {
+            GuideEntry& effect = *pointer;
+            const GuideActionOrigin& origin = effect.sourceActions.front().origin;
+            if (origin.source != trigger.source || origin.scene != trigger.scene ||
+                origin.event != trigger.event || origin.narrativeGroup != original.narrativeGroup ||
+                origin.ordinal <= trigger.ordinal) continue;
+            // Separate conditional outcomes; equal text in sibling blocks is
+            // insufficient to combine mutually exclusive effects.
+            const std::wstring branchKey = effect.conditionKey + L"#block:" + std::to_wstring(origin.block);
+            auto found = std::find_if(variants.begin(), variants.end(), [&](const Branch& branch) {
+                return branch.entry.conditionKey == branchKey;
+            });
+            if (found == variants.end()) {
+                Branch branch;
+                branch.entry = original;
+                branch.entry.conditionKey = branchKey;
+                branch.outcomePrefix = effect.prefix;
+                branch.conditional = effect.conditionKey != original.conditionKey;
+                variants.push_back(std::move(branch));
+                found = variants.end() - 1;
             }
-            reward.hideInAll = true;
-            hasUsefulResult = true;
+            for (const auto& action : effect.actions)
+                if (found->outcomes.empty() || found->outcomes.back() != action) found->outcomes.push_back(action);
+            // AI remains visible in its own chapter, by user preference.
+            if (effect.filter == GuideFilter::Rewards) effect.hideInAll = true;
         }
-        if (hasUsefulResult) dialog.text = dialog.prefix + JoinGuideActions(dialog.actions) + L"。";
-        else keep[dialogIndex] = false;
+        if (variants.empty() && original.keepWithoutResult) dialogues.push_back(original);
+        for (Branch& branch : variants) {
+            GuideEntry& entry = branch.entry;
+            if (branch.conditional) {
+                // The parent dialogue runs before this child test. Never move
+                // the child's condition to the dialogue's own trigger.
+                entry.text = original.prefix + JoinGuideActions(original.actions) +
+                    L"；随后，" + branch.outcomePrefix + JoinGuideActions(branch.outcomes) + L"。";
+            } else {
+                entry.actions.insert(entry.actions.end(), branch.outcomes.begin(), branch.outcomes.end());
+                entry.text = entry.prefix + JoinGuideActions(entry.actions) + L"。";
+            }
+            dialogues.push_back(std::move(entry));
+        }
     }
-    size_t index = 0;
-    result.entries.erase(std::remove_if(result.entries.begin(), result.entries.end(),
-        [&](const GuideEntry&) { return !keep[index++]; }), result.entries.end());
+    std::vector<GuideEntry> entries;
+    for (auto& entry : dialogues) entries.push_back(std::move(entry));
+    for (GuideEntry& entry : result.entries) {
+        if (entry.filter == GuideFilter::Dialog) continue;
+        // Aggregate only after ownership is fixed, and only within the same
+        // trigger, path and block. Each source action remains available.
+        auto found = entries.end();
+        if (!entry.sourceActions.empty()) {
+            const auto& origin = entry.sourceActions.front().origin;
+            found = std::find_if(entries.begin(), entries.end(), [&](const GuideEntry& previous) {
+                if (previous.filter != entry.filter || previous.prefix != entry.prefix ||
+                    previous.conditionKey != entry.conditionKey || previous.hideInAll != entry.hideInAll ||
+                    previous.sourceActions.empty()) return false;
+                const auto& earlier = previous.sourceActions.back().origin;
+                return earlier.source == origin.source && earlier.scene == origin.scene &&
+                    earlier.event == origin.event && earlier.block == origin.block &&
+                    earlier.narrativeGroup == origin.narrativeGroup && earlier.ordinal < origin.ordinal;
+            });
+        }
+        if (found == entries.end()) entries.push_back(std::move(entry));
+        else {
+            // Preserve successive assignments, including a return to an
+            // earlier policy; remove only adjacent identical observations.
+            for (const auto& action : entry.actions)
+                if (found->actions.empty() || found->actions.back() != action) found->actions.push_back(action);
+            found->sourceActions.insert(found->sourceActions.end(), entry.sourceActions.begin(), entry.sourceActions.end());
+            found->text = found->prefix + JoinGuideActions(found->actions) + L"。";
+        }
+    }
+    result.entries = std::move(entries);
 }
 
 std::wstring FileTitle(const std::wstring& path, int number);
@@ -2136,7 +2561,7 @@ std::wstring RenderGuideText(const GuideResult& result, GuideFilter filter,
     std::wstring output = result.title + L"\r\n";
     if (!result.readStatus.empty()) output += result.readStatus + L"\r\n";
     const GuideFilter filters[] = {GuideFilter::Dialog, GuideFilter::Ambush, GuideFilter::Ai, GuideFilter::Rewards};
-    const wchar_t* headings[] = {L"一、人物对话与单挑", L"二、伏兵", L"三、敌军 AI", L"四、状态与奖惩"};
+    const wchar_t* headings[] = {L"一、人物对话与单挑", L"二、伏兵", L"三、部队 AI 与控制变化", L"四、状态与奖惩"};
     bool any = false;
     for (size_t group = 0; group < _countof(filters); ++group) {
         if (filter != GuideFilter::All && filter != filters[group]) continue;
@@ -2817,37 +3242,15 @@ bool BuildGuideStatsForTest(const wchar_t* scenarioPath, const wchar_t* gameRoot
                 if (matched) ++stats.matchedAmbushCommands;
             }
         }
-        if (command.id == 0x4E) {
-            ++stats.aiCommands;
-            for (const GuideCondition& condition : command.conditions)
-                if (condition.id < _countof(stats.aiConditions)) ++stats.aiConditions[condition.id];
-            std::wstring conditions;
-            bool simpleAdjacent = false;
-            std::pair<int, int> adjacent;
-            if (!RenderConditions(context, command.conditions, conditions, simpleAdjacent, adjacent)) continue;
-            ++stats.conditionedAiCommands;
-            if (command.values.size() < 8) continue;
-            bool matched = false;
-            bool changing = false;
-            for (const GuideUnit& unit : context.units) {
-                if (unit.camp != GuideUnit::Camp::Enemy) continue;
-                bool target = false;
-                if (command.values[0] == 0) target = unit.id == command.values[1];
-                else if (command.values[0] == 1) {
-                    const int x1 = std::min(command.values[2], command.values[4]);
-                    const int x2 = std::max(command.values[2], command.values[4]);
-                    const int y1 = std::min(command.values[3], command.values[5]);
-                    const int y2 = std::max(command.values[3], command.values[5]);
-                    target = unit.x >= x1 && unit.x <= x2 && unit.y >= y1 && unit.y <= y2;
-                }
-                if (target) {
-                    matched = true;
-                    if (unit.policy != command.values[7]) changing = true;
-                }
-            }
-            if (matched) ++stats.matchedAiCommands;
-            if (changing) ++stats.changingAiCommands;
-        }
+    }
+    for (const GuideAiChange& change : CollectGuideAiChanges(context)) {
+        const GuideCommand& command = *change.command;
+        ++stats.aiCommands;
+        for (const GuideCondition& condition : command.conditions)
+            if (condition.id < _countof(stats.aiConditions)) ++stats.aiConditions[condition.id];
+        if (!command.conditions.empty()) ++stats.conditionedAiCommands;
+        if (change.targetResolved) ++stats.matchedAiCommands;
+        ++stats.changingAiCommands;
     }
     GuideResult result;
     AddDialogEntries(context, result);
@@ -2879,7 +3282,12 @@ bool BuildGuideScriptTextForTest(const std::vector<unsigned char>& bytes,
     RecordUnknownGuideConditions(context);
     GuideResult result;
     result.title = L"简易攻略";
+    CollectDeployments(context, context.units);
+    AddDialogEntries(context, result);
+    AddAmbushEntries(context, result);
+    AddAiEntries(context, result);
     AddRewardEntries(context, result);
+    MergeAndPruneNarrativeEntries(result);
     text = RenderGuideText(result, GuideFilter::All);
     return true;
 }
