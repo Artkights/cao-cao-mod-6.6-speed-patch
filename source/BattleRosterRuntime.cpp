@@ -179,9 +179,11 @@ void Complete(int person, int requestedCamp, size_t commandPosition, ULONGLONG n
     if (!Copy(&mode,reinterpret_cast<void*>(layout.sceneMode),1) || mode == 3) return;
     int camp = -1;
     if (!ReadCamp(layout,person,camp)) return;
-    // FFFF means remove; only an explicit successful player-camp request can
-    // reactivate a previously changed-faction row. Confirm the committed camp.
-    if (requestedCamp == 0 && camp == 0) {
+    // P2 is the native 3B join mode: 0=data join, 1=memory join and
+    // 0xFFFF/0xFF=leave. The committed person flag at +0x2A is authoritative:
+    // only a non-leave command that leaves it at 0 establishes membership.
+    const bool leave = requestedCamp == 0xFF || requestedCamp == 0xFFFF;
+    if (!leave && camp == 0) {
         NotifyBattleRosterJoined(person,ordinal,commandPosition,now);
         std::wstring name;
         if (ReadBattlePersonName(layout.peoplePointer,person,name)) NotifyBattleRosterLabel(person,name);

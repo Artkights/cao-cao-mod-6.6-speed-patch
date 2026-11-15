@@ -49,7 +49,7 @@ BOOL CALLBACK FindTips(HWND window, LPARAM parameter) {
     wchar_t name[64] = {};
     GetClassNameW(window, name, 64);
     if (std::wstring(name) == TOOLTIPS_CLASSW &&
-        SendMessageW(window, TTM_GETTOOLCOUNT, 0, 0) == 4)
+        SendMessageW(window, TTM_GETTOOLCOUNT, 0, 0) == 6)
         *reinterpret_cast<HWND*>(parameter) = window;
     return TRUE;
 }
@@ -101,10 +101,10 @@ bool SaveOwnWindowBitmap(HWND window, const wchar_t* path) {
 using Metric = long long BattleUnitTotals::*;
 const Metric kMetrics[] = {
     &BattleUnitTotals::damageDealt, &BattleUnitTotals::damageReceived,
-    &BattleUnitTotals::recoveryDone, &BattleUnitTotals::criticalCount,
-    &BattleUnitTotals::comboExtraHitCount, &BattleUnitTotals::attackBlockCount,
-    &BattleUnitTotals::spellBlockCount, &BattleUnitTotals::physicalReceivedCount,
-    &BattleUnitTotals::strategyReceivedCount
+    &BattleUnitTotals::healDone, &BattleUnitTotals::recoveryDone,
+    &BattleUnitTotals::criticalCount, &BattleUnitTotals::comboExtraHitCount,
+    &BattleUnitTotals::attackBlockCount, &BattleUnitTotals::spellBlockCount,
+    &BattleUnitTotals::physicalReceivedCount, &BattleUnitTotals::strategyReceivedCount
 };
 
 int Person(HWND list, int row) {
@@ -159,15 +159,15 @@ void CheckWholeRows(HWND list, const std::vector<BattleUnitTotals>& source) {
         const auto found = std::find_if(source.begin(), source.end(),
             [person](const BattleUnitTotals& unit) { return unit.personId == person; });
         matches = found != source.end() && Cell(list, row, 0) == found->label;
-        for (int column = 1; matches && column <= 9; ++column)
+        for (int column = 1; matches && column <= 10; ++column)
             matches = Cell(list, row, column) == std::to_wstring((*found).*kMetrics[column - 1]);
     }
-    Check(matches, "sorting moves the name and all nine metrics together by person ID");
+    Check(matches, "sorting moves the name and all ten metrics together by person ID");
 }
 
 void CheckArrow(HWND header, int activeColumn, bool descending = true) {
     bool matches = true;
-    for (int column = 0; column < 10; ++column) {
+    for (int column = 0; column < 11; ++column) {
         HDITEMW item = {};
         item.mask = HDI_FORMAT;
         matches = Header_GetItem(header, column, &item) && matches;
@@ -182,7 +182,7 @@ void CheckFit(HWND list) {
     RECT client = {};
     GetClientRect(list, &client);
     int total = 0, smallest = INT_MAX, largest = 0;
-    for (int column = 0; column < 10; ++column) {
+    for (int column = 0; column < 11; ++column) {
         const int width = ListView_GetColumnWidth(list, column);
         total += width;
         smallest = std::min(smallest, width);
@@ -191,10 +191,10 @@ void CheckFit(HWND list) {
     Check(total == client.right - client.left,
         "column widths exactly fill the client viewport without a four-pixel gap");
     Check(smallest > 0 && largest - smallest <= 1,
-        "all ten column widths differ by at most one pixel");
+        "all eleven column widths differ by at most one pixel");
     const HWND header = ListView_GetHeader(list);
     RECT last = {};
-    Check(Header_GetItemRect(header, 9, &last) != FALSE, "last header rectangle exists");
+    Check(Header_GetItemRect(header, 10, &last) != FALSE, "last header rectangle exists");
     MapWindowPoints(header, list, reinterpret_cast<POINT*>(&last), 2);
     Check(last.right == client.right, "last header ends exactly at the visible right edge");
     Check((GetWindowLongPtrW(list, GWL_STYLE) & WS_HSCROLL) == 0,
@@ -203,9 +203,10 @@ void CheckFit(HWND list) {
 
 BattleStatsSnapshot MakeFixture(size_t count) {
     BattleStatsSnapshot fixture;
-    fixture.knownMetrics = 0x3FF;
+    fixture.knownMetrics = 0x7FF;
     fixture.active = true;
     fixture.rosterAvailable = true;
+    fixture.healingAvailable = true;
     fixture.physicalReceivedAvailable = true;
     fixture.strategyReceivedAvailable = true;
     const wchar_t* names[] = {L"曹操", L"夏侯惇", L"荀彧", L"典韦", L"许褚", L"郭嘉"};
@@ -213,7 +214,7 @@ BattleStatsSnapshot MakeFixture(size_t count) {
         BattleUnitTotals unit;
         unit.personId = 100 + static_cast<int>(index);
         unit.label = std::wstring(names[index % 6]) + L"（验证" + std::to_wstring(index + 1) + L"）";
-        for (int metric = 0; metric < 9; ++metric)
+        for (int metric = 0; metric < 10; ++metric)
             unit.*kMetrics[metric] = static_cast<long long>((index + 1) * 1000) + metric * 13;
         fixture.units.push_back(unit);
         unit.damageDealt += 100000;
@@ -245,10 +246,10 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
         Pump();
         RECT client = {};
         GetClientRect(list, &client);
-        nonDivisible = nonDivisible || (client.right - client.left) % 10 != 0;
+        nonDivisible = nonDivisible || (client.right - client.left) % 11 != 0;
         CheckFit(list);
     }
-    Check(nonDivisible, "layout exercises widths that do not divide evenly into ten columns");
+    Check(nonDivisible, "layout exercises widths that do not divide evenly into eleven columns");
     NMHEADERW tracking = {};
     tracking.hdr.hwndFrom = header;
     tracking.hdr.code = HDN_BEGINTRACKW;
@@ -288,7 +289,7 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
     const long long values[] = {2, 100, 10, 0, 100, LLONG_MAX};
     const std::vector<int> descending = {5, 1, 4, 2, 0, 3};
     const std::vector<int> ascending = {3, 0, 2, 1, 4, 5};
-    for (int column = 1; column <= 9; ++column) {
+    for (int column = 1; column <= 10; ++column) {
         gFixture = MakeFixture(6);
         for (size_t row = 0; row < gFixture.units.size(); ++row)
             gFixture.units[row].*kMetrics[column - 1] = values[row];
@@ -318,7 +319,7 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
     if (!capture.empty()) Check(SaveOwnWindowBitmap(window, (capture + L"-sorted.bmp").c_str()),
         "active descending native sort arrow renders for visual review");
     Click(window, list, 1);
-    Click(window, list, 3);
+    Click(window, list, 4);
     CheckOrder(list, gFixture.units, descending, "switching columns starts the new column descending");
     Click(window, list, 1);
     CheckOrder(list, gFixture.units, descending, "returning to a previous column restarts descending");
@@ -341,8 +342,8 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
     CheckDefaultOrder(list, gFixture.campaignUnits);
     CheckArrow(header, -1);
     CheckWholeRows(list, gFixture.campaignUnits);
-    Click(window, list, 8);
-    CheckArrow(header, 8, true);
+    Click(window, list, 9);
+    CheckArrow(header, 9, true);
     SelectPage(window, tabs, 0);
     CheckDefaultOrder(list, gFixture.units);
     CheckArrow(header, -1);
@@ -351,14 +352,14 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
 
     gFixture.physicalReceivedAvailable = false;
     Refresh(window);
-    Click(window, list, 8);
+    Click(window, list, 9);
     CheckDefaultOrder(list, gFixture.units);
-    Check(Cell(list, 0, 8) == L"--" && Cell(list, 0, 9) != L"--",
+    Check(Cell(list, 0, 9) == L"--" && Cell(list, 0, 10) != L"--",
         "unavailable physical received metric is independent of strategy received");
-    CheckArrow(header, 8, true);
-    Click(window, list, 8);
+    CheckArrow(header, 9, true);
+    Click(window, list, 9);
     CheckDefaultOrder(list, gFixture.units);
-    CheckArrow(header, 8, false);
+    CheckArrow(header, 9, false);
     gFixture.physicalReceivedAvailable = true;
     gFixture.units[0].physicalReceivedCount = LLONG_MAX;
     Refresh(window);
@@ -366,9 +367,9 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
         "newly available metric applies the remembered ascending direction");
     gFixture.strategyReceivedAvailable = false;
     Refresh(window);
-    Click(window, list, 9);
+    Click(window, list, 10);
     CheckDefaultOrder(list, gFixture.units);
-    Check(Cell(list, 0, 8) != L"--" && Cell(list, 0, 9) == L"--",
+    Check(Cell(list, 0, 9) != L"--" && Cell(list, 0, 10) == L"--",
         "unavailable strategy received metric is independent of physical received");
     gFixture.strategyReceivedAvailable = true;
     gFixture.knownMetrics &= ~BattleStatsDamageDealt;
@@ -400,12 +401,12 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
     CheckFit(list);
     gFixture.units[0].physicalReceivedCount = 0;
     Refresh(window);
-    Click(window, list, 8);
-    Click(window, list, 8);
-    Check(Cell(list, 0, 8) == L"0", "available zero remains real in a single-row sort");
+    Click(window, list, 9);
+    Click(window, list, 9);
+    Check(Cell(list, 0, 9) == L"0", "available zero remains real in a single-row sort");
     gFixture.units.clear();
     Refresh(window);
-    Click(window, list, 3);
+    Click(window, list, 4);
     Check(ListView_GetItemCount(list) == 1 && Cell(list, 0, 0).find(L"暂无") != std::wstring::npos,
         "sorting an empty table preserves its placeholder row");
     CheckFit(list);
@@ -415,8 +416,8 @@ void RunExtendedTests(HWND window, HWND list, HWND tabs, const std::wstring& cap
     gFixture = MakeFixture(6);
     Refresh(window);
     SelectPage(window, tabs, 1);
-    Click(window, list, 4);
-    Click(window, list, 4);
+    Click(window, list, 5);
+    Click(window, list, 5);
 }
 } // namespace
 
@@ -440,8 +441,9 @@ int wmain(int argc, wchar_t** argv) {
     gInstance = GetModuleHandleW(nullptr);
     const INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
     Check(InitCommonControlsEx(&controls) != FALSE, "common controls initialize");
-    gFixture.knownMetrics = 0x3FF;
+    gFixture.knownMetrics = 0x7FF;
     gFixture.active = true;
+    gFixture.healingAvailable = true;
     gFixture.physicalReceivedAvailable = true;
     gFixture.strategyReceivedAvailable = true;
     BattleUnitTotals totals;
@@ -449,6 +451,7 @@ int wmain(int argc, wchar_t** argv) {
     totals.label = L"曹操（受击统计验证）";
     totals.damageDealt = 325;
     totals.damageReceived = 86;
+    totals.healDone = 41;
     totals.recoveryDone = 40;
     totals.criticalCount = 2;
     totals.comboExtraHitCount = 1;
@@ -463,9 +466,9 @@ int wmain(int argc, wchar_t** argv) {
     if (interactive) {
         gFixture = MakeFixture(48);
         for (size_t row = 0; row < gFixture.units.size(); ++row)
-            for (int metric = 0; metric < 9; ++metric)
+            for (int metric = 0; metric < 10; ++metric)
                 gFixture.units[row].*kMetrics[metric] =
-                    static_cast<long long>(((row * 17 + metric * 29) % 113) * (metric < 3 ? 81 : 1));
+                    static_cast<long long>(((row * 17 + metric * 29) % 113) * (metric < 4 ? 81 : 1));
     }
     Check(OpenBattleInfo(nullptr), "production statistics window opens");
     HWND window = FindWindowW(L"XiaoAn66BattleInfoWindow", nullptr);
@@ -492,7 +495,7 @@ int wmain(int argc, wchar_t** argv) {
         CloseBattleInfo();
         return gFailures ? 1 : 0;
     }
-    Check(Header_GetItemCount(header) == 10, "all ten columns exist");
+    Check(Header_GetItemCount(header) == 11, "all eleven columns exist");
     HMODULE headerModule = nullptr;
     const LONG_PTR headerProcedure = GetClassLongPtrW(header, GCLP_WNDPROC);
     const BOOL foundHeaderModule = GetModuleHandleExW(
@@ -506,16 +509,18 @@ int wmain(int argc, wchar_t** argv) {
         if (_wcsnicmp(component, L"\\winsxs\\", 8) == 0) sideBySideControls = true;
     Check(readHeaderModule && sideBySideControls,
         "native header loads side-by-side common controls for visible v6 sort arrows");
-    Check(Cell(list, 0, 6) == L"3" && Cell(list, 0, 7) == L"4",
+    Check(Cell(list, 0, 3) == L"41" && Cell(list, 0, 4) == L"40",
+        "healing and recovery columns display independent totals");
+    Check(Cell(list, 0, 7) == L"3" && Cell(list, 0, 8) == L"4",
         "existing dodge metrics retain their values");
-    Check(Cell(list, 0, 8) == L"9" && Cell(list, 0, 9) == L"12",
+    Check(Cell(list, 0, 9) == L"9" && Cell(list, 0, 10) == L"12",
         "received columns display independent totals");
 
     SetWindowPos(window, nullptr, 20, 20, 1540, 460, SWP_NOZORDER | SWP_NOACTIVATE);
     Pump();
     int totalWidth = 0;
     int firstWidth = 0;
-    for (int column = 0; column < 10; ++column) {
+    for (int column = 0; column < 11; ++column) {
         const int width = ListView_GetColumnWidth(list, column);
         if (!column) firstWidth = width;
         Check(width == firstWidth || width == firstWidth + 1 || width == firstWidth - 1,
@@ -535,7 +540,7 @@ int wmain(int argc, wchar_t** argv) {
     Pump();
     firstWidth = ListView_GetColumnWidth(list, 0);
     totalWidth = 0;
-    for (int column = 0; column < 10; ++column) {
+    for (int column = 0; column < 11; ++column) {
         const int width = ListView_GetColumnWidth(list, column);
         Check(width == firstWidth || width == firstWidth + 1 || width == firstWidth - 1,
             "narrow columns have equal widths");
@@ -555,8 +560,8 @@ int wmain(int argc, wchar_t** argv) {
     HWND tips = nullptr;
     EnumThreadWindows(GetCurrentThreadId(), FindTips, reinterpret_cast<LPARAM>(&tips));
     if (!tips) EnumChildWindows(window, FindTips, reinterpret_cast<LPARAM>(&tips));
-    Check(tips != nullptr, "all four explanatory header tooltips exist");
-    for (int column = 8; tips && column < 10; ++column) {
+    Check(tips != nullptr, "all six explanatory header tooltips exist");
+    for (int column = 9; tips && column < 11; ++column) {
         TOOLINFOW tool = {TTTOOLINFOW_V2_SIZE};
         tool.hwnd = header;
         tool.uId = static_cast<UINT_PTR>(column);
@@ -580,7 +585,7 @@ int wmain(int argc, wchar_t** argv) {
     GetScrollInfo(list, SB_HORZ, &afterRefresh);
     Check(afterRefresh.nPos == 0,
         "periodic refresh keeps the fully visible table at the left edge");
-    Check(Cell(list, 0, 8) == L"--" && Cell(list, 0, 9) == L"12",
+    Check(Cell(list, 0, 9) == L"--" && Cell(list, 0, 10) == L"12",
         "physical capability degrades independently");
     if (!capture.empty()) {
         const std::wstring path = capture + L"-unavailable.bmp";
@@ -589,23 +594,23 @@ int wmain(int argc, wchar_t** argv) {
     gFixture.physicalReceivedAvailable = true;
     gFixture.strategyReceivedAvailable = false;
     Refresh(window);
-    Check(Cell(list, 0, 8) == L"9" && Cell(list, 0, 9) == L"--",
+    Check(Cell(list, 0, 9) == L"9" && Cell(list, 0, 10) == L"--",
         "strategy capability degrades independently");
     gFixture.strategyReceivedAvailable = true;
     gFixture.units[0].physicalReceivedCount = 0;
     gFixture.units[0].strategyReceivedCount = 0;
     Refresh(window);
-    Check(Cell(list, 0, 8) == L"0" && Cell(list, 0, 9) == L"0",
+    Check(Cell(list, 0, 9) == L"0" && Cell(list, 0, 10) == L"0",
         "available zero remains distinct from unavailable");
     gFixture.knownMetrics &= ~BattleStatsPhysicalReceived;
     Refresh(window);
-    Check(Cell(list, 0, 8) == L"--", "unknown historical metric does not invent zero");
+    Check(Cell(list, 0, 9) == L"--", "unknown historical metric does not invent zero");
     gFixture.knownMetrics |= BattleStatsPhysicalReceived;
     Refresh(window);
     TabCtrl_SetCurSel(tabs, 1);
     NMHDR changed = {tabs, 0x6813, TCN_SELCHANGE};
     SendMessageW(window, WM_NOTIFY, 0x6813, reinterpret_cast<LPARAM>(&changed));
-    Check(Cell(list, 0, 8) == L"1234567890123" && Cell(list, 0, 9) == L"2345678901234",
+    Check(Cell(list, 0, 9) == L"1234567890123" && Cell(list, 0, 10) == L"2345678901234",
         "campaign tab shows full 64-bit received totals");
     RunExtendedTests(window, list, tabs, capture);
     CloseBattleInfo();
@@ -618,8 +623,8 @@ int wmain(int argc, wchar_t** argv) {
     Check(TabCtrl_GetCurSel(tabs) == 0, "reopening selects current battlefield by default");
     CheckDefaultOrder(list, gFixture.units);
     CheckArrow(header, -1);
-    Click(window, list, 4);
-    CheckArrow(header, 4, true);
+    Click(window, list, 5);
+    CheckArrow(header, 5, true);
     Check(Person(list, 0) == gFixture.units.back().personId,
         "first click after reopening starts descending");
     CloseBattleInfo();

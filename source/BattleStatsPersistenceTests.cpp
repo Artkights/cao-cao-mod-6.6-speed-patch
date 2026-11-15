@@ -88,6 +88,7 @@ BattleUnitTotals SampleUnit(int personId, int slot) {
     unit.damageDealt = (std::numeric_limits<long long>::max)() - personId;
     unit.damageReceived = 345;
     unit.recoveryDone = 67;
+    unit.healDone = 68;
     unit.criticalCount = 8;
     unit.comboExtraHitCount = 9;
     unit.attackBlockCount = 10;
@@ -104,7 +105,7 @@ BattleStatsPersistedState SampleState() {
     state.scenarioOrdinal = 7;
     state.campaignId = 0xFF123456789ABCDEull;
     state.battleInstance = 0x1020304050607080ull;
-    state.knownMetrics = 0xA5;
+    state.knownMetrics = 0xA5 | BattleStatsHealing;
     state.historyIncomplete = true;
     state.status = L"已迁移旧统计；历史记录从此存档继续。";
     state.units.push_back(SampleUnit(7, 3));
@@ -144,7 +145,8 @@ BattleStatsPersistedState SampleState() {
 bool SameUnit(const BattleUnitTotals& left, const BattleUnitTotals& right) {
     return left.personId == right.personId && left.slot == right.slot && left.label == right.label &&
         left.damageDealt == right.damageDealt && left.damageReceived == right.damageReceived &&
-        left.recoveryDone == right.recoveryDone && left.criticalCount == right.criticalCount &&
+        left.recoveryDone == right.recoveryDone && left.healDone == right.healDone &&
+        left.criticalCount == right.criticalCount &&
         left.comboExtraHitCount == right.comboExtraHitCount && left.attackBlockCount == right.attackBlockCount &&
         left.spellBlockCount == right.spellBlockCount && left.defeatedEnemies == right.defeatedEnemies &&
         left.physicalReceivedCount == right.physicalReceivedCount &&
@@ -227,8 +229,9 @@ void AppendFixtureText(std::vector<unsigned char>& bytes, const std::wstring& te
     bytes.insert(bytes.end(), first, first + text.size() * sizeof(wchar_t));
 }
 
-// Build the original schema-2/3 wire formats independently of the schema-4
-// writer: schema 2 has no received counters; neither legacy format has roster.
+// Build the older schema-2/3/4 wire formats independently of the schema-5
+// writer: schema 2 has no received counters; schema 4 has a roster; none of
+// these legacy formats carries the healing total.
 bool WriteLegacyFixture(const std::wstring& path, uint32_t schema,
     const BattleStatsPersistedState& state) {
     std::vector<unsigned char> payload;
@@ -256,12 +259,30 @@ bool WriteLegacyFixture(const std::wstring& path, uint32_t schema,
                 unit.comboExtraHitCount, unit.attackBlockCount, unit.spellBlockCount,
                 static_cast<uint32_t>(unit.label.size())};
             AppendFixture(payload, row);
-            if (schema == 3) {
+            if (schema >= 3) {
                 AppendFixture(payload, unit.physicalReceivedCount);
                 AppendFixture(payload, unit.strategyReceivedCount);
             }
             AppendFixtureText(payload, unit.label);
         }
+    }
+    if (schema >= 4) {
+        const TestRosterHeader roster = {
+            static_cast<uint32_t>(state.campaignRoster.size()),
+            static_cast<uint32_t>(state.currentBattleParticipants.size())};
+        AppendFixture(payload, roster);
+        for (const BattleRosterEntry& entry : state.campaignRoster) {
+            const TestRosterRow row = {entry.personId, entry.joinScenarioOrdinal,
+                entry.lastCamp, entry.joinCommandOrdinal, static_cast<uint8_t>(entry.joined ? 1 : 0),
+                static_cast<uint8_t>(entry.tracking ? 1 : 0),
+                static_cast<uint8_t>(entry.changedFaction ? 1 : 0),
+                static_cast<uint8_t>(entry.source),
+                static_cast<uint32_t>(entry.label.size())};
+            AppendFixture(payload, row);
+            AppendFixtureText(payload, entry.label);
+        }
+        for (int personId : state.currentBattleParticipants)
+            AppendFixture(payload, static_cast<int32_t>(personId));
     }
     std::vector<unsigned char> bytes(kNativePayload, kNativePayload + strlen(kNativePayload));
     TestFooter footer = {};
@@ -286,20 +307,25 @@ void ValidateLegacyEmbedded(const std::wstring& folder) {
     expected.knownMetrics = 0x3FF;
     expected.units[0].physicalReceivedCount = 19;
     expected.units[0].strategyReceivedCount = 20;
-    for (uint32_t schema : {2u, 3u}) {
+    for (uint32_t schema : {2u, 3u, 4u}) {
         const std::wstring save = folder + L"\\schema" + std::to_wstring(schema) + L".E5S";
         BattleStatsPersistedState loaded;
         std::wstring error;
         Check(WriteLegacyFixture(save, schema, expected) &&
             ReadBattleStatsEmbedded(save, loaded, error) == BattleStatsReadResult::Loaded &&
-            loaded.schemaVersion == schema && loaded.historyIncomplete && loaded.rosterHistoryIncomplete &&
-            loaded.campaignRoster.empty() && loaded.currentBattleParticipants.empty() &&
+            loaded.schemaVersion == schema && loaded.historyIncomplete &&
+            loaded.rosterHistoryIncomplete == (schema < 4) &&
+            (schema < 4 ? loaded.campaignRoster.empty() && loaded.currentBattleParticipants.empty() :
+                loaded.campaignRoster.size() == expected.campaignRoster.size() &&
+                loaded.currentBattleParticipants == expected.currentBattleParticipants) &&
             loaded.units.size() == expected.units.size() && loaded.campaignUnits.size() == expected.campaignUnits.size() &&
             loaded.units[0].damageDealt == expected.units[0].damageDealt &&
+            loaded.units[0].healDone == 0 &&
             loaded.units[0].physicalReceivedCount == (schema == 2 ? 0 : 19) &&
             loaded.units[0].strategyReceivedCount == (schema == 2 ? 0 : 20),
             schema == 2 ? "read an authentic schema-2 fixture and seed new counters at zero" :
-                "read an authentic schema-3 fixture and retain received counts without inventing a roster");
+                (schema == 3 ? "read an authentic schema-3 fixture and retain received counts without inventing a roster" :
+                    "read a schema-4 fixture and seed the new healing total at zero"));
     }
 }
 
@@ -386,7 +412,7 @@ void ValidateEmbedded(const std::wstring& folder) {
     // A schema-3 row has the persisted person ID, totals header and received
     // counters. Recompute the hash so this exercises structural
     // duplicate validation, rather than stopping at integrity verification.
-    constexpr size_t rowBytes = 88;
+    constexpr size_t rowBytes = 96;
     const size_t secondRow = firstRow + rowBytes + sample.units[0].label.size() * sizeof(wchar_t);
     memcpy(damaged.data() + secondRow, damaged.data() + firstRow, sizeof(int32_t));
     Check(RefreshPayloadHash(damaged) && WriteBytes(changed, damaged) &&
@@ -446,8 +472,8 @@ void ValidateEmbedded(const std::wstring& folder) {
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject overlong labels");
     invalid = SampleState(); invalid.status.assign(4097, L'x');
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject overlong status text");
-    invalid = SampleState(); invalid.knownMetrics = 0x400;
-    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-4 metric bits");
+    invalid = SampleState(); invalid.knownMetrics = 0x800;
+    Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject undefined schema-5 metric bits");
     invalid = SampleState(); invalid.campaignRoster.pop_back();
     Check(!WriteBattleStatsEmbedded(changed, invalid, error), "reject campaign totals without a matching roster entry");
     invalid = SampleState(); invalid.campaignUnits.pop_back();
@@ -470,7 +496,7 @@ void ValidateEmbedded(const std::wstring& folder) {
     size_t rosterOffset = strlen(kNativePayload) + sizeof(TestHeader) +
         (sample.scenario.size() + sample.status.size()) * sizeof(wchar_t);
     for (const auto* group : {&sample.units, &sample.campaignUnits})
-        for (const auto& unit : *group) rosterOffset += 88 + unit.label.size() * sizeof(wchar_t);
+        for (const auto& unit : *group) rosterOffset += 96 + unit.label.size() * sizeof(wchar_t);
     damaged = valid;
     TestRosterRow badRoster = {};
     memcpy(&badRoster, damaged.data() + rosterOffset + sizeof(TestRosterHeader), sizeof(badRoster));

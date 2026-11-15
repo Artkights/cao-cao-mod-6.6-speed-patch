@@ -83,6 +83,7 @@ int wmain() {
     first.damageDealt = 123;
     first.damageReceived = 9;
     first.recoveryDone = 44;
+    first.healDone = 45;
     first.criticalCount = 2;
     first.comboExtraHitCount = 1;
     first.attackBlockCount = 3;
@@ -97,7 +98,7 @@ int wmain() {
     state.battleInstance = 4;
     state.scenarioOrdinal = 8;
     state.elapsedMilliseconds = 98765;
-    state.knownMetrics = 1023;
+    state.knownMetrics = 2047;
     state.units = {first, second};
     state.campaignUnits = {first};
     const std::wstring save = (root / L"存档.E5S").wstring();
@@ -139,15 +140,15 @@ int wmain() {
         content.find(LoggedPath(save)) != std::string::npos &&
         content.find(Utf8(L"一行\\r\\n下一行\\t结束")) != std::string::npos,
         "UTF-8 log records build, actual Unicode save path, and escaped single-line diagnostics");
-    const size_t capture = content.find("schema=4");
-    const size_t restored = content.find("schema=4", capture + 1);
+    const size_t capture = content.find("schema=5");
+    const size_t restored = content.find("schema=5", capture + 1);
     const size_t endCapture = content.find(" detail=", capture);
     const size_t endRestored = content.find("\r\n", restored);
     Check(capture != std::string::npos && restored != std::string::npos &&
         content.substr(capture, endCapture - capture) == content.substr(restored, endRestored - restored) &&
         content.find("campaign.count=1") != std::string::npos &&
         content.find("current.count=2") != std::string::npos &&
-        content.find("7/2:123,9,44,2,1,3,4,5,11,13") != std::string::npos &&
+        content.find("7/2:123,9,44,45,2,1,3,4,5,11,13") != std::string::npos &&
         content.find("elapsedMs=98765") != std::string::npos,
         "capture and restore produce identical two-ledger summaries despite vector order");
     Check(content.find("op=" + std::to_string(operation) + " build=" + Utf8(XiaoAnInstall::kPackageVersion) +

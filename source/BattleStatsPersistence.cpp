@@ -284,13 +284,18 @@ static_assert(sizeof(wchar_t) == 2, "Statistics strings use UTF-16 code units");
 constexpr std::array<char, 8> kPayloadMagic = {'X','A','S','T','A','T','2','P'};
 constexpr std::array<char, 8> kFooterMagic = {'X','A','S','T','A','T','2','F'};
 constexpr std::array<char, 8> kFooterEnd = {'X','A','S','T','A','T','E','N'};
-// The stable envelope markers are retained so schema-2/3 damage/truncation
-// detection also applies to schema 4. The schema field defines the row format.
-constexpr uint32_t kEmbeddedSchema = 4;
+// The stable envelope markers are retained so older damage/truncation
+// detection also applies to the current schema. The schema field defines the
+// row format: schema 3 adds received counters, schema 4 adds the roster, and
+// schema 5 appends the per-unit healing total after the received counters.
+constexpr uint32_t kEmbeddedSchema = 5;
 constexpr uint32_t kOldEmbeddedSchema = 2;
-constexpr uint32_t kPreviousEmbeddedSchema = 3;
+constexpr uint32_t kOlderEmbeddedSchema = 3;
+constexpr uint32_t kPreviousEmbeddedSchema = 4;
+constexpr uint32_t kRosterSchema = 4;
 constexpr uint32_t kPersonCount = 65535; // 0xFFFF is the engine's empty ID.
-constexpr uint32_t kKnownMetricsMask = 0x3FF;
+constexpr uint32_t kKnownMetricsMask = 0x7FF;
+constexpr uint32_t kSchema4KnownMetricsMask = 0x3FF;
 constexpr uint32_t kOldKnownMetricsMask = 0xFF;
 constexpr uint32_t kMaxStatusCharacters = 4096;
 constexpr uint64_t kMaxNativeBytes = 64ull * 1024 * 1024;
@@ -399,7 +404,7 @@ bool ValidTotals(const BattleUnitTotals& unit) {
         unit.slot >= -1 && unit.slot < static_cast<int>(kMaxUnits) &&
         unit.label.size() <= kMaxLabelCharacters && unit.defeatedEnemies >= 0 &&
         unit.damageDealt >= 0 && unit.damageReceived >= 0 && unit.recoveryDone >= 0 &&
-        unit.criticalCount >= 0 && unit.comboExtraHitCount >= 0 &&
+        unit.healDone >= 0 && unit.criticalCount >= 0 && unit.comboExtraHitCount >= 0 &&
         unit.attackBlockCount >= 0 && unit.spellBlockCount >= 0 &&
         unit.physicalReceivedCount >= 0 && unit.strategyReceivedCount >= 0;
 }
@@ -428,6 +433,8 @@ bool AppendGroup(std::vector<unsigned char>& bytes, const std::vector<BattleUnit
         AppendValue(bytes, row);
         const ReceivedUnitCounts received = {unit.physicalReceivedCount, unit.strategyReceivedCount};
         AppendValue(bytes, received);
+        const int64_t healDone = unit.healDone;
+        AppendValue(bytes, healDone);
         AppendWide(bytes, unit.label);
     }
     return true;
@@ -436,7 +443,8 @@ bool AppendGroup(std::vector<unsigned char>& bytes, const std::vector<BattleUnit
 bool ReadGroup(const std::vector<unsigned char>& bytes, size_t& offset, uint32_t count,
     uint32_t schema, std::vector<BattleUnitTotals>& units) {
     const size_t minimumRow = sizeof(EmbeddedUnitHeader) +
-        (schema >= 3 ? sizeof(ReceivedUnitCounts) : 0);
+        (schema >= 3 ? sizeof(ReceivedUnitCounts) : 0) +
+        (schema >= kEmbeddedSchema ? sizeof(int64_t) : 0);
     if (offset > bytes.size() || count > (bytes.size() - offset) / minimumRow) return false;
     std::vector<bool> seen(kPersonCount, false);
     units.reserve(count);
@@ -449,6 +457,11 @@ bool ReadGroup(const std::vector<unsigned char>& bytes, size_t& offset, uint32_t
             if (!ReadValue(bytes, offset, received)) return false;
             unit.physicalReceivedCount = received.physical;
             unit.strategyReceivedCount = received.strategy;
+        }
+        if (schema >= kEmbeddedSchema) {
+            int64_t healDone = 0;
+            if (!ReadValue(bytes, offset, healDone)) return false;
+            unit.healDone = healDone;
         }
         if (!ReadWide(bytes, offset, row.totals.labelCharacters, unit.label)) return false;
         unit.personId = row.personId;
@@ -573,7 +586,7 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
         return BattleStatsReadResult::Corrupt;
     }
     if (footer.schema != kEmbeddedSchema && footer.schema != kPreviousEmbeddedSchema &&
-        footer.schema != kOldEmbeddedSchema) {
+        footer.schema != kOlderEmbeddedSchema && footer.schema != kOldEmbeddedSchema) {
         error = L"存档使用了当前补丁不支持的战场统计版本。";
         return BattleStatsReadResult::Unsupported;
     }
@@ -598,12 +611,12 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     if (!ReadValue(payload, offset, header) ||
         memcmp(header.magic, kPayloadMagic.data(), kPayloadMagic.size()) ||
         header.schema != footer.schema || header.headerBytes != sizeof(header) ||
-        (header.flags & ~(footer.schema >= kEmbeddedSchema ? 7u : 3u)) ||
+        (header.flags & ~(footer.schema >= kRosterSchema ? 7u : 3u)) ||
         header.unitCount > kMaxUnits || header.campaignUnitCount > kPersonCount ||
         header.scenarioCharacters > kMaxScenarioCharacters || header.statusCharacters > kMaxStatusCharacters ||
         header.scenarioOrdinal < -1 || header.scenarioOrdinal >= static_cast<int32_t>(kPersonCount) ||
-            (header.knownMetrics & ~(footer.schema == kOldEmbeddedSchema ?
-            kOldKnownMetricsMask : kKnownMetricsMask))) {
+            (header.knownMetrics & ~(footer.schema == kOldEmbeddedSchema ? kOldKnownMetricsMask :
+            (footer.schema >= kEmbeddedSchema ? kKnownMetricsMask : kSchema4KnownMetricsMask)))) {
         error = L"存档中的战场统计版本字段、人物数量或文本长度无效。";
         return BattleStatsReadResult::Corrupt;
     }
@@ -611,7 +624,7 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
     decoded.schemaVersion = header.schema;
     decoded.active = (header.flags & 1) != 0;
     decoded.historyIncomplete = (header.flags & 2) != 0 || header.schema < kEmbeddedSchema;
-    decoded.rosterHistoryIncomplete = (header.flags & 4) != 0 || header.schema < kEmbeddedSchema;
+    decoded.rosterHistoryIncomplete = (header.flags & 4) != 0 || header.schema < kRosterSchema;
     decoded.scenarioOrdinal = header.scenarioOrdinal;
     decoded.knownMetrics = header.knownMetrics;
     decoded.elapsedMilliseconds = header.elapsedMilliseconds;
@@ -621,7 +634,7 @@ BattleStatsReadResult DecodeEmbedded(const std::vector<unsigned char>& bytes,
         !ReadWide(payload, offset, header.statusCharacters, decoded.status) ||
         !ReadGroup(payload, offset, header.unitCount, header.schema, decoded.units) ||
         !ReadGroup(payload, offset, header.campaignUnitCount, header.schema, decoded.campaignUnits) ||
-        (header.schema >= kEmbeddedSchema &&
+        (header.schema >= kRosterSchema &&
             !ReadRoster(payload, offset, decoded.campaignRoster, decoded.currentBattleParticipants)) ||
         offset != payload.size() || !ValidateBattleStatsRosterState(decoded)) {
         error = L"存档中的战场统计人物数据不完整、重复或包含非法计数。";

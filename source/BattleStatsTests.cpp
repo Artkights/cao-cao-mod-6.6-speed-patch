@@ -3,6 +3,7 @@
 #include "EngineProfile.h"
 #include "ScenarioScript.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -127,6 +128,7 @@ bool SameTotals(const BattleUnitTotals& left, const BattleUnitTotals& right) {
         left.damageDealt == right.damageDealt &&
         left.damageReceived == right.damageReceived &&
         left.recoveryDone == right.recoveryDone &&
+        left.healDone == right.healDone &&
         left.criticalCount == right.criticalCount &&
         left.comboExtraHitCount == right.comboExtraHitCount &&
         left.attackBlockCount == right.attackBlockCount &&
@@ -400,6 +402,11 @@ int wmain(int argc, wchar_t** argv) {
         "accumulate every positive friendly HP delta on its target unit");
     Check(secondTotals && secondTotals->recoveryDone == 15,
         "accumulate positive HP deltas for each multi-target recipient");
+    Check(actorTotals && actorTotals->healDone == 205,
+        "attribute every recovery-channel HP delta to the resolved caster");
+    Check(friendlyTotals && friendlyTotals->healDone == 0 &&
+        secondTotals && secondTotals->healDone == 0,
+        "do not credit healing to beneficiaries that were not the caster");
     Check(actorTotals && actorTotals->damageDealt == 30,
         "keep strategy-damage actor resolution separate from recovery layout");
     Check(actorTotals && actorTotals->comboExtraHitCount == 2,
@@ -412,6 +419,30 @@ int wmain(int argc, wchar_t** argv) {
         "attribute confirmed spell blocks to the friendly defender");
     Check(!FindUnit(snapshot, enemyActorSlot),
         "exclude enemy recovery and physical events from friendly totals");
+
+    // Healing strategies raise HP through the strategy-damage channel
+    // (kind=1), whose caster pointer lives at context+0x08. This is the
+    // regression that previously left the healing column at zero.
+    context.fill(0);
+    frame.fill(0);
+    PutByte(context.data() + 1, actorSlot);
+    PutPointer(context.data() + 8, actor);
+    PutByte(context.data() + 0x0C, friendlyTargetSlot);
+    PutPointer(callerFrame - 4, reinterpret_cast<uintptr_t>(context.data()));
+    RecordBattleStatsSettlementForTest(1, friendlyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 40, 70);
+    BattleStatsSnapshot healed;
+    Check(ReadBattleStatsSnapshot(healed) &&
+        FindUnit(healed, actorSlot)->healDone == 235 &&
+        FindUnit(healed, friendlyTargetSlot)->recoveryDone == 235,
+        "attribute strategy-channel healing to the caster and recovery to the target");
+    PutByte(context.data() + 0x0C, enemyTargetSlot);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 40, 70);
+    ReadBattleStatsSnapshot(healed);
+    Check(FindUnit(healed, actorSlot)->healDone == 235,
+        "exclude healing dealt to enemy beneficiaries");
+    snapshot = healed;
 
     BattleStatsPersistedState persisted;
     Check(CaptureBattleStatsState(persisted, 1000) && persisted.active &&
@@ -615,6 +646,17 @@ int wmain(int argc, wchar_t** argv) {
     ReadBattleStatsSnapshot(fresh);
     Check(fresh.campaignRoster[1].lastCamp == 255 && !fresh.campaignRoster[1].tracking,
         "the full native camp byte including the removal sentinel stops tracking");
+    std::vector<int> watch;
+    Check(ReadBattleRosterTrackingIds(watch) &&
+        std::find(watch.begin(), watch.end(), 902) != watch.end(),
+        "a confirmed party leave stays on the authoritative watch list");
+    NotifyBattleRosterCamp(902, 0, 3042);
+    RecordBattleStatsSettlementForTest(1, enemyTarget,
+        reinterpret_cast<uintptr_t>(callerFrame), 80, 50);
+    ReadBattleStatsSnapshot(fresh);
+    Check(fresh.campaignRoster[1].tracking && !fresh.campaignRoster[1].changedFaction &&
+        FindPerson(fresh.campaignUnits, 902)->damageDealt == 120,
+        "the party flag returning to zero resumes campaign tracking after a real leave");
 
     ShutdownBattleStats();
     Check(RestoreBattleStatsState(persisted, 3000), "restore historical totals when collection hooks are unavailable");
@@ -686,10 +728,10 @@ int wmain(int argc, wchar_t** argv) {
     }
     BattleStatsPersistedState newGame;
     newGame.scenarioOrdinal = 0;
-    Check(RestoreBattleStatsState(newGame, 5010), "restore an empty schema-4 R save beside the same static script");
+    Check(RestoreBattleStatsState(newGame, 5010), "restore an empty schema-5 R save beside the same static script");
     ReadBattleStatsSnapshot(fresh);
     Check(fresh.campaignRoster.empty() && fresh.campaignUnits.empty(),
-        "schema-4 saves never infer membership from a statically present unexecuted 3B");
+        "schema-5 saves never infer membership from a statically present unexecuted 3B");
     std::filesystem::remove_all(migrationRoot);
 
     ShutdownBattleStats();

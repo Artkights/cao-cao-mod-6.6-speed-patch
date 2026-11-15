@@ -547,15 +547,16 @@ int main() {
     check(battle && battleTabs && battleList && !battleDetail && IsWindowUnicode(battleList) &&
         TabText(battleTabs, 0) == L"当前战场" && TabText(battleTabs, 1) == L"全局统计" &&
         ColumnText(battleList, 0) == L"单位" && ColumnText(battleList, 1) == L"造成伤害" &&
-        ColumnText(battleList, 2) == L"承受伤害" && ColumnText(battleList, 3) == L"回复量" &&
-        ColumnText(battleList, 4) == L"暴击次数" && ColumnText(battleList, 5) == L"连击次数" &&
-        ColumnText(battleList, 6) == L"攻击闪避" && ColumnText(battleList, 7) == L"策略闪避" &&
-        ColumnText(battleList, 8) == L"物理受击" && ColumnText(battleList, 9) == L"策略受击",
-        "battle statistics exposes current and campaign tabs with ten Unicode columns");
+        ColumnText(battleList, 2) == L"承受伤害" && ColumnText(battleList, 3) == L"治疗量" &&
+        ColumnText(battleList, 4) == L"回复量" && ColumnText(battleList, 5) == L"暴击次数" &&
+        ColumnText(battleList, 6) == L"连击次数" && ColumnText(battleList, 7) == L"攻击闪避" &&
+        ColumnText(battleList, 8) == L"策略闪避" && ColumnText(battleList, 9) == L"物理受击" &&
+        ColumnText(battleList, 10) == L"策略受击",
+        "battle statistics exposes current and campaign tabs with eleven Unicode columns");
     BattleStatsPersistedState historical;
     // This fixture models a pre-roster production save.  Schema 3 migration
     // intentionally reconstructs the legacy campaign rows and marks the
-    // inferred membership as incomplete; a schema-4 state must carry its
+    // inferred membership as incomplete; a schema-5 state must carry its
     // explicit roster and participant sets.
     historical.schemaVersion = 3;
     historical.scenario = L"S_07.eex";

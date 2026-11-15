@@ -982,7 +982,7 @@ void ValidatePrivateAttemptIdentity() {
     BYTE campaign=0;
     BYTE game[4]={0,0,1,0};
     auto state=MakeLoadState(404,44,444);
-    Check(RestoreBattleStatsState(state,GetTickCount64()),"seed complete schema-4 statistics for private save attempts");
+    Check(RestoreBattleStatsState(state,GetTickCount64()),"seed complete schema-5 statistics for private save attempts");
     ConfigureSaveEnhancerForTest(gFakeRoot.c_str(),&campaign,
         reinterpret_cast<uintptr_t>(&PrivateTransactionalNative),reinterpret_cast<uintptr_t>(&FakeFilename));
     SetSaveExtensionCapabilityForTest(NativeExtensionCapability::None);

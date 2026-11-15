@@ -103,15 +103,15 @@ void WriteUnits(std::wostringstream& output, const wchar_t* name,
     for (const auto& unit : units) sorted.push_back(&unit);
     std::sort(sorted.begin(), sorted.end(), [](const auto* left, const auto* right) {
         return std::tie(left->personId, left->damageDealt, left->damageReceived,
-            left->recoveryDone, left->criticalCount, left->comboExtraHitCount,
+            left->recoveryDone, left->healDone, left->criticalCount, left->comboExtraHitCount,
             left->attackBlockCount, left->spellBlockCount, left->defeatedEnemies,
             left->physicalReceivedCount, left->strategyReceivedCount, left->slot) <
             std::tie(right->personId, right->damageDealt, right->damageReceived,
-                right->recoveryDone, right->criticalCount, right->comboExtraHitCount,
+                right->recoveryDone, right->healDone, right->criticalCount, right->comboExtraHitCount,
                 right->attackBlockCount, right->spellBlockCount, right->defeatedEnemies,
                 right->physicalReceivedCount, right->strategyReceivedCount, right->slot);
     });
-    std::array<int64_t, 10> totals = {};
+    std::array<int64_t, 11> totals = {};
     uint64_t digest = UINT64_C(14695981039346656037);
     const auto hashNumber = [&digest](uint64_t value) {
         for (unsigned byte = 0; byte < 8; ++byte) {
@@ -122,8 +122,8 @@ void WriteUnits(std::wostringstream& output, const wchar_t* name,
     };
     hashNumber(units.size());
     for (const auto* unit : sorted) {
-        const std::array<int64_t, 10> values = {{unit->damageDealt, unit->damageReceived,
-            unit->recoveryDone, unit->criticalCount, unit->comboExtraHitCount,
+        const std::array<int64_t, 11> values = {{unit->damageDealt, unit->damageReceived,
+            unit->recoveryDone, unit->healDone, unit->criticalCount, unit->comboExtraHitCount,
             unit->attackBlockCount, unit->spellBlockCount, unit->defeatedEnemies,
             unit->physicalReceivedCount, unit->strategyReceivedCount}};
         hashNumber(static_cast<uint64_t>(unit->personId));
@@ -153,8 +153,9 @@ void WriteUnits(std::wostringstream& output, const wchar_t* name,
         // Fixed metric order makes capture/verification/restore directly comparable.
         output << unit->personId << L"/" << unit->slot << L":" <<
             unit->damageDealt << L"," << unit->damageReceived << L"," <<
-            unit->recoveryDone << L"," << unit->criticalCount << L"," <<
-            unit->comboExtraHitCount << L"," << unit->attackBlockCount << L"," <<
+            unit->recoveryDone << L"," << unit->healDone << L"," <<
+            unit->criticalCount << L"," << unit->comboExtraHitCount << L"," <<
+            unit->attackBlockCount << L"," <<
             unit->spellBlockCount << L"," << unit->defeatedEnemies << L"," <<
             unit->physicalReceivedCount << L"," << unit->strategyReceivedCount;
     }

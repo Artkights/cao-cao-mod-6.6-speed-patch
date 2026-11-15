@@ -834,6 +834,8 @@ uint32_t AvailableMetricsUnlocked() {
         gSettlementAvailable[SettlementStrategyDamage])
         mask |= BattleStatsDamageDealt | BattleStatsDamageReceived | BattleStatsDefeatedEnemies;
     if (gSettlementAvailable[kRecoveryCapability]) mask |= BattleStatsRecovery;
+    if (gSettlementAvailable[SettlementStrategyDamage] ||
+        gSettlementAvailable[kRecoveryCapability]) mask |= BattleStatsHealing;
     if (gCriticalAvailable) mask |= BattleStatsCritical;
     if (gComboAvailable) mask |= BattleStatsCombo;
     if (gAttackBlockAvailable) mask |= BattleStatsAttackBlock;
@@ -918,10 +920,46 @@ bool ConfirmEventParticipantUnlocked(int personId, int slot) {
         coordinates[0] != 255 && coordinates[1] != 255 && AddCurrentParticipantUnlocked(personId, slot);
 }
 
+// A real party leave is proven only by the runtime person flag 0xFF. A
+// battlefield camp 1..15 is a faction change and must never thaw merely
+// because the person flag later reads zero.
+bool IsPartyLeaveFrozenUnlocked(const BattleRosterEntry& entry) {
+    return entry.joined && !entry.tracking && entry.changedFaction &&
+        entry.lastCamp == 255;
+}
+
+void MarkRosterPartyFlagUnlocked(int personId, int flag) {
+    if (!gRosterAvailable) return;
+    BattleRosterEntry* entry = FindRosterUnlocked(personId);
+    if (!entry || flag < 0) return;
+    if (flag == 0) {
+        if (IsPartyLeaveFrozenUnlocked(*entry)) {
+            entry->changedFaction = false;
+            entry->tracking = true;
+            entry->lastCamp = 0;
+            TraceLedgerUnlocked(L"roster-rejoin", L"party-flag-returned");
+        } else if (!entry->changedFaction && entry->lastCamp != 0) {
+            entry->lastCamp = 0;
+            TraceLedgerUnlocked(L"roster-camp", L"confirmed-party-flag");
+        }
+        return;
+    }
+    const bool changed = entry->lastCamp != flag || entry->tracking;
+    entry->lastCamp = flag;
+    if (entry->tracking) {
+        entry->changedFaction = true;
+        entry->tracking = false;
+    }
+    if (changed) TraceLedgerUnlocked(L"roster-camp", L"confirmed-party-flag");
+}
+
 void MarkRosterCampUnlocked(int personId, int camp) {
     if (!gRosterAvailable) return;
     BattleRosterEntry* entry = FindRosterUnlocked(personId);
     if (!entry || camp < 0) return;
+    // Preserve the only evidence that a rejoin may resume tracking. Tactical
+    // zero observations cannot erase a confirmed party-leave sentinel.
+    if (IsPartyLeaveFrozenUnlocked(*entry) && camp == 0) return;
     const bool changed = entry->lastCamp != camp || (camp != 0 && entry->tracking);
     entry->lastCamp = camp;
     if (camp != 0 && entry->tracking) {
@@ -1021,6 +1059,38 @@ bool ResolveStrategyDamageSettlement(uintptr_t callerFrame, int targetSlot, int&
         contextTarget == targetSlot;
 }
 
+// Recovery results are applied by 0x4246D1 / 0x424822 in the 6.5 engine.
+// Their caller ECX (the strategy context) lives at [EBP-0x0C], the caster slot
+// is context+0x02, and the result target slot is context+0x0D+index where the
+// byte-sized result index is the caller's [EBP-0x04]. Healing strategies do not
+// use this layout: they raise HP through the strategy-damage channel below.
+bool ResolveRecoverySettlement(int kind, uintptr_t callerFrame, int targetSlot,
+    int& actorSlot) {
+    uintptr_t context = 0;
+    uintptr_t frameTarget = 0;
+    BYTE actor = 0xFF;
+    BYTE index = 0;
+    BYTE contextTarget = 0xFF;
+    int frameTargetSlot = -1;
+    // The simple loop keeps the setter target at [EBP-0x10]; the animated loop
+    // keeps it at [EBP-0x14]. Cross-check both the result-list slot and the
+    // actual setter target before attributing the heal.
+    const uintptr_t frameTargetOffset =
+        kind == SettlementRecoverySimple ? 0x10 : 0x14;
+    if (!ReadBytes(callerFrame - 0x0C, &context, sizeof(context)) || !context ||
+        !ReadBytes(context + 0x02, &actor, sizeof(actor)) ||
+        !ReadBytes(callerFrame - 0x04, &index, sizeof(index)) ||
+        index >= kUnitCount ||
+        !ReadBytes(context + 0x0D + index, &contextTarget, sizeof(contextTarget)) ||
+        !ReadBytes(callerFrame - frameTargetOffset, &frameTarget, sizeof(frameTarget)))
+        return false;
+    if (actor >= kUnitCount || contextTarget != targetSlot ||
+        !UnitSlotFromPointer(frameTarget, frameTargetSlot) ||
+        frameTargetSlot != targetSlot) return false;
+    actorSlot = actor;
+    return true;
+}
+
 bool ResolveSettlementActor(int kind, uintptr_t callerFrame,
     int targetSlot, int& actorSlot) {
     switch (kind) {
@@ -1028,6 +1098,9 @@ bool ResolveSettlementActor(int kind, uintptr_t callerFrame,
         return ResolvePhysicalSettlement(callerFrame, targetSlot, actorSlot);
     case SettlementStrategyDamage:
         return ResolveStrategyDamageSettlement(callerFrame, targetSlot, actorSlot);
+    case SettlementRecoverySimple:
+    case SettlementRecoveryAnimated:
+        return ResolveRecoverySettlement(kind, callerFrame, targetSlot, actorSlot);
     default:
         return false;
     }
@@ -1074,7 +1147,7 @@ void ExportCurrentRecordUnlocked() {
     std::wstring output = L"战斗记录\r\n剧本：" + gScenario + L"\r\n持续时间：" +
         std::to_wstring(gElapsed / 1000) + L" 秒\r\n历史不完整：" +
         (gHistoryIncomplete ? L"是" : L"否") + L"\r\n\r\n";
-    std::wstring csv = L"剧本,战役编号,战场实例,人物编号,单位,造成伤害,承受伤害,回复量,暴击次数,连击次数,攻击闪避,策略闪避,击退敌军,物理受击,策略受击,历史不完整\r\n";
+    std::wstring csv = L"剧本,战役编号,战场实例,人物编号,单位,造成伤害,承受伤害,治疗量,回复量,暴击次数,连击次数,攻击闪避,策略闪避,击退敌军,物理受击,策略受击,历史不完整\r\n";
     const uint32_t metrics = gKnownMetrics | AvailableMetricsUnlocked();
     for (const auto& pair : gTotals) {
         const auto& unit = pair.second;
@@ -1091,6 +1164,7 @@ void ExportCurrentRecordUnlocked() {
         };
         metric(BattleStatsDamageDealt, L"造成伤害", unit.damageDealt);
         metric(BattleStatsDamageReceived, L"承受伤害", unit.damageReceived);
+        metric(BattleStatsHealing, L"治疗量", unit.healDone);
         metric(BattleStatsRecovery, L"回复量", unit.recoveryDone);
         metric(BattleStatsCritical, L"暴击次数", unit.criticalCount);
         metric(BattleStatsCombo, L"连击次数", unit.comboExtraHitCount);
@@ -1171,16 +1245,36 @@ void RecordSettlement(int kind, uintptr_t target, uintptr_t callerFrame, int old
         ScopedStatsLock lock;
         if (gActive && !gLoading) {
             ObserveSlotCampUnlocked(targetSlot);
-            if (finalHp > oldHp && targetCamp == 0) {
-                AddMetricUnlocked(targetSlot, &BattleUnitTotals::recoveryDone,
-                    static_cast<long long>(finalHp) - oldHp, BattleStatsRecovery);
-            } else if (oldHp > finalHp) {
+            const long long delta = static_cast<long long>(finalHp) - oldHp;
+            if (delta > 0) {
+                // Recovery is beneficiary-side: any source that actually
+                // restores a player unit's HP counts, including self-healing.
+                if (targetCamp == 0) {
+                    AddMetricUnlocked(targetSlot, &BattleUnitTotals::recoveryDone,
+                        delta, BattleStatsRecovery);
+                }
+                // Healing is caster-side: attribute the same actual HP delta
+                // to the player unit that caused it. Only our/friendly
+                // beneficiaries count; enemy healing is excluded.
+                if (kind != SettlementPhysicalDamage && targetCamp >= 0 && targetCamp <= 1) {
+                    int actorSlot = -1;
+                    int actorCamp = -1;
+                    if (ResolveSettlementActor(kind, callerFrame, targetSlot, actorSlot) &&
+                        UnitCamp(actorSlot, actorCamp)) {
+                        ObserveSlotCampUnlocked(actorSlot);
+                        if (actorCamp == 0) {
+                            AddMetricUnlocked(actorSlot, &BattleUnitTotals::healDone,
+                                delta, BattleStatsHealing);
+                        }
+                    }
+                }
+            } else if (delta < 0) {
                 int actorSlot = -1;
                 int actorCamp = -1;
                 if (ResolveSettlementActor(kind, callerFrame, targetSlot, actorSlot) &&
                     UnitCamp(actorSlot, actorCamp)) {
                     ObserveSlotCampUnlocked(actorSlot);
-                    const long long damage = static_cast<long long>(oldHp) - finalHp;
+                    const long long damage = -delta;
                     if (actorCamp == 0) {
                         AddMetricUnlocked(actorSlot, &BattleUnitTotals::damageDealt,
                             damage, BattleStatsDamageDealt);
@@ -2157,7 +2251,12 @@ bool ReadBattleRosterTrackingIds(std::vector<int>& personIds) {
     personIds.reserve(gCampaignRoster.size());
     for (const auto& pair : gCampaignRoster) {
         const BattleRosterEntry& entry = pair.second;
-        if (entry.joined && entry.tracking && !entry.changedFaction)
+        if (!entry.joined) continue;
+        const bool tracking = entry.tracking && !entry.changedFaction;
+        // Confirmed party leaves stay watched so that the authoritative
+        // person flag returning to zero can resume tracking without a 3B
+        // notification (memory join, S-scene join or a missed bridge event).
+        if (tracking || IsPartyLeaveFrozenUnlocked(entry))
             personIds.push_back(pair.first);
     }
     return true;
@@ -2168,7 +2267,7 @@ void NotifyBattleRosterCamp(int personId, int camp, ULONGLONG now) {
     if (personId < 0 || personId >= 0xFFFF || camp < 0 || camp > 255) return;
     ScopedStatsLock lock;
     if (gLoading) return;
-    MarkRosterCampUnlocked(personId, camp);
+    MarkRosterPartyFlagUnlocked(personId, camp);
     lock.Unlock();
 }
 
@@ -2267,6 +2366,7 @@ bool ReadBattleStatsSnapshot(BattleStatsSnapshot& snapshot) {
     snapshot.physicalSettlementAvailable = gSettlementAvailable[SettlementPhysicalDamage];
     snapshot.strategyDamageAvailable = gSettlementAvailable[SettlementStrategyDamage];
     snapshot.recoveryAvailable = gSettlementAvailable[kRecoveryCapability];
+    snapshot.healingAvailable = snapshot.strategyDamageAvailable || snapshot.recoveryAvailable;
     snapshot.criticalAvailable = gCriticalAvailable;
     snapshot.comboAvailable = gComboAvailable;
     snapshot.attackBlockAvailable = gAttackBlockAvailable;
@@ -2330,7 +2430,7 @@ bool CaptureBattleStatsState(BattleStatsPersistedState& state, ULONGLONG now) {
 
 bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG now) {
     if ((state.schemaVersion != 1 && state.schemaVersion != 2 && state.schemaVersion != 3 &&
-        state.schemaVersion != 4) || state.campaignRoster.size() > 0xFFFF ||
+        state.schemaVersion != 4 && state.schemaVersion != 5) || state.campaignRoster.size() > 0xFFFF ||
         state.currentBattleParticipants.size() > kUnitCount ||
         state.units.size() > kUnitCount || state.campaignUnits.size() > 0xFFFF ||
         state.scenario.size() > 1024 || state.status.size() > 4096 ||
@@ -2351,7 +2451,8 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
         for (BattleUnitTotals unit : source) {
             if (unit.slot < -1 || unit.slot >= static_cast<int>(kUnitCount) ||
                 unit.label.size() > 256 || unit.damageDealt < 0 || unit.damageReceived < 0 ||
-                unit.recoveryDone < 0 || unit.criticalCount < 0 || unit.comboExtraHitCount < 0 ||
+                unit.recoveryDone < 0 || unit.healDone < 0 ||
+                unit.criticalCount < 0 || unit.comboExtraHitCount < 0 ||
                 unit.attackBlockCount < 0 || unit.spellBlockCount < 0 || unit.defeatedEnemies < 0 ||
                 unit.physicalReceivedCount < 0 || unit.strategyReceivedCount < 0)
                 return false;
@@ -2368,6 +2469,7 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
             if (legacy || !(state.knownMetrics & BattleStatsStrategyDodge)) unit.spellBlockCount = 0;
             if (state.schemaVersion < 3 || !(state.knownMetrics & BattleStatsPhysicalReceived)) unit.physicalReceivedCount=0;
             if (state.schemaVersion < 3 || !(state.knownMetrics & BattleStatsStrategyReceived)) unit.strategyReceivedCount=0;
+            if (state.schemaVersion < 5 || !(state.knownMetrics & BattleStatsHealing)) unit.healDone = 0;
             if (unit.personId < 0 || unit.personId >= 0xFFFF || target.count(unit.personId))
                 return false;
             target.emplace(unit.personId, std::move(unit));
@@ -2384,7 +2486,7 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
             return false;
         roster.emplace(item.personId, item);
     }
-    // Only legacy formats may infer membership. A schema-4 save is an exact
+    // Only legacy formats may infer membership. A schema-5 save is an exact
     // execution ledger and must never gain rows merely because a script has
     // an unexecuted 0x3B branch.
     std::set<int> participants;
@@ -2465,7 +2567,9 @@ bool RestoreBattleStatsState(const BattleStatsPersistedState& state, ULONGLONG n
     gScenarioOrdinal = state.scenarioOrdinal;
     gCampaignId = state.campaignId;
     gBattleInstance = state.battleInstance;
-    gKnownMetrics = state.knownMetrics & (state.schemaVersion < 3 ? 0xFFu : 0x3FFu);
+    const uint32_t knownMask = state.schemaVersion < 3 ? 0xFFu :
+        (state.schemaVersion >= 5 ? 0x7FFu : 0x3FFu);
+    gKnownMetrics = state.knownMetrics & knownMask;
     const uint32_t newMetrics = BattleStatsAttackDodge | BattleStatsStrategyDodge |
         BattleStatsPhysicalReceived | BattleStatsStrategyReceived;
     gHistoryIncomplete = state.historyIncomplete || legacy || state.schemaVersion < 3 ||

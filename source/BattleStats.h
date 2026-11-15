@@ -18,6 +18,10 @@ struct BattleRosterEntry {
     bool joined = false;
     bool tracking = false;
     bool changedFaction = false;
+    // Last observed camp. Runtime person-table flags are 0 (in our army) and
+    // 0xFF (left the party); battlefield rows use 0..15. A frozen entry with
+    // changedFaction && !tracking && lastCamp == 255 is a confirmed party
+    // leave that may resume when the authoritative person flag returns to 0.
     int lastCamp = -1;
     int joinScenarioOrdinal = -1;
     uint32_t joinCommandOrdinal = 0xFFFFFFFFu;
@@ -38,7 +42,8 @@ enum BattleStatsMetric : uint32_t {
     BattleStatsStrategyDodge = BattleStatsSpellBlock,
     BattleStatsDefeatedEnemies = 1u << 7,
     BattleStatsPhysicalReceived = 1u << 8,
-    BattleStatsStrategyReceived = 1u << 9
+    BattleStatsStrategyReceived = 1u << 9,
+    BattleStatsHealing = 1u << 10
 };
 
 struct BattleUnitTotals {
@@ -48,6 +53,9 @@ struct BattleUnitTotals {
     long long damageDealt = 0;
     long long damageReceived = 0;
     long long recoveryDone = 0;
+    // Actual HP restored by this player unit as the caster of a healing
+    // strategy or an item. Self-healing counts; overheal and MP do not.
+    long long healDone = 0;
     long long criticalCount = 0;
     long long comboExtraHitCount = 0;
     // Schema 2 compatibility names: counts of real physical / hostile
@@ -67,6 +75,7 @@ struct BattleStatsSnapshot {
     bool physicalSettlementAvailable = false;
     bool strategyDamageAvailable = false;
     bool recoveryAvailable = false;
+    bool healingAvailable = false;
     bool criticalAvailable = false;
     bool comboAvailable = false;
     // True only after the complete native final-hit / eligibility call graph
@@ -77,7 +86,7 @@ struct BattleStatsSnapshot {
     bool strategyReceivedAvailable = false;
     bool active = false;
     bool loading = false;
-    uint32_t schemaVersion = 4;
+    uint32_t schemaVersion = 5;
     int scenarioOrdinal = -1;
     uint64_t campaignId = 0;
     uint64_t battleInstance = 0;
@@ -96,7 +105,7 @@ struct BattleStatsSnapshot {
 };
 
 struct BattleStatsPersistedState {
-    uint32_t schemaVersion = 4;
+    uint32_t schemaVersion = 5;
     int scenarioOrdinal = -1;
     uint64_t campaignId = 0;
     uint64_t battleInstance = 0;
@@ -193,6 +202,8 @@ void NotifyBattleRosterJoined(int personId, int scenarioOrdinal,
 void NotifyBattleRosterCamp(int personId, int camp, ULONGLONG now);
 void NotifyBattleRosterLabel(int personId, const std::wstring& label);
 void SetBattleRosterCapability(bool available, const wchar_t* reason = nullptr);
+// Returns roster members whose runtime person-table flag must be watched:
+// actively tracked members plus confirmed party leaves awaiting a return to 0.
 bool ReadBattleRosterTrackingIds(std::vector<int>& personIds);
 void SetBattleStatsStatus(const std::wstring& status, bool historyIncomplete);
 

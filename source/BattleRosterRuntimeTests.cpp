@@ -146,22 +146,29 @@ void Validate(const wchar_t* path) {
     Check(lastName == L"曹操","R join immediately copies the native GBK person name before any battlefield poll");
     CompleteBattleRosterJoinForTest(7,0,1234,20);
     Check(joins == 2,"repeat native 3B reaches the idempotent model notification");
+    CompleteBattleRosterJoinForTest(7,1,1235,21);
+    Check(joins == 3 && lastPosition == 1235,
+        "memory join mode also establishes or restores membership");
     ordinal = 3;
     CompleteBattleRosterJoinForTest(8,0,0,21);
-    Check(joins == 2,"S commands never create campaign membership");
+    Check(joins == 3,"S commands never create campaign membership");
     ordinal = 2;
     people[7 * 0x48 + 0x2A] = 1;
     CompleteBattleRosterJoinForTest(7,0,0,22);
-    Check(joins == 2 && changes == 1 && lastCamp == 1,"failed committed camp verification cannot create a player join");
+    Check(joins == 3 && changes == 1 && lastCamp == 1,"failed committed camp verification cannot create a player join");
     CompleteBattleRosterJoinForTest(-1,0,0,23);
     CompleteBattleRosterJoinForTest(0x400,0,0,23);
-    Check(joins == 2 && changes == 1,"invalid person IDs cannot index the authoritative table");
+    Check(joins == 3 && changes == 1,"invalid person IDs cannot index the authoritative table");
     snapshot.campaignRoster.clear();
     BattleRosterEntry entry; entry.personId = 7; entry.joined = true;
     snapshot.campaignRoster.push_back(entry);
     PollBattleRosterRuntime(24);
     Check(changes == 2 && lastPerson == 7 && lastCamp == 1,
         "R polling detects faction changes for joined units absent from the battlefield");
+    people[7 * 0x48 + 0x2A] = 0xFF;
+    CompleteBattleRosterJoinForTest(7,255,0,24);
+    Check(joins == 3 && changes == 3 && lastCamp == 255,
+        "the leave sentinel still reports a camp change instead of a join");
     BYTE patched[5] = {};
     BYTE* site = mapped + layout.completedSite - base;
     memcpy(patched,site,5); site[0] = 0x90;

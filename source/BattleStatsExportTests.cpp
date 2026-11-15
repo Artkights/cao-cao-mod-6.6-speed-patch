@@ -87,7 +87,7 @@ BattleStatsPersistedState SampleState() {
     state.scenario = L"S_00,\"战场\".eex";
     state.campaignId = 77;
     state.battleInstance = 88;
-    state.knownMetrics = 0x3FF;
+    state.knownMetrics = 0x7FF;
     state.elapsedMilliseconds = 12000;
     BattleUnitTotals unit;
     unit.personId = 7;
@@ -95,6 +95,7 @@ BattleStatsPersistedState SampleState() {
     unit.label = L"张,\"辽\"\r\n将军";
     unit.damageDealt = 101;
     unit.damageReceived = 102;
+    unit.healDone = 99;
     unit.recoveryDone = 103;
     unit.criticalCount = 104;
     unit.comboExtraHitCount = 105;
@@ -133,25 +134,27 @@ void VerifyAvailableExport(const std::wstring& root) {
         records.text[0].stem() == records.csv[0].stem(), "leaving a battlefield creates one TXT and CSV pair with the same identity");
     if (records.text.size() != 1 || records.csv.size() != 1) return;
     const auto csv = ParseCsv(ReadUtf16(records.csv[0]));
-    Check(csv.size() == 2 && csv[0].size() == 16 && csv[1].size() == 16,
-        "Excel-readable CSV has one header and one current-battle row with all ten metrics");
-    if (csv.size() == 2 && csv[0].size() == 16 && csv[1].size() == 16) {
+    Check(csv.size() == 2 && csv[0].size() == 17 && csv[1].size() == 17,
+        "Excel-readable CSV has one header and one current-battle row with all eleven metrics");
+    if (csv.size() == 2 && csv[0].size() == 17 && csv[1].size() == 17) {
         Check(csv[1][0] == SampleState().scenario && csv[1][4] == SampleState().units[0].label &&
             csv[1][1] == L"77" && csv[1][2] == L"88" && csv[1][3] == L"7",
             "CSV quoting preserves Chinese labels, commas, quotes, newlines and battle/person identities");
-        Check(csv[0][10] == L"攻击闪避" && csv[0][11] == L"策略闪避" &&
-            csv[1][5] == L"101" && csv[1][6] == L"102" && csv[1][7] == L"103" &&
-            csv[1][8] == L"104" && csv[1][9] == L"105" && csv[1][10] == L"106" &&
-            csv[1][11] == L"107" && csv[1][12] == L"108" &&
-            csv[0][13] == L"物理受击" && csv[1][13] == L"9223372036854775807" &&
-            csv[0][14] == L"策略受击" && csv[1][14] == L"0" && csv[1][15] == L"否",
-            "export preserves existing dodge semantics, full 64-bit received counts and a genuine known zero");
+        Check(csv[0][7] == L"治疗量" && csv[0][8] == L"回复量" &&
+            csv[0][11] == L"攻击闪避" && csv[0][12] == L"策略闪避" &&
+            csv[1][5] == L"101" && csv[1][6] == L"102" && csv[1][7] == L"99" &&
+            csv[1][8] == L"103" && csv[1][9] == L"104" && csv[1][10] == L"105" &&
+            csv[1][11] == L"106" && csv[1][12] == L"107" && csv[1][13] == L"108" &&
+            csv[0][14] == L"物理受击" && csv[1][14] == L"9223372036854775807" &&
+            csv[0][15] == L"策略受击" && csv[1][15] == L"0" && csv[1][16] == L"否",
+            "export preserves healing, recovery, dodge semantics and full 64-bit received counts");
     }
     const auto text = ReadUtf16(records.text[0]);
-    Check(text.find(L"物理受击：9223372036854775807") != std::wstring::npos &&
+    Check(text.find(L"治疗量：99") != std::wstring::npos &&
+        text.find(L"物理受击：9223372036854775807") != std::wstring::npos &&
         text.find(L"策略受击：0") != std::wstring::npos && text.find(L"攻击闪避：106") != std::wstring::npos &&
         text.find(L"历史不完整：否") != std::wstring::npos,
-        "TXT battle record carries the same received, dodge and completeness values");
+        "TXT battle record carries healing, received, dodge and completeness values");
     NotifyBattleStatsScenarioInstalled(2, false, false, 1001);
     const auto repeated = FindRecords(root);
     Check(repeated.text.size() == 1 && repeated.csv.size() == 1, "repeated scene notification does not export the battle twice");
@@ -164,8 +167,8 @@ void VerifyUnavailableExport(const std::wstring& root) {
     const auto records = FindRecords(root);
     const auto rows = records.csv.size() == 1 ? ParseCsv(ReadUtf16(records.csv[0])) :
         std::vector<std::vector<std::wstring>>();
-    Check(rows.size() == 2 && rows[1].size() == 16 && rows[1][10] == L"106" &&
-        rows[1][13] == L"--" && rows[1][14] == L"--",
+    Check(rows.size() == 2 && rows[1].size() == 17 && rows[1][11] == L"106" &&
+        rows[1][14] == L"--" && rows[1][15] == L"--",
         "unsupported received layouts export unavailable markers independently of retained dodge history");
     Check(records.text.size() == 1 && ReadUtf16(records.text[0]).find(L"物理受击：--") != std::wstring::npos &&
         ReadUtf16(records.text[0]).find(L"策略受击：--") != std::wstring::npos,
@@ -188,9 +191,9 @@ void VerifyMigrationAndLoading(const std::wstring& root) {
     const auto records = FindRecords(root);
     const auto rows = records.csv.size() == 1 ? ParseCsv(ReadUtf16(records.csv[0])) :
         std::vector<std::vector<std::wstring>>();
-    Check(rows.size() == 2 && rows[1].size() == 16 && rows[1][10] == L"106" &&
-        rows[1][11] == L"107" && rows[1][13] == L"0" && rows[1][14] == L"0" && rows[1][15] == L"是",
-        "old histories retain dodge values, seed received at zero and export incomplete history");
+    Check(rows.size() == 2 && rows[1].size() == 17 && rows[1][11] == L"106" &&
+        rows[1][12] == L"107" && rows[1][14] == L"0" && rows[1][15] == L"0" && rows[1][16] == L"是",
+        "old histories retain dodge values, seed received/healing at zero and export incomplete history");
     BattleStatsPersistedState after;
     CaptureBattleStatsState(after, GetTickCount64());
     Check(after.units.empty() && after.currentBattleParticipants.empty() &&
